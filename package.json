@@ -1,0 +1,38 @@
+{
+  "name": "dr-shumard-analytics",
+  "version": "1.0.0",
+  "description": "Production analytics dashboard for Dr Shumard medical centre",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev:api": "node --watch server.js",
+    "dev:ui": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "db:migrate": "psql $DATABASE_URL -f db/schema.sql",
+    "generate-key": "node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"",
+    "test:webhook": "node scripts/test-webhook.js",
+    "test:fb-sync": "node fb-sync.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "cors": "^2.8.5",
+    "date-fns": "^4.1.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "node-cron": "^3.0.3",
+    "react-datepicker": "^9.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

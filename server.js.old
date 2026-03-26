@@ -1,0 +1,608 @@
+// ============================================================================
+// Dr Shumard Analytics — Production API Server
+// ============================================================================
+
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { createClient } from '@supabase/supabase-js';
+import crypto from 'crypto';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import 'dotenv/config';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  console.error('❌ Missing SUPABASE_URL or SUPABASE_SERVICE_KEY');
+  process.exit(1);
+}
+if (!API_KEY) {
+  console.error('❌ Missing API_KEY — webhooks will be unprotected');
+  process.exit(1);
+}
+
+// ─── Supabase Client ─────────────────────────────────────────────────────────
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// ─── Express App ─────────────────────────────────────────────────────────────
+const app = express();
+
+// Security headers
+app.use(helmet({
+  contentSecurityPolicy: false, // Allow inline styles for the React app
+}));
+
+// CORS
+const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').filter(Boolean);
+app.use(cors({
+  origin: corsOrigins.length > 0 ? corsOrigins : true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+}));
+
+// Body parsing
+app.use(express.json({ limit: '1mb' }));
+
+// Request logging
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    if (req.path.startsWith('/api')) {
+      console.log(`${req.method} ${req.path} → ${res.statusCode} (${ms}ms)`);
+    }
+  });
+  next();
+});
+
+// ─── Rate Limiting ───────────────────────────────────────────────────────────
+const webhookLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 60,
+  message: { error: 'Too many requests, try again later' },
+});
+
+const dashboardLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 120,
+  message: { error: 'Too many requests' },
+});
+
+// ─── Auth Middleware ──────────────────────────────────────────────────────────
+function authenticateWebhook(req, res, next) {
+  const key = req.headers['x-api-key'] || req.query.api_key;
+  if (!key) {
+    return res.status(401).json({ error: 'Missing API key. Send X-API-Key header.' });
+  }
+  if (!crypto.timingSafeEqual(Buffer.from(key), Buffer.from(API_KEY))) {
+    return res.status(403).json({ error: 'Invalid API key' });
+  }
+  next();
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function getLADate(dateStr) {
+  const date = dateStr ? new Date(dateStr) : new Date();
+  return date.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+}
+
+function getLADayOfWeek(dateStr) {
+  const [m, d, y] = dateStr.split('/').map(Number);
+  const date = new Date(y, m - 1, d);
+  return date.toLocaleDateString('en-US', { weekday: 'long' });
+}
+
+function parseDateInput(input) {
+  // Accept: MM/DD/YYYY, YYYY-MM-DD, or ISO strings
+  if (!input) return null;
+  const str = String(input).trim();
+
+  // MM/DD/YYYY
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(str)) return str;
+
+  // YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
+    const [y, m, d] = str.substring(0, 10).split('-');
+    return `${m}/${d}/${y}`;
+  }
+
+  // Try parsing as date
+  const parsed = new Date(str);
+  if (!isNaN(parsed.getTime())) {
+    return parsed.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+  }
+
+  return null;
+}
+
+function dateToISO(mmddyyyy) {
+  const [m, d, y] = mmddyyyy.split('/');
+  return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+}
+
+// ─── Webhook Log ─────────────────────────────────────────────────────────────
+async function logWebhook(source, payload, status, errorMessage = null) {
+  try {
+    await supabase.from('webhook_log').insert({
+      source,
+      payload,
+      status,
+      error_message: errorMessage,
+    });
+  } catch (e) {
+    console.error('Failed to log webhook:', e.message);
+  }
+}
+
+
+// =============================================================================
+// WEBHOOK ENDPOINTS (for Zapier / Make)
+// =============================================================================
+
+// POST /api/metrics — Upsert daily metrics
+// Zapier/Make sends: { date, fb_spend, registrations, replays, viewedcta, clickedcta, purchases }
+app.post('/api/metrics', webhookLimiter, authenticateWebhook, async (req, res) => {
+  try {
+    const body = req.body;
+    await logWebhook('zapier', body, 'received');
+
+    const date = parseDateInput(body.date);
+    if (!date) {
+      await logWebhook('zapier', body, 'error', 'Invalid or missing date');
+      return res.status(400).json({ error: 'Invalid or missing date. Use MM/DD/YYYY or YYYY-MM-DD.' });
+    }
+
+    const isoDate = dateToISO(date);
+    const dayOfWeek = getLADayOfWeek(date);
+
+    const row = {
+      date: isoDate,
+      day_of_week: dayOfWeek,
+      fb_spend: parseFloat(body.fb_spend) || 0,
+      registrations: parseInt(body.registrations) || 0,
+      replays: parseInt(body.replays) || 0,
+      viewedcta: parseInt(body.viewedcta) || 0,
+      clickedcta: parseInt(body.clickedcta) || 0,
+      purchases: parseInt(body.purchases) || 0,
+    };
+
+    const { data, error } = await supabase
+      .from('daily_metrics')
+      .upsert(row, { onConflict: 'date' })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    await logWebhook('zapier', body, 'processed');
+    console.log(`✅ Upserted metrics for ${date} (${dayOfWeek})`);
+    res.json({ success: true, date, day: dayOfWeek, data });
+
+  } catch (err) {
+    console.error('❌ POST /api/metrics error:', err.message);
+    await logWebhook('zapier', req.body, 'error', err.message);
+    res.status(500).json({ error: 'Internal server error', detail: err.message });
+  }
+});
+
+// POST /api/metrics/batch — Bulk upsert (for backfills)
+app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, res) => {
+  try {
+    const { entries } = req.body;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return res.status(400).json({ error: 'Send { entries: [...] } array' });
+    }
+
+    if (entries.length > 365) {
+      return res.status(400).json({ error: 'Maximum 365 entries per batch' });
+    }
+
+    const rows = [];
+    const errors = [];
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const date = parseDateInput(entry.date);
+      if (!date) {
+        errors.push({ index: i, error: 'Invalid date', input: entry.date });
+        continue;
+      }
+      rows.push({
+        date: dateToISO(date),
+        day_of_week: getLADayOfWeek(date),
+        fb_spend: parseFloat(entry.fb_spend) || 0,
+        registrations: parseInt(entry.registrations) || 0,
+        replays: parseInt(entry.replays) || 0,
+        viewedcta: parseInt(entry.viewedcta) || 0,
+        clickedcta: parseInt(entry.clickedcta) || 0,
+        purchases: parseInt(entry.purchases) || 0,
+      });
+    }
+
+    if (rows.length > 0) {
+      const { error } = await supabase
+        .from('daily_metrics')
+        .upsert(rows, { onConflict: 'date' });
+      if (error) throw error;
+    }
+
+    await logWebhook('batch', { count: entries.length }, 'processed');
+    res.json({ success: true, inserted: rows.length, errors });
+
+  } catch (err) {
+    console.error('❌ POST /api/metrics/batch error:', err.message);
+    res.status(500).json({ error: 'Internal server error', detail: err.message });
+  }
+});
+
+// POST /api/metrics/increment — Add to today's totals (for real-time event tracking)
+// Zapier sends: { field: "registrations", count: 1 }
+app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (req, res) => {
+  try {
+    const { field, count = 1 } = req.body;
+    const validFields = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases'];
+
+    if (!validFields.includes(field)) {
+      return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
+    }
+
+    const today = getLADate();
+    const isoToday = dateToISO(today);
+    const dayOfWeek = getLADayOfWeek(today);
+
+    // Ensure today's row exists
+    await supabase
+      .from('daily_metrics')
+      .upsert({ date: isoToday, day_of_week: dayOfWeek }, { onConflict: 'date' });
+
+    // Increment via RPC or read-modify-write
+    const { data: current } = await supabase
+      .from('daily_metrics')
+      .select(field)
+      .eq('date', isoToday)
+      .single();
+
+    const newValue = (Number(current?.[field]) || 0) + Number(count);
+
+    const { data, error } = await supabase
+      .from('daily_metrics')
+      .update({ [field]: newValue })
+      .eq('date', isoToday)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ success: true, date: today, field, previous: current?.[field], new: newValue });
+
+  } catch (err) {
+    console.error('❌ POST /api/metrics/increment error:', err.message);
+    res.status(500).json({ error: 'Internal server error', detail: err.message });
+  }
+});
+
+
+// POST /api/metrics/set — Set a field to an absolute value for today (or a given date)
+// Use this when the source gives you the CURRENT TOTAL, not a delta.
+// e.g. Facebook API returns today's cumulative spend — this replaces, not adds.
+// Body: { field: "fb_spend", value: 312.75 }
+// Optional: { field: "fb_spend", value: 312.75, date: "03/14/2026" }
+app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, res) => {
+  try {
+    const { field, value, date: dateInput } = req.body;
+    const validFields = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases'];
+
+    if (!validFields.includes(field)) {
+      return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
+    }
+
+    if (value === undefined || value === null) {
+      return res.status(400).json({ error: 'Missing value' });
+    }
+
+    const targetDate = dateInput ? parseDateInput(dateInput) : getLADate();
+    if (!targetDate) {
+      return res.status(400).json({ error: 'Invalid date' });
+    }
+
+    const isoDate = dateToISO(targetDate);
+    const dayOfWeek = getLADayOfWeek(targetDate);
+
+    // Ensure the row exists
+    await supabase
+      .from('daily_metrics')
+      .upsert({ date: isoDate, day_of_week: dayOfWeek }, { onConflict: 'date' });
+
+    // Read previous value for the response
+    const { data: current } = await supabase
+      .from('daily_metrics')
+      .select(field)
+      .eq('date', isoDate)
+      .single();
+
+    const previous = current?.[field];
+    const newValue = field === 'fb_spend' ? parseFloat(value) : parseInt(value);
+
+    // Set the absolute value
+    const { data, error } = await supabase
+      .from('daily_metrics')
+      .update({ [field]: newValue })
+      .eq('date', isoDate)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    await logWebhook('set', { field, value: newValue, date: targetDate }, 'processed');
+    console.log(`✅ Set ${field} = ${newValue} for ${targetDate} (was ${previous})`);
+    res.json({ success: true, date: targetDate, field, previous, new: newValue });
+
+  } catch (err) {
+    console.error('❌ POST /api/metrics/set error:', err.message);
+    res.status(500).json({ error: 'Internal server error', detail: err.message });
+  }
+});
+
+
+// =============================================================================
+// DASHBOARD ENDPOINTS (for the frontend)
+// =============================================================================
+
+// GET /api/metrics — Fetch all daily metrics
+app.get('/api/metrics', dashboardLimiter, async (req, res) => {
+  try {
+    const { limit = 90, offset = 0 } = req.query;
+
+    const { data, error, count } = await supabase
+      .from('daily_metrics')
+      .select('*', { count: 'exact' })
+      .order('date', { ascending: false })
+      .range(Number(offset), Number(offset) + Number(limit) - 1);
+
+    if (error) throw error;
+
+    // Convert to frontend format (MM/DD/YYYY)
+    const formatted = (data || []).map(row => ({
+      date: row.date.substring(0, 10).replace(/(\d{4})-(\d{2})-(\d{2})/, '$2/$3/$1'),
+      day: row.day_of_week,
+      fb_spend: Number(row.fb_spend),
+      registrations: row.registrations,
+      replays: row.replays,
+      viewedcta: row.viewedcta,
+      clickedcta: row.clickedcta,
+      purchases: row.purchases,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    }));
+
+    res.json({ data: formatted, total: count });
+
+  } catch (err) {
+    console.error('❌ GET /api/metrics error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PUT /api/metrics/:date — Update a specific day (from dashboard edit)
+app.put('/api/metrics/:date', dashboardLimiter, async (req, res) => {
+  try {
+    const dateInput = parseDateInput(req.params.date);
+    if (!dateInput) return res.status(400).json({ error: 'Invalid date' });
+
+    const isoDate = dateToISO(dateInput);
+    const body = req.body;
+
+    const updates = {};
+    if (body.fb_spend !== undefined) updates.fb_spend = parseFloat(body.fb_spend) || 0;
+    if (body.registrations !== undefined) updates.registrations = parseInt(body.registrations) || 0;
+    if (body.replays !== undefined) updates.replays = parseInt(body.replays) || 0;
+    if (body.viewedcta !== undefined) updates.viewedcta = parseInt(body.viewedcta) || 0;
+    if (body.clickedcta !== undefined) updates.clickedcta = parseInt(body.clickedcta) || 0;
+    if (body.purchases !== undefined) updates.purchases = parseInt(body.purchases) || 0;
+
+    const { data, error } = await supabase
+      .from('daily_metrics')
+      .update(updates)
+      .eq('date', isoDate)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, data });
+
+  } catch (err) {
+    console.error('❌ PUT /api/metrics error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/metrics/:date
+app.delete('/api/metrics/:date', dashboardLimiter, async (req, res) => {
+  try {
+    const dateInput = parseDateInput(req.params.date);
+    if (!dateInput) return res.status(400).json({ error: 'Invalid date' });
+
+    const isoDate = dateToISO(dateInput);
+    const { error } = await supabase
+      .from('daily_metrics')
+      .delete()
+      .eq('date', isoDate);
+
+    if (error) throw error;
+    res.json({ success: true, deleted: dateInput });
+
+  } catch (err) {
+    console.error('❌ DELETE /api/metrics error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+// =============================================================================
+// CUSTOM METRICS ENDPOINTS
+// =============================================================================
+
+// GET /api/custom-metrics
+app.get('/api/custom-metrics', dashboardLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('custom_metrics')
+      .select('*')
+      .order('sort_order', { ascending: true });
+
+    if (error) throw error;
+    res.json({ data: data || [] });
+
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/custom-metrics
+app.post('/api/custom-metrics', dashboardLimiter, async (req, res) => {
+  try {
+    const { name, formula, format = 'number' } = req.body;
+    if (!name || !formula) {
+      return res.status(400).json({ error: 'name and formula required' });
+    }
+
+    const { data, error } = await supabase
+      .from('custom_metrics')
+      .insert({ name, formula, format })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, data });
+
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PUT /api/custom-metrics/:id
+app.put('/api/custom-metrics/:id', dashboardLimiter, async (req, res) => {
+  try {
+    const { name, formula, format } = req.body;
+    const updates = {};
+    if (name) updates.name = name;
+    if (formula) updates.formula = formula;
+    if (format) updates.format = format;
+
+    const { data, error } = await supabase
+      .from('custom_metrics')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, data });
+
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/custom-metrics/:id
+app.delete('/api/custom-metrics/:id', dashboardLimiter, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('custom_metrics')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (error) throw error;
+    res.json({ success: true });
+
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+// =============================================================================
+// WEBHOOK LOG (for debugging)
+// =============================================================================
+
+app.get('/api/webhook-log', dashboardLimiter, async (req, res) => {
+  try {
+    const { limit = 50 } = req.query;
+    const { data, error } = await supabase
+      .from('webhook_log')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(Number(limit));
+
+    if (error) throw error;
+    res.json({ data: data || [] });
+
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+// =============================================================================
+// HEALTH CHECK
+// =============================================================================
+
+app.get('/api/health', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('daily_metrics').select('id').limit(1);
+    res.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      timezone: 'America/Los_Angeles',
+      la_time: new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }),
+      database: error ? 'error' : 'connected',
+    });
+  } catch {
+    res.status(503).json({ status: 'error', database: 'disconnected' });
+  }
+});
+
+
+// =============================================================================
+// STATIC FILES (serve the React dashboard)
+// =============================================================================
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+// SPA fallback
+app.get('*', (req, res) => {
+  if (req.path.startsWith('/api')) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+
+// =============================================================================
+// START
+// =============================================================================
+
+app.listen(PORT, () => {
+  console.log(`
+╔══════════════════════════════════════════════════╗
+║   Dr Shumard Analytics — Production Server       ║
+╠══════════════════════════════════════════════════╣
+║                                                  ║
+║   Dashboard:  http://localhost:${PORT}              ║
+║   API:        http://localhost:${PORT}/api/metrics   ║
+║   Health:     http://localhost:${PORT}/api/health    ║
+║   Timezone:   America/Los_Angeles                ║
+║                                                  ║
+╚══════════════════════════════════════════════════╝
+  `);
+});
+
+export default app;
