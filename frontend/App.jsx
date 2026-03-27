@@ -415,7 +415,7 @@ export default function App() {
               <div style={S.tableWrap}>
                 <table style={S.table}>
                   <thead><tr>
-                    <th style={S.th}>Day</th><th style={S.th}>Date</th><th style={S.th}>FB Spend</th><th style={S.th}>Registrations</th><th style={S.th}>Replays</th><th style={S.th}>Viewed CTA</th><th style={S.th}>Clicked CTA</th><th style={S.th}>Purchases</th><th style={S.th}>Attended</th>
+                    <th style={S.th}>Day</th><th style={S.th}>Date</th><th style={S.th}>FB Spend</th><th style={S.th}>Registrations</th><th style={S.th}>Attended</th><th style={S.th}>Replays</th><th style={S.th}>Viewed CTA</th><th style={S.th}>Clicked CTA</th><th style={S.th}>Purchases</th>
                     {customs.map(cm => <th key={cm.id} style={{ ...S.th, color: "#12864A" }}>{cm.name}</th>)}
                     <th style={{ ...S.th, width: 72 }}>Actions</th>
                   </tr></thead>
@@ -430,11 +430,11 @@ export default function App() {
                           <td style={S.td}><span style={{ color: "#1A1A1A", fontWeight: 500, fontSize: 14 }}>{fmtDateNice(row.date)}</span>{isToday && <span style={S.todayDot} />}</td>
                           <td style={S.tdMoney}>${(Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>
                           <td style={S.tdNum}>{(Number(row.registrations) || 0).toLocaleString()}</td>
+                          <td style={S.tdNum}>{(Number(row.attended) || 0).toLocaleString()}</td>
                           <td style={S.tdNum}>{(Number(row.replays) || 0).toLocaleString()}</td>
                           <td style={S.tdNum}>{(Number(row.viewedcta) || 0).toLocaleString()}</td>
                           <td style={S.tdNum}>{(Number(row.clickedcta) || 0).toLocaleString()}</td>
                           <td style={S.tdNum}><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></td>
-                          <td style={S.tdNum}>{(Number(row.attended) || 0).toLocaleString()}</td>
                           {customs.map(cm => { const v = evalFormula(cm.formula, row); return <td key={cm.id} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(v, cm.format)}</td>; })}
                           <td style={S.td}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
@@ -464,11 +464,11 @@ export default function App() {
                     <div style={S.boardCardBody}>
                       <div style={S.bcItem}><span style={S.bcLabel}>FB Spend</span><span style={S.bcVal}>${(Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</span></div>
                       <div style={S.bcItem}><span style={S.bcLabel}>Registrations</span><span style={S.bcVal}>{(Number(row.registrations) || 0).toLocaleString()}</span></div>
+                      <div style={S.bcItem}><span style={S.bcLabel}>Attended</span><span style={S.bcVal}>{(Number(row.attended) || 0).toLocaleString()}</span></div>
                       <div style={S.bcItem}><span style={S.bcLabel}>Replays</span><span style={S.bcVal}>{(Number(row.replays) || 0).toLocaleString()}</span></div>
                       <div style={S.bcItem}><span style={S.bcLabel}>Viewed CTA</span><span style={S.bcVal}>{(Number(row.viewedcta) || 0).toLocaleString()}</span></div>
                       <div style={S.bcItem}><span style={S.bcLabel}>Clicked CTA</span><span style={S.bcVal}>{(Number(row.clickedcta) || 0).toLocaleString()}</span></div>
                       <div style={S.bcItem}><span style={S.bcLabel}>Purchases</span><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></div>
-                      <div style={S.bcItem}><span style={S.bcLabel}>Attended</span><span style={S.bcVal}>{(Number(row.attended) || 0).toLocaleString()}</span></div>
                       {customs.map(cm => { const v = evalFormula(cm.formula, row); return <div key={cm.id} style={S.bcItem}><span style={S.bcLabel}>{cm.name}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(v, cm.format)}</span></div>; })}
                     </div>
                     <div style={S.boardCardActions}>
