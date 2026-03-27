@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
     viewedcta       INTEGER NOT NULL DEFAULT 0,
     clickedcta      INTEGER NOT NULL DEFAULT 0,
     purchases       INTEGER NOT NULL DEFAULT 0,
+    attended        INTEGER NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

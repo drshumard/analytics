@@ -97,7 +97,7 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "registrations", "replays", "viewedcta", "clickedcta", "purchases"];
+const MK = ["fb_spend", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "attended"];
 const evalFormula = (f, row) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(k, "gi"), String(Number(row[k]) || 0)); if (/[^0-9+\-*/().%\s_]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
 const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` : fmt === "currency" ? `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
 
@@ -415,13 +415,13 @@ export default function App() {
               <div style={S.tableWrap}>
                 <table style={S.table}>
                   <thead><tr>
-                    <th style={S.th}>Day</th><th style={S.th}>Date</th><th style={S.th}>FB Spend</th><th style={S.th}>Registrations</th><th style={S.th}>Replays</th><th style={S.th}>Viewed CTA</th><th style={S.th}>Clicked CTA</th><th style={S.th}>Purchases</th>
+                    <th style={S.th}>Day</th><th style={S.th}>Date</th><th style={S.th}>FB Spend</th><th style={S.th}>Registrations</th><th style={S.th}>Replays</th><th style={S.th}>Viewed CTA</th><th style={S.th}>Clicked CTA</th><th style={S.th}>Purchases</th><th style={S.th}>Attended</th>
                     {customs.map(cm => <th key={cm.id} style={{ ...S.th, color: "#12864A" }}>{cm.name}</th>)}
                     <th style={{ ...S.th, width: 72 }}>Actions</th>
                   </tr></thead>
                   <tbody>
                     {filtered.length === 0 ? (
-                      <tr><td colSpan={9 + customs.length} style={S.emptyTd}>No entries found for this period.</td></tr>
+                      <tr><td colSpan={10 + customs.length} style={S.emptyTd}>No entries found for this period.</td></tr>
                     ) : filtered.map((row) => {
                       const isToday = row.date === getLADate();
                       return (
@@ -434,6 +434,7 @@ export default function App() {
                           <td style={S.tdNum}>{(Number(row.viewedcta) || 0).toLocaleString()}</td>
                           <td style={S.tdNum}>{(Number(row.clickedcta) || 0).toLocaleString()}</td>
                           <td style={S.tdNum}><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></td>
+                          <td style={S.tdNum}>{(Number(row.attended) || 0).toLocaleString()}</td>
                           {customs.map(cm => { const v = evalFormula(cm.formula, row); return <td key={cm.id} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(v, cm.format)}</td>; })}
                           <td style={S.td}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
@@ -467,6 +468,7 @@ export default function App() {
                       <div style={S.bcItem}><span style={S.bcLabel}>Viewed CTA</span><span style={S.bcVal}>{(Number(row.viewedcta) || 0).toLocaleString()}</span></div>
                       <div style={S.bcItem}><span style={S.bcLabel}>Clicked CTA</span><span style={S.bcVal}>{(Number(row.clickedcta) || 0).toLocaleString()}</span></div>
                       <div style={S.bcItem}><span style={S.bcLabel}>Purchases</span><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></div>
+                      <div style={S.bcItem}><span style={S.bcLabel}>Attended</span><span style={S.bcVal}>{(Number(row.attended) || 0).toLocaleString()}</span></div>
                       {customs.map(cm => { const v = evalFormula(cm.formula, row); return <div key={cm.id} style={S.bcItem}><span style={S.bcLabel}>{cm.name}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(v, cm.format)}</span></div>; })}
                     </div>
                     <div style={S.boardCardActions}>
@@ -587,10 +589,10 @@ function Modal({ title, msg, onCancel, onConfirm }) {
 
 function EntryForm({ initial, onSubmit, onCancel }) {
   const today = getLADate();
-  const [f, setF] = useState({ date: initial?.date || today, fb_spend: initial?.fb_spend ?? "", registrations: initial?.registrations ?? "", replays: initial?.replays ?? "", viewedcta: initial?.viewedcta ?? "", clickedcta: initial?.clickedcta ?? "", purchases: initial?.purchases ?? "" });
+  const [f, setF] = useState({ date: initial?.date || today, fb_spend: initial?.fb_spend ?? "", registrations: initial?.registrations ?? "", replays: initial?.replays ?? "", viewedcta: initial?.viewedcta ?? "", clickedcta: initial?.clickedcta ?? "", purchases: initial?.purchases ?? "", attended: initial?.attended ?? "" });
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
-  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases: parseInt(f.purchases) || 0 });
-  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases", l: "Purchases", ph: "0" }];
+  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases: parseInt(f.purchases) || 0, attended: parseInt(f.attended) || 0 });
+  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases", l: "Purchases", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
   return (
     <div className="fi" style={S.fc}>
       <div style={S.fh}><div style={{ ...S.formBadge, background: initial ? "#EFF8FF" : "#ECFDF3", color: initial ? "#175CD3" : "#12864A" }}>{initial ? "EDIT ENTRY" : "NEW ENTRY"}</div><h2 style={S.ft}>{initial ? `Update ${fmtDateNice(initial.date)}` : "Add Daily Metrics"}</h2><p style={S.fs}>Enter metrics for the day. Fields default to 0 if empty.</p></div>

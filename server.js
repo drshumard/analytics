@@ -203,6 +203,7 @@ app.post('/api/metrics', webhookLimiter, authenticateWebhook, async (req, res) =
             viewedcta: parseInt(body.viewedcta) || 0,
             clickedcta: parseInt(body.clickedcta) || 0,
             purchases: parseInt(body.purchases) || 0,
+            attended: parseInt(body.attended) || 0,
         };
 
         const { data, error } = await supabase
@@ -255,6 +256,7 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
                 viewedcta: parseInt(entry.viewedcta) || 0,
                 clickedcta: parseInt(entry.clickedcta) || 0,
                 purchases: parseInt(entry.purchases) || 0,
+                attended: parseInt(entry.attended) || 0,
             });
         }
 
@@ -279,7 +281,7 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
 app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
         const { field, count = 1, name, email, phone, ...rest } = req.body;
-        const validFields = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases'];
+        const validFields = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -343,7 +345,7 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
 app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
         const { field, value, date: dateInput } = req.body;
-        const validFields = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases'];
+        const validFields = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -508,6 +510,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 viewedcta: row.viewedcta,
                 clickedcta: row.clickedcta,
                 purchases: row.purchases,
+                attended: row.attended,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
             };
@@ -537,6 +540,7 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
         if (body.viewedcta !== undefined) updates.viewedcta = parseInt(body.viewedcta) || 0;
         if (body.clickedcta !== undefined) updates.clickedcta = parseInt(body.clickedcta) || 0;
         if (body.purchases !== undefined) updates.purchases = parseInt(body.purchases) || 0;
+        if (body.attended !== undefined) updates.attended = parseInt(body.attended) || 0;
 
         const { data, error } = await supabase
             .from('daily_metrics')

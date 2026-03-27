@@ -32,6 +32,7 @@ Public read access. Writes require Supabase JWT auth.
 | `PUT` | `/api/custom-metrics/:id` | Update a custom metric | Admin |
 | `DELETE` | `/api/custom-metrics/:id` | Delete a custom metric | Admin |
 | `GET` | `/api/events` | List webhook events (`?type=` `?limit=`) | Public |
+|  |  | Types: `registrations`, `replays`, `viewedcta`, `clickedcta`, `purchases`, `attended` |  |
 | `GET` | `/api/webhook-log` | View webhook call log | Public |
 | `POST` | `/api/refresh` | Refresh FB spend for today | Public |
 | `POST` | `/api/refresh-date` | Refresh FB spend for a specific date | Public |
