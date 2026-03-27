@@ -87,7 +87,9 @@ function authenticateWebhook(req, res, next) {
     if (!key) {
         return res.status(401).json({ error: 'Missing API key. Send X-API-Key header.' });
     }
-    if (!crypto.timingSafeEqual(Buffer.from(key), Buffer.from(API_KEY))) {
+    const keyBuf = Buffer.from(key);
+    const apiBuf = Buffer.from(API_KEY);
+    if (keyBuf.length !== apiBuf.length || !crypto.timingSafeEqual(keyBuf, apiBuf)) {
         return res.status(403).json({ error: 'Invalid API key' });
     }
     next();
