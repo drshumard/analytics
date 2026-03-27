@@ -71,7 +71,7 @@ app.use((req, res, next) => {
 // ─── Rate Limiting ───────────────────────────────────────────────────────────
 const webhookLimiter = rateLimit({
     windowMs: 1 * 60 * 1000, // 1 minute
-    max: 60,
+    max: 300,
     message: { error: 'Too many requests, try again later' },
 });
 
