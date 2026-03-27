@@ -37,6 +37,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 // ─── Express App ─────────────────────────────────────────────────────────────
 const app = express();
 
+// Trust first proxy (nginx) — required for express-rate-limit behind a reverse proxy
+app.set('trust proxy', 1);
+
 // Security headers
 app.use(helmet({
     contentSecurityPolicy: false, // Allow inline styles for the React app
