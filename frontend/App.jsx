@@ -123,7 +123,7 @@ const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
 const MK = ["fb_spend", "registrations", "replays", "unique_replays", "viewedcta", "clickedcta", "purchases", "attended"];
 const COL_LABELS = { fb_spend: "FB Spend", registrations: "Registrations", attended: "Attended", replays: "Replays", unique_replays: "Unique Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases: "Purchases" };
-const DEFAULT_HIDDEN = ["unique_replays"];
+const DEFAULT_HIDDEN = [];
 const evalFormula = (f, row) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(k, "gi"), String(Number(row[k]) || 0)); if (/[^0-9+\-*/().%\s_]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
 const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` : fmt === "currency" ? `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
 
