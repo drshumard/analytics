@@ -467,21 +467,59 @@ app.post('/api/refresh-date', dashboardLimiter, async (req, res) => {
     }
 });
 
-// GET /api/me — Return current user's role
+// GET /api/me — Return current user's role and preferences
 app.get('/api/me', dashboardLimiter, requireAuth, async (req, res) => {
     try {
         const { data } = await supabase
             .from('user_roles')
-            .select('role')
+            .select('role, preferences')
             .eq('user_id', req.user.id)
             .single();
         res.json({
             id: req.user.id,
             email: req.user.email,
             role: data?.role || 'viewer',
+            preferences: data?.preferences || {},
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to fetch user info' });
+    }
+});
+
+// PUT /api/me/preferences — Save user preferences (hidden columns, etc.)
+app.put('/api/me/preferences', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const { preferences } = req.body;
+        if (!preferences || typeof preferences !== 'object') {
+            return res.status(400).json({ error: 'Send { preferences: { ... } }' });
+        }
+
+        // Check if user_roles row exists
+        const { data: existing } = await supabase
+            .from('user_roles')
+            .select('user_id')
+            .eq('user_id', req.user.id)
+            .single();
+
+        let error;
+        if (existing) {
+            // Update only preferences, keep existing role
+            ({ error } = await supabase
+                .from('user_roles')
+                .update({ preferences })
+                .eq('user_id', req.user.id));
+        } else {
+            // Insert new row with default viewer role
+            ({ error } = await supabase
+                .from('user_roles')
+                .insert({ user_id: req.user.id, role: 'viewer', preferences }));
+        }
+
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        console.error('❌ PUT /api/me/preferences error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
@@ -502,6 +540,33 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
 
         if (error) throw error;
 
+        // Compute unique replays per day from the events table
+        // Count distinct users (by email → phone → name fallback) for replay events
+        const dates = (data || []).map(r => String(r.date).substring(0, 10));
+        let uniqueReplayMap = {};
+        if (dates.length > 0) {
+            const { data: replayEvents } = await supabase
+                .from('events')
+                .select('email, name, phone, event_time')
+                .eq('event_type', 'replays')
+                .gte('event_time', `${dates[dates.length - 1]}T00:00:00`)
+                .lte('event_time', `${dates[0]}T23:59:59`)
+                .limit(5000);
+
+            if (replayEvents) {
+                for (const ev of replayEvents) {
+                    const d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                    if (!uniqueReplayMap[d]) uniqueReplayMap[d] = new Set();
+                    // Use best available identifier: email > phone > name
+                    const key = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
+                    if (key) uniqueReplayMap[d].add(key);
+                }
+                for (const d of Object.keys(uniqueReplayMap)) {
+                    uniqueReplayMap[d] = uniqueReplayMap[d].size;
+                }
+            }
+        }
+
         // Convert to frontend format (MM/DD/YYYY) — pure string, no timezone shift
         const formatted = (data || []).map(row => {
             const dateStr = String(row.date).substring(0, 10);
@@ -512,6 +577,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 fb_spend: Number(row.fb_spend),
                 registrations: row.registrations,
                 replays: row.replays,
+                unique_replays: uniqueReplayMap[dateStr] || 0,
                 viewedcta: row.viewedcta,
                 clickedcta: row.clickedcta,
                 purchases: row.purchases,

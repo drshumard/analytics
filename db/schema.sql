@@ -101,9 +101,10 @@ CREATE INDEX IF NOT EXISTS idx_events_email ON events (email);
 
 -- User roles for dashboard access control
 CREATE TABLE IF NOT EXISTS user_roles (
-    user_id    UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-    role       TEXT NOT NULL DEFAULT 'viewer' CHECK (role IN ('admin', 'viewer')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    user_id      UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    role         TEXT NOT NULL DEFAULT 'viewer' CHECK (role IN ('admin', 'viewer')),
+    preferences  JSONB NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- AI Insights chat conversations (persisted per user)

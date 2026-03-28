@@ -121,7 +121,9 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "attended"];
+const MK = ["fb_spend", "registrations", "replays", "unique_replays", "viewedcta", "clickedcta", "purchases", "attended"];
+const COL_LABELS = { fb_spend: "FB Spend", registrations: "Registrations", attended: "Attended", replays: "Replays", unique_replays: "Unique Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases: "Purchases" };
+const DEFAULT_HIDDEN = ["unique_replays"];
 const evalFormula = (f, row) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(k, "gi"), String(Number(row[k]) || 0)); if (/[^0-9+\-*/().%\s_]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
 const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` : fmt === "currency" ? `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
 
@@ -149,6 +151,18 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [events, setEvents] = useState([]);
   const [evFilter, setEvFilter] = useState("");
+  const [hiddenCols, setHiddenCols] = useState(DEFAULT_HIDDEN);
+  const [colMenuOpen, setColMenuOpen] = useState(false);
+  const colMenuRef = useRef(null);
+  const savePrefsToServer = async (hidden) => {
+    try {
+      const headers = await getAuthHeaders();
+      await fetch(`${API_BASE}/api/me/preferences`, { method: "PUT", headers, body: JSON.stringify({ preferences: { hidden_cols: hidden } }) });
+    } catch { /* silent */ }
+  };
+  const toggleCol = (col) => { setHiddenCols(prev => { const next = prev.includes(col) ? prev.filter(c => c !== col) : [...prev, col]; savePrefsToServer(next); return next; }); };
+  const isColVisible = (col) => !hiddenCols.includes(col);
+  useEffect(() => { const h = (e) => { if (colMenuRef.current && !colMenuRef.current.contains(e.target)) setColMenuOpen(false); }; document.addEventListener("mousedown", h); return () => document.removeEventListener("mousedown", h); }, []);
   const tt = useRef(null);
 
   const flash = useCallback((msg, type = "ok") => { if (tt.current) clearTimeout(tt.current); setToast({ msg, type }); tt.current = setTimeout(() => setToast(null), 3000); }, []);
@@ -186,6 +200,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/me`, { headers: { Authorization: `Bearer ${token}` } });
       const data = await res.json();
       setUserRole(data.role || "viewer");
+      if (data.preferences?.hidden_cols) setHiddenCols(data.preferences.hidden_cols);
     } catch { setUserRole("viewer"); }
     setAuthLoading(false);
   };
@@ -432,6 +447,19 @@ export default function App() {
                   <div style={viewMode === "list" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("list")}><I d="M4 6h16M4 12h16M4 18h16" size={14} /> List</div>
                   <div style={viewMode === "board" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("board")}><I d="M4 4h4v16H4zM10 4h4v16h-4zM16 4h4v16h-4z" size={14} /> Board</div>
                 </div>
+                <div style={{ position: "relative" }} ref={colMenuRef}>
+                  <button style={S.btnLight} onClick={() => setColMenuOpen(p => !p)}><I d="M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" size={14} stroke="#6B7280" /> Columns</button>
+                  {colMenuOpen && (
+                    <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 6, background: "#fff", border: "1px solid #E5E7EB", borderRadius: 10, padding: "8px 0", boxShadow: "0 4px 12px rgba(0,0,0,0.1)", zIndex: 50, minWidth: 180 }}>
+                      {MK.map(col => (
+                        <label key={col} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 14px", cursor: "pointer", fontSize: 13, color: "#374151", fontWeight: 500 }} onMouseEnter={e => e.currentTarget.style.background = "#F9FAFB"} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                          <input type="checkbox" checked={isColVisible(col)} onChange={() => toggleCol(col)} style={{ accentColor: "#111827" }} />
+                          {COL_LABELS[col]}
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
               <div style={S.searchWrap}><I d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" size={15} stroke="#AEAEA8" /><input style={S.searchInput} placeholder="Search records..." value={search} onChange={e => setSearch(e.target.value)} /></div>
             </div>
@@ -440,26 +468,35 @@ export default function App() {
               <div style={S.tableWrap}>
                 <table style={S.table}>
                   <thead><tr>
-                    <th style={S.th}>Day</th><th style={S.th}>Date</th><th style={S.th}>FB Spend</th><th style={S.th}>Registrations</th><th style={S.th}>Attended</th><th style={S.th}>Replays</th><th style={S.th}>Viewed CTA</th><th style={S.th}>Clicked CTA</th><th style={S.th}>Purchases</th>
+                    <th style={S.th}>Day</th><th style={S.th}>Date</th>
+                    {isColVisible("fb_spend") && <th style={S.th}>FB Spend</th>}
+                    {isColVisible("registrations") && <th style={S.th}>Registrations</th>}
+                    {isColVisible("attended") && <th style={S.th}>Attended</th>}
+                    {isColVisible("replays") && <th style={S.th}>Replays</th>}
+                    {isColVisible("unique_replays") && <th style={S.th}>Unique Replays</th>}
+                    {isColVisible("viewedcta") && <th style={S.th}>Viewed CTA</th>}
+                    {isColVisible("clickedcta") && <th style={S.th}>Clicked CTA</th>}
+                    {isColVisible("purchases") && <th style={S.th}>Purchases</th>}
                     {customs.map(cm => <th key={cm.id} style={{ ...S.th, color: "#12864A" }}>{cm.name}</th>)}
                     <th style={{ ...S.th, width: 72 }}>Actions</th>
                   </tr></thead>
                   <tbody>
                     {filtered.length === 0 ? (
-                      <tr><td colSpan={10 + customs.length} style={S.emptyTd}>No entries found for this period.</td></tr>
+                      <tr><td colSpan={2 + MK.filter(k => isColVisible(k)).length + customs.length + 1} style={S.emptyTd}>No entries found for this period.</td></tr>
                     ) : filtered.map((row) => {
                       const isToday = row.date === getLADate();
                       return (
                         <tr key={row.date} className="trow" style={isToday ? { background: "#F8FDF9" } : {}}>
                           <td style={S.td}><span style={S.dayPill}>{getLADayShort(row.date)}</span></td>
-                          <td style={{ ...S.td, whiteSpace: "nowrap", minWidth: 90, position: "relative" }}><span style={{ color: "#1A1A1A", fontWeight: 500, fontSize: 14 }}>{fmtDateNice(row.date)}</span>{isToday && <span style={S.todayDot} />}</td>
-                          <td style={S.tdMoney}>${(Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>
-                          <td style={S.tdNum}>{(Number(row.registrations) || 0).toLocaleString()}</td>
-                          <td style={S.tdNum}>{(Number(row.attended) || 0).toLocaleString()}</td>
-                          <td style={S.tdNum}>{(Number(row.replays) || 0).toLocaleString()}</td>
-                          <td style={S.tdNum}>{(Number(row.viewedcta) || 0).toLocaleString()}</td>
-                          <td style={S.tdNum}>{(Number(row.clickedcta) || 0).toLocaleString()}</td>
-                          <td style={S.tdNum}><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></td>
+                          <td style={{ ...S.td, whiteSpace: "nowrap", minWidth: 90 }}><span style={{ color: "#1A1A1A", fontWeight: 500, fontSize: 14 }}>{fmtDateNice(row.date)}</span></td>
+                          {isColVisible("fb_spend") && <td style={S.tdMoney}>${(Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>}
+                          {isColVisible("registrations") && <td style={S.tdNum}>{(Number(row.registrations) || 0).toLocaleString()}</td>}
+                          {isColVisible("attended") && <td style={S.tdNum}>{(Number(row.attended) || 0).toLocaleString()}</td>}
+                          {isColVisible("replays") && <td style={S.tdNum}>{(Number(row.replays) || 0).toLocaleString()}</td>}
+                          {isColVisible("unique_replays") && <td style={S.tdNum}>{(Number(row.unique_replays) || 0).toLocaleString()}</td>}
+                          {isColVisible("viewedcta") && <td style={S.tdNum}>{(Number(row.viewedcta) || 0).toLocaleString()}</td>}
+                          {isColVisible("clickedcta") && <td style={S.tdNum}>{(Number(row.clickedcta) || 0).toLocaleString()}</td>}
+                          {isColVisible("purchases") && <td style={S.tdNum}><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></td>}
                           {customs.map(cm => { const v = evalFormula(cm.formula, row); return <td key={cm.id} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(v, cm.format)}</td>; })}
                           <td style={S.td}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
@@ -483,17 +520,18 @@ export default function App() {
                     <div style={S.boardCardHeader}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                         <span style={S.dayPill}>{getLADayShort(row.date)}</span>
-                        <div style={{ fontWeight: 600, color: "#111827", fontSize: 14 }}>{fmtDateNice(row.date)}{row.date === getLADate() && <span style={S.todayDot} />}</div>
+                        <div style={{ fontWeight: 600, color: "#111827", fontSize: 14 }}>{fmtDateNice(row.date)}</div>
                       </div>
                     </div>
                     <div style={S.boardCardBody}>
-                      <div style={S.bcItem}><span style={S.bcLabel}>FB Spend</span><span style={S.bcVal}>${(Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</span></div>
-                      <div style={S.bcItem}><span style={S.bcLabel}>Registrations</span><span style={S.bcVal}>{(Number(row.registrations) || 0).toLocaleString()}</span></div>
-                      <div style={S.bcItem}><span style={S.bcLabel}>Attended</span><span style={S.bcVal}>{(Number(row.attended) || 0).toLocaleString()}</span></div>
-                      <div style={S.bcItem}><span style={S.bcLabel}>Replays</span><span style={S.bcVal}>{(Number(row.replays) || 0).toLocaleString()}</span></div>
-                      <div style={S.bcItem}><span style={S.bcLabel}>Viewed CTA</span><span style={S.bcVal}>{(Number(row.viewedcta) || 0).toLocaleString()}</span></div>
-                      <div style={S.bcItem}><span style={S.bcLabel}>Clicked CTA</span><span style={S.bcVal}>{(Number(row.clickedcta) || 0).toLocaleString()}</span></div>
-                      <div style={S.bcItem}><span style={S.bcLabel}>Purchases</span><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></div>
+                      {isColVisible("fb_spend") && <div style={S.bcItem}><span style={S.bcLabel}>FB Spend</span><span style={S.bcVal}>${(Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</span></div>}
+                      {isColVisible("registrations") && <div style={S.bcItem}><span style={S.bcLabel}>Registrations</span><span style={S.bcVal}>{(Number(row.registrations) || 0).toLocaleString()}</span></div>}
+                      {isColVisible("attended") && <div style={S.bcItem}><span style={S.bcLabel}>Attended</span><span style={S.bcVal}>{(Number(row.attended) || 0).toLocaleString()}</span></div>}
+                      {isColVisible("replays") && <div style={S.bcItem}><span style={S.bcLabel}>Replays</span><span style={S.bcVal}>{(Number(row.replays) || 0).toLocaleString()}</span></div>}
+                      {isColVisible("unique_replays") && <div style={S.bcItem}><span style={S.bcLabel}>Unique Replays</span><span style={S.bcVal}>{(Number(row.unique_replays) || 0).toLocaleString()}</span></div>}
+                      {isColVisible("viewedcta") && <div style={S.bcItem}><span style={S.bcLabel}>Viewed CTA</span><span style={S.bcVal}>{(Number(row.viewedcta) || 0).toLocaleString()}</span></div>}
+                      {isColVisible("clickedcta") && <div style={S.bcItem}><span style={S.bcLabel}>Clicked CTA</span><span style={S.bcVal}>{(Number(row.clickedcta) || 0).toLocaleString()}</span></div>}
+                      {isColVisible("purchases") && <div style={S.bcItem}><span style={S.bcLabel}>Purchases</span><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></div>}
                       {customs.map(cm => { const v = evalFormula(cm.formula, row); return <div key={cm.id} style={S.bcItem}><span style={S.bcLabel}>{cm.name}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(v, cm.format)}</span></div>; })}
                     </div>
                     <div style={S.boardCardActions}>
