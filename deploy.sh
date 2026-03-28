@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── Dr Shumard Analytics — Deploy Script ──
-# Pulls latest from GitHub, rebuilds frontend, and restarts the app.
+# ── Dr Shumard Analytics — Zero-Downtime Deploy Script ──
+# Pulls latest from GitHub, rebuilds frontend, and gracefully reloads the app.
+# PM2 keeps the old process alive until the new one signals ready.
 # Usage: ./deploy.sh [branch]
 #   branch  — git branch to deploy (default: main)
 
@@ -32,13 +33,15 @@ npm ci --prefer-offline
 log "Building frontend…"
 npm run build
 
-# 5. Restart via PM2
-log "Restarting PM2 process…"
+# 5. Zero-downtime reload via PM2
+#    - 'reload' (not 'restart') keeps the old process alive until the new one is ready
+#    - ecosystem.config.cjs has wait_ready: true, so PM2 waits for process.send('ready')
+log "Reloading PM2 process (zero-downtime)…"
 if pm2 describe "$PM2_APP_NAME" > /dev/null 2>&1; then
-    pm2 restart "$PM2_APP_NAME"
+    pm2 reload ecosystem.config.cjs
 else
-    pm2 start server.js --name "$PM2_APP_NAME"
+    pm2 start ecosystem.config.cjs
 fi
 pm2 save
 
-log "═══ Deployment complete ═══"
+log "═══ Deployment complete (zero-downtime) ═══"

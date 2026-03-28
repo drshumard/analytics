@@ -106,3 +106,20 @@ CREATE TABLE IF NOT EXISTS user_roles (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- AI Insights chat conversations (persisted per user)
+CREATE TABLE IF NOT EXISTS chat_conversations (
+    id          TEXT PRIMARY KEY,
+    user_id     UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    title       TEXT NOT NULL DEFAULT 'New chat',
+    messages    JSONB NOT NULL DEFAULT '[]',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_conversations_user
+    ON chat_conversations (user_id, updated_at DESC);
+
+CREATE TRIGGER trg_chat_conversations_updated
+    BEFORE UPDATE ON chat_conversations
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+

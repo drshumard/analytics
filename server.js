@@ -795,6 +795,209 @@ app.get('/api/fb-sync/status', dashboardLimiter, async (req, res) => {
 
 
 // =============================================================================
+// INSIGHTS — AI Business Analyst (Claude API)
+// =============================================================================
+
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) => {
+    if (!ANTHROPIC_API_KEY) {
+        return res.status(503).json({ error: 'AI Insights not configured — set ANTHROPIC_API_KEY' });
+    }
+
+    try {
+        const { messages = [] } = req.body;
+        if (!Array.isArray(messages) || messages.length === 0) {
+            return res.status(400).json({ error: 'Send { messages: [{ role, content }] }' });
+        }
+
+        // Fetch context: last 90 days of metrics + recent events
+        const [metricsRes, eventsRes] = await Promise.all([
+            supabase.from('daily_metrics').select('*').order('date', { ascending: false }).limit(90),
+            supabase.from('events').select('*').order('event_time', { ascending: false }).limit(200),
+        ]);
+
+        const metricsData = (metricsRes.data || []).map(r => ({
+            date: r.date,
+            day: r.day_of_week,
+            fb_spend: Number(r.fb_spend),
+            registrations: r.registrations,
+            attended: r.attended,
+            replays: r.replays,
+            viewedcta: r.viewedcta,
+            clickedcta: r.clickedcta,
+            purchases: r.purchases,
+        }));
+
+        const eventsData = (eventsRes.data || []).map(e => ({
+            type: e.event_type,
+            name: e.name,
+            email: e.email,
+            time: e.event_time,
+        }));
+
+        const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+
+        const systemPrompt = `You are a senior business analyst for Dr Shumard, a medical practice. You analyze their marketing funnel and provide actionable insights.
+
+TODAY'S DATE: ${today} (Los Angeles timezone)
+
+THE FUNNEL STAGES (in order):
+1. FB Spend — daily Facebook ad budget  
+2. Registrations — people who signed up for the webinar
+3. Attended — people who actually attended the webinar
+4. Replays — people who watched the replay
+5. Viewed CTA — people who saw the call to action
+6. Clicked CTA — people who clicked the call to action  
+7. Purchases — people who purchased
+
+KEY METRICS TO TRACK:
+- Cost per Registration (fb_spend / registrations)
+- Attendance Rate (attended / registrations × 100)
+- CTA View Rate (viewedcta / (attended + replays) × 100)
+- CTA Click Rate (clickedcta / viewedcta × 100)
+- Conversion Rate (purchases / clickedcta × 100)
+- Cost per Acquisition (fb_spend / purchases)
+
+DAILY METRICS (last ${metricsData.length} days, newest first):
+${JSON.stringify(metricsData, null, 0)}
+
+RECENT EVENTS (last ${eventsData.length} events — individual registrations/purchases with timestamps):
+${JSON.stringify(eventsData, null, 0)}
+
+INSTRUCTIONS:
+- Give specific, data-backed insights. Reference actual numbers and dates.
+- Identify trends, anomalies, and opportunities.
+- Compare periods (week-over-week, day-over-day) when relevant.
+- Suggest concrete actions to improve funnel conversion.
+- Format responses with markdown: use headers, bullet points, bold for key numbers.
+- Keep responses focused and actionable — not overly long.
+- If asked about something not in the data, say so honestly.`;
+
+        // Call Claude API
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+                model: 'claude-sonnet-4-20250514',
+                max_tokens: 2048,
+                system: systemPrompt,
+                messages: messages.map(m => ({
+                    role: m.role === 'user' ? 'user' : 'assistant',
+                    content: m.content,
+                })),
+            }),
+        });
+
+        if (!response.ok) {
+            const errBody = await response.text();
+            console.error('❌ Claude API error:', response.status, errBody);
+            return res.status(502).json({ error: 'AI service error', detail: errBody });
+        }
+
+        const result = await response.json();
+        const reply = result.content?.[0]?.text || 'No response generated.';
+
+        res.json({ reply, usage: result.usage });
+
+    } catch (err) {
+        console.error('❌ POST /api/insights/chat error:', err.message);
+        res.status(500).json({ error: 'Internal server error', detail: err.message });
+    }
+});
+
+// =============================================================================
+// CHAT CONVERSATION PERSISTENCE
+// =============================================================================
+
+// GET /api/insights/conversations — list all chats for the authenticated user
+app.get('/api/insights/conversations', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('chat_conversations')
+            .select('id, title, updated_at')
+            .eq('user_id', req.user.id)
+            .order('updated_at', { ascending: false });
+
+        if (error) throw error;
+        res.json({ data: data || [] });
+    } catch (err) {
+        console.error('❌ GET /api/insights/conversations error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// GET /api/insights/conversations/:id — fetch a single conversation with messages
+app.get('/api/insights/conversations/:id', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('chat_conversations')
+            .select('*')
+            .eq('id', req.params.id)
+            .eq('user_id', req.user.id)
+            .single();
+
+        if (error) {
+            if (error.code === 'PGRST116') return res.status(404).json({ error: 'Conversation not found' });
+            throw error;
+        }
+        res.json({ data });
+    } catch (err) {
+        console.error('❌ GET /api/insights/conversations/:id error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// PUT /api/insights/conversations/:id — create or update a conversation
+app.put('/api/insights/conversations/:id', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const { title, messages } = req.body;
+        if (!Array.isArray(messages)) {
+            return res.status(400).json({ error: 'messages must be an array' });
+        }
+
+        const { data, error } = await supabase
+            .from('chat_conversations')
+            .upsert({
+                id: req.params.id,
+                user_id: req.user.id,
+                title: title || 'New chat',
+                messages,
+            }, { onConflict: 'id' })
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json({ success: true, data });
+    } catch (err) {
+        console.error('❌ PUT /api/insights/conversations error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// DELETE /api/insights/conversations/:id — delete a conversation
+app.delete('/api/insights/conversations/:id', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const { error } = await supabase
+            .from('chat_conversations')
+            .delete()
+            .eq('id', req.params.id)
+            .eq('user_id', req.user.id);
+
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        console.error('❌ DELETE /api/insights/conversations error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+
+// =============================================================================
 // STATIC FILES (serve the React dashboard)
 // =============================================================================
 
@@ -813,7 +1016,7 @@ app.get('*', (req, res) => {
 // START
 // =============================================================================
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     const fbStatus = (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) ? '✅ Active (every 30 min)' : '⚠️  Not configured';
     console.log(`
 ╔══════════════════════════════════════════════════╗
@@ -828,6 +1031,21 @@ app.listen(PORT, () => {
 ║                                                  ║
 ╚══════════════════════════════════════════════════╝
   `);
+
+    // Signal PM2 that this process is ready to accept traffic
+    if (process.send) process.send('ready');
+});
+
+// ─── Graceful Shutdown ───────────────────────────────────────────────────────
+// PM2 sends SIGINT during reload — finish in-flight requests, then exit cleanly
+process.on('SIGINT', () => {
+    console.log('⏳ Graceful shutdown: closing server…');
+    server.close(() => {
+        console.log('✅ Server closed — all requests finished');
+        process.exit(0);
+    });
+    // Force shutdown after 4s if connections don't drain
+    setTimeout(() => { process.exit(0); }, 4000);
 });
 
 export default app;

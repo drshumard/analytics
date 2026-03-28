@@ -84,6 +84,30 @@ const api = {
     if (!res.ok) throw new Error(`Failed to fetch events: ${res.status}`);
     return res.json();
   },
+  async chat(messages) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/insights/chat`, { method: "POST", headers, body: JSON.stringify({ messages }) });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Chat failed: ${res.status}`); }
+    return res.json();
+  },
+  async getConversations() {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/insights/conversations`, { headers });
+    if (!res.ok) throw new Error(`Failed to fetch conversations: ${res.status}`);
+    return res.json();
+  },
+  async saveConversation(id, title, messages) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/insights/conversations/${id}`, { method: "PUT", headers, body: JSON.stringify({ title, messages }) });
+    if (!res.ok) throw new Error(`Failed to save conversation: ${res.status}`);
+    return res.json();
+  },
+  async deleteConversation(id) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/insights/conversations/${id}`, { method: "DELETE", headers });
+    if (!res.ok) throw new Error(`Failed to delete conversation: ${res.status}`);
+    return res.json();
+  },
 };
 
 function getLocalKey() {
@@ -94,7 +118,7 @@ function getLocalKey() {
 const getLADate = () => new Date().toLocaleDateString("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit" });
 const getLADay = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { weekday: "long" }); } catch { return ""; } };
 const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { weekday: "short" }); } catch { return ""; } };
-const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); } catch { return d; } };
+const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
 const MK = ["fb_spend", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "attended"];
@@ -332,6 +356,7 @@ export default function App() {
 
           {view === "dash" && (
             <>
+              <button style={S.btnLight} onClick={() => setView("insights")}>✨ Insights</button>
               <button style={S.btnLight} onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}>Activity Log</button>
               {isAdmin && <button style={S.btnLight} onClick={() => { setEditCM(null); setView("custom-list"); }}>Manage Metrics</button>}
             </>
@@ -427,7 +452,7 @@ export default function App() {
                       return (
                         <tr key={row.date} className="trow" style={isToday ? { background: "#F8FDF9" } : {}}>
                           <td style={S.td}><span style={S.dayPill}>{getLADayShort(row.date)}</span></td>
-                          <td style={S.td}><span style={{ color: "#1A1A1A", fontWeight: 500, fontSize: 14 }}>{fmtDateNice(row.date)}</span>{isToday && <span style={S.todayDot} />}</td>
+                          <td style={{ ...S.td, whiteSpace: "nowrap", minWidth: 90, position: "relative" }}><span style={{ color: "#1A1A1A", fontWeight: 500, fontSize: 14 }}>{fmtDateNice(row.date)}</span>{isToday && <span style={S.todayDot} />}</td>
                           <td style={S.tdMoney}>${(Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>
                           <td style={S.tdNum}>{(Number(row.registrations) || 0).toLocaleString()}</td>
                           <td style={S.tdNum}>{(Number(row.attended) || 0).toLocaleString()}</td>
@@ -565,6 +590,7 @@ export default function App() {
             </div>
           </div>
         )}
+        {view === "insights" && <InsightsChat flash={flash} />}
       </main>
 
       {delConfirm && <Modal title="Delete Entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
@@ -622,6 +648,288 @@ function CMForm({ initial, onSubmit, onCancel, metrics }) {
   );
 }
 
+// Simple markdown renderer for chat messages
+function renderMd(text) {
+  if (!text) return text;
+  return text.split('\n').map((line, i) => {
+    // Headers
+    if (line.startsWith('### ')) return <h4 key={i} style={{ fontSize: 14, fontWeight: 700, color: "#111827", margin: "12px 0 4px" }}>{line.slice(4)}</h4>;
+    if (line.startsWith('## ')) return <h3 key={i} style={{ fontSize: 15, fontWeight: 700, color: "#111827", margin: "14px 0 4px" }}>{line.slice(3)}</h3>;
+    if (line.startsWith('# ')) return <h2 key={i} style={{ fontSize: 16, fontWeight: 700, color: "#111827", margin: "16px 0 6px" }}>{line.slice(2)}</h2>;
+    // Bullet points
+    if (line.startsWith('- ') || line.startsWith('* ')) {
+      const content = line.slice(2);
+      return <div key={i} style={{ paddingLeft: 12, margin: "3px 0", display: "flex", gap: 6 }}><span style={{ color: "#9CA3AF" }}>•</span><span>{renderInline(content)}</span></div>;
+    }
+    // Empty line
+    if (line.trim() === '') return <div key={i} style={{ height: 8 }} />;
+    // Regular paragraph
+    return <p key={i} style={{ margin: "3px 0", lineHeight: 1.6 }}>{renderInline(line)}</p>;
+  });
+}
+
+function renderInline(text) {
+  // Bold **text**
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={i} style={{ fontWeight: 700, color: "#111827" }}>{part.slice(2, -2)}</strong>;
+    }
+    return <span key={i}>{part}</span>;
+  });
+}
+
+function InsightsChat({ flash }) {
+  const [history, setHistory] = useState([]);
+  const [activeId, setActiveId] = useState(null);
+  const [chatMsgs, setChatMsgs] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const chatEndRef = useRef(null);
+  // Cache of full conversation messages (sidebar list only has id/title/updated_at)
+  const msgsCache = useRef({});
+
+  // Load conversation list from Supabase on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await api.getConversations();
+        setHistory(data || []);
+      } catch (e) {
+        console.error('Failed to load conversations:', e.message);
+      } finally {
+        setHistoryLoading(false);
+      }
+    })();
+  }, []);
+
+  // When selecting a chat, fetch full messages if not cached
+  useEffect(() => {
+    if (!activeId) { setChatMsgs([]); return; }
+    if (msgsCache.current[activeId]) {
+      setChatMsgs(msgsCache.current[activeId]);
+      return;
+    }
+    // Messages aren't in cache — for newly created chats they will be;
+    // for existing ones loaded from sidebar we need to fetch them
+    (async () => {
+      try {
+        const headers = await getAuthHeaders();
+        const res = await fetch(`${API_BASE}/api/insights/conversations/${activeId}`, { headers });
+        if (res.ok) {
+          const body = await res.json();
+          const msgs = body.data?.messages || [];
+          msgsCache.current[activeId] = msgs;
+          setChatMsgs(msgs);
+        }
+      } catch { /* fallback: empty */ }
+    })();
+  }, [activeId]);
+
+  // Auto-scroll
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatMsgs, chatLoading]);
+
+  const saveChat = async (id, msgs) => {
+    const title = msgs.find(m => m.role === "user")?.content?.slice(0, 50) || "New chat";
+    msgsCache.current[id] = msgs;
+    // Optimistic UI update
+    setHistory(prev => {
+      const existing = prev.find(c => c.id === id);
+      if (existing) {
+        return prev.map(c => c.id === id ? { ...c, title, updated_at: new Date().toISOString() } : c);
+      }
+      return [{ id, title, updated_at: new Date().toISOString() }, ...prev];
+    });
+    // Persist to Supabase (fire-and-forget)
+    api.saveConversation(id, title, msgs).catch(e => console.error('Save chat error:', e.message));
+  };
+
+  const newChat = () => { setActiveId(null); setChatMsgs([]); setChatInput(""); };
+
+  const deleteChat = async (id) => {
+    setHistory(prev => prev.filter(c => c.id !== id));
+    delete msgsCache.current[id];
+    if (activeId === id) { setActiveId(null); setChatMsgs([]); }
+    api.deleteConversation(id).catch(e => flash(e.message, "err"));
+  };
+
+  const starters = [
+    "What trends do you see this week?",
+    "How can we improve CTA conversion?",
+    "Summarize today's performance",
+    "What's our cost per acquisition trend?",
+    "Compare this week vs last week",
+  ];
+
+  const sendMessage = async (text) => {
+    const msg = text || chatInput.trim();
+    if (!msg || chatLoading) return;
+
+    const chatId = activeId || `chat-${Date.now()}`;
+    if (!activeId) setActiveId(chatId);
+
+    const newMsgs = [...chatMsgs, { role: "user", content: msg }];
+    setChatMsgs(newMsgs);
+    setChatInput("");
+    setChatLoading(true);
+    saveChat(chatId, newMsgs);
+
+    try {
+      const { reply } = await api.chat(newMsgs);
+      const fullMsgs = [...newMsgs, { role: "assistant", content: reply }];
+      setChatMsgs(fullMsgs);
+      saveChat(chatId, fullMsgs);
+    } catch (e) {
+      flash(e.message, "err");
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  const fmtTime = (ts) => {
+    const d = new Date(ts);
+    const now = new Date();
+    const diff = now - d;
+    if (diff < 60000) return "Just now";
+    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+    if (diff < 604800000) return d.toLocaleDateString("en-US", { weekday: "short" });
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  };
+
+  const IC = {
+    outer: { display: "flex", height: "calc(100vh - 120px)", gap: 0 },
+    sidebar: { width: sidebarOpen ? 260 : 0, minWidth: sidebarOpen ? 260 : 0, background: "#F9FAFB", borderRight: sidebarOpen ? "1px solid #E5E7EB" : "none", display: "flex", flexDirection: "column", overflow: "hidden", transition: "width 0.2s, min-width 0.2s", borderRadius: "12px 0 0 12px" },
+    sidebarHeader: { padding: "16px", borderBottom: "1px solid #E5E7EB", display: "flex", justifyContent: "space-between", alignItems: "center" },
+    sidebarTitle: { fontSize: 13, fontWeight: 600, color: "#374151", letterSpacing: "0.02em", textTransform: "uppercase" },
+    newBtn: { padding: "5px 10px", background: "#111827", color: "#fff", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "Inter, sans-serif" },
+    chatList: { flex: 1, overflowY: "auto", padding: "8px" },
+    chatItem: { padding: "10px 12px", borderRadius: 8, cursor: "pointer", marginBottom: 4, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, transition: "background 0.1s" },
+    chatItemActive: { background: "#fff", border: "1px solid #E5E7EB", boxShadow: "0 1px 2px rgba(0,0,0,0.04)" },
+    chatItemInactive: { background: "transparent", border: "1px solid transparent" },
+    chatTitle: { fontSize: 13, fontWeight: 500, color: "#111827", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 },
+    chatTime: { fontSize: 11, color: "#9CA3AF", whiteSpace: "nowrap", marginTop: 2 },
+    delBtn: { background: "none", border: "none", cursor: "pointer", padding: 2, fontSize: 14, color: "#D1D5DB", flexShrink: 0 },
+    main: { flex: 1, display: "flex", flexDirection: "column", padding: "0 0 0 16px", minWidth: 0 },
+    header: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 },
+    headerLeft: {},
+    title: { fontSize: 24, fontWeight: 600, color: "#111827", letterSpacing: "-0.02em" },
+    sub: { fontSize: 13, color: "#6B7280", marginTop: 4 },
+    toggleBtn: { background: "none", border: "1px solid #E5E7EB", borderRadius: 8, cursor: "pointer", padding: "6px 10px", fontSize: 13, color: "#6B7280", fontFamily: "Inter, sans-serif" },
+    body: { flex: 1, overflowY: "auto", padding: "0 4px", display: "flex", flexDirection: "column", gap: 12 },
+    empty: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20 },
+    emptyIcon: { width: 48, height: 48, borderRadius: "50%", background: "linear-gradient(135deg, #EEF2FF, #E0E7FF)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24 },
+    emptyTitle: { fontSize: 18, fontWeight: 600, color: "#111827" },
+    emptyDesc: { fontSize: 14, color: "#6B7280", textAlign: "center", maxWidth: 360 },
+    chips: { display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "center", marginTop: 8 },
+    chip: { padding: "8px 14px", background: "#fff", border: "1px solid #E5E7EB", borderRadius: 20, fontSize: 13, color: "#374151", cursor: "pointer", fontWeight: 500, transition: "all 0.15s" },
+    userBub: { alignSelf: "flex-end", maxWidth: "75%", padding: "10px 16px", background: "#111827", color: "#fff", borderRadius: "16px 16px 4px 16px", fontSize: 14, lineHeight: 1.5 },
+    aiBub: { alignSelf: "flex-start", maxWidth: "85%", padding: "14px 18px", background: "#F9FAFB", border: "1px solid #E5E7EB", borderRadius: "16px 16px 16px 4px", fontSize: 14, lineHeight: 1.5, color: "#374151" },
+    typing: { alignSelf: "flex-start", padding: "12px 18px", background: "#F9FAFB", border: "1px solid #E5E7EB", borderRadius: "16px 16px 16px 4px", display: "flex", gap: 5, alignItems: "center" },
+    dot: { width: 6, height: 6, borderRadius: "50%", background: "#9CA3AF" },
+    inputWrap: { display: "flex", gap: 8, padding: "12px 0", borderTop: "1px solid #F3F4F6", marginTop: 8 },
+    input: { flex: 1, padding: "12px 16px", border: "1px solid #E5E7EB", borderRadius: 12, fontSize: 14, outline: "none", fontFamily: "Inter, sans-serif", background: "#fff" },
+    sendBtn: { padding: "10px 20px", background: "#111827", color: "#fff", border: "none", borderRadius: 12, fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "Inter, sans-serif", whiteSpace: "nowrap" },
+  };
+
+  return (
+    <div style={IC.outer}>
+      {/* Sidebar */}
+      <div style={IC.sidebar}>
+        <div style={IC.sidebarHeader}>
+          <span style={IC.sidebarTitle}>Chat History</span>
+          <button style={IC.newBtn} onClick={newChat}>+ New</button>
+        </div>
+        <div style={IC.chatList}>
+          {historyLoading ? (
+            <div style={{ padding: 16, textAlign: "center", color: "#9CA3AF", fontSize: 13 }}>Loading…</div>
+          ) : history.length === 0 ? (
+            <div style={{ padding: 16, textAlign: "center", color: "#9CA3AF", fontSize: 13 }}>No conversations yet</div>
+          ) : (
+            [...history].sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at)).map(chat => (
+              <div
+                key={chat.id}
+                style={{ ...IC.chatItem, ...(activeId === chat.id ? IC.chatItemActive : IC.chatItemInactive) }}
+                onClick={() => setActiveId(chat.id)}
+                onMouseEnter={e => { if (activeId !== chat.id) e.currentTarget.style.background = "#F3F4F6"; }}
+                onMouseLeave={e => { if (activeId !== chat.id) e.currentTarget.style.background = "transparent"; }}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={IC.chatTitle}>{chat.title}</div>
+                  <div style={IC.chatTime}>{fmtTime(new Date(chat.updated_at).getTime())}</div>
+                </div>
+                <button style={IC.delBtn} onClick={e => { e.stopPropagation(); deleteChat(chat.id); }} title="Delete">×</button>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* Main chat area */}
+      <div style={IC.main}>
+        <div style={IC.header}>
+          <div style={IC.headerLeft}>
+            <h1 style={IC.title}>✨ AI Insights</h1>
+            <div style={IC.sub}>Ask questions about your funnel data · Powered by Claude</div>
+          </div>
+          <button style={IC.toggleBtn} onClick={() => setSidebarOpen(p => !p)}>
+            {sidebarOpen ? "◀ Hide" : "▶ History"}
+          </button>
+        </div>
+
+        <div style={IC.body}>
+          {chatMsgs.length === 0 && !chatLoading ? (
+            <div style={IC.empty}>
+              <div style={IC.emptyIcon}>📊</div>
+              <div style={IC.emptyTitle}>Ask me anything about your data</div>
+              <div style={IC.emptyDesc}>I can analyze trends, compare periods, identify anomalies, and suggest improvements for your marketing funnel.</div>
+              <div style={IC.chips}>
+                {starters.map(s => (
+                  <button key={s} style={IC.chip} onClick={() => sendMessage(s)} onMouseEnter={e => { e.target.style.background = "#F3F4F6"; e.target.style.borderColor = "#D1D5DB"; }} onMouseLeave={e => { e.target.style.background = "#fff"; e.target.style.borderColor = "#E5E7EB"; }}>
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <>
+              {chatMsgs.map((m, i) => (
+                <div key={i} style={m.role === "user" ? IC.userBub : IC.aiBub}>
+                  {m.role === "assistant" ? renderMd(m.content) : m.content}
+                </div>
+              ))}
+              {chatLoading && (
+                <div style={IC.typing}>
+                  <div className="blink-1" style={IC.dot} />
+                  <div className="blink-2" style={IC.dot} />
+                  <div className="blink-3" style={IC.dot} />
+                </div>
+              )}
+              <div ref={chatEndRef} />
+            </>
+          )}
+        </div>
+
+        <div style={IC.inputWrap}>
+          <input
+            style={IC.input}
+            value={chatInput}
+            onChange={e => setChatInput(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && !e.shiftKey && sendMessage()}
+            placeholder="Ask about your metrics, trends, conversions..."
+            disabled={chatLoading}
+          />
+          <button style={{ ...IC.sendBtn, opacity: chatLoading || !chatInput.trim() ? 0.5 : 1 }} onClick={() => sendMessage()} disabled={chatLoading || !chatInput.trim()}>
+            {chatLoading ? "Thinking..." : "Send"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -636,6 +944,8 @@ body{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 .rowBtn{opacity:0;transition:opacity 150ms ease}
 input:focus{outline:none;border-color:#D1D5DB!important;box-shadow:0 0 0 3px rgba(243,244,246,1)!important}
 ::selection{background:rgba(18,134,74,0.12)}
+@keyframes blink{0%,100%{opacity:0.3}50%{opacity:1}}
+.blink-1{animation:blink 1.2s 0s infinite}.blink-2{animation:blink 1.2s 0.2s infinite}.blink-3{animation:blink 1.2s 0.4s infinite}
 `;
 
 const fn = "'Inter',-apple-system,BlinkMacSystemFont,sans-serif";
@@ -672,7 +982,7 @@ const S = {
   tdNum: { padding: "14px 20px", borderBottom: "1px solid #F3F4F6", fontWeight: 500, fontVariantNumeric: "tabular-nums", color: "#111827", fontSize: 13, textAlign: "center" },
   tdMoney: { padding: "14px 20px", borderBottom: "1px solid #F3F4F6", fontWeight: 500, fontVariantNumeric: "tabular-nums", color: "#111827", fontSize: 13, textAlign: "center" },
   dayPill: { display: "inline-block", padding: "4px 10px", background: "#F3F4F6", color: "#4B5563", fontSize: 11, fontWeight: 600, borderRadius: 6, letterSpacing: "0.02em", textTransform: "uppercase" },
-  todayDot: { display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "#F97316", marginLeft: 8, verticalAlign: "middle" },
+  todayDot: { display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "#F97316", marginLeft: 4, verticalAlign: "middle" },
   purchBadge: { display: "inline-block", padding: "2px 8px", background: "#ECFDF5", color: "#047857", fontWeight: 600, borderRadius: 4, border: "1px solid #A7F3D0" },
   emptyTd: { padding: 48, textAlign: "center", color: "#9CA3AF", fontSize: 14, fontWeight: 500 },
   rowAct: { background: "#fff", border: "1px solid #E5E7EB", borderRadius: 6, cursor: "pointer", padding: "6px", display: "inline-flex", alignItems: "center", boxShadow: "0 1px 2px rgba(0,0,0,0.02)" },
