@@ -344,6 +344,15 @@ export default function App() {
             <input type="password" value={authPass} onChange={e => setAuthPass(e.target.value)} required style={{ width: "100%", padding: "10px 14px", borderRadius: 10, border: "1px solid #D1D5DB", fontSize: 14, outline: "none", boxSizing: "border-box" }} />
           </div>
           <button type="submit" style={{ ...S.btnDark, width: "100%", justifyContent: "center", padding: "11px 0", borderRadius: 10, fontSize: 14, fontWeight: 600 }}>Sign In</button>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "20px 0" }}>
+            <div style={{ flex: 1, height: 1, background: "#E5E7EB" }} />
+            <span style={{ fontSize: 12, color: "#9CA3AF", fontWeight: 500 }}>or</span>
+            <div style={{ flex: 1, height: 1, background: "#E5E7EB" }} />
+          </div>
+          <button type="button" onClick={() => supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.origin } })} style={{ ...S.btnLight, width: "100%", justifyContent: "center", padding: "11px 0", borderRadius: 10, fontSize: 14, fontWeight: 600, gap: 10 }}>
+            <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59a14.5 14.5 0 010-9.18l-7.98-6.19a24.01 24.01 0 000 21.56l7.98-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+            Continue with Google
+          </button>
         </form>
       </div>
     </div>
@@ -371,7 +380,7 @@ export default function App() {
 
           {view === "dash" && (
             <>
-              <button style={S.btnLight} onClick={() => setView("insights")}>✨ Insights</button>
+              <button style={S.btnLight} onClick={() => setView("insights")}>Insights</button>
               <button style={S.btnLight} onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}>Activity Log</button>
               {isAdmin && <button style={S.btnLight} onClick={() => { setEditCM(null); setView("custom-list"); }}>Manage Metrics</button>}
             </>
