@@ -575,73 +575,56 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
 
         if (error) throw error;
 
-        // Compute unique replays per day from the events table
-        // Count distinct users (by email → phone → name fallback) for replay events
+        // Compute deduplicated counts per day for all event types from the events table
+        // Groups by date (LA timezone) + event_type, counts distinct users (email → phone → name)
         const dates = (data || []).map(r => String(r.date).substring(0, 10));
-        let uniqueReplayMap = {};
+        const dedupMap = {}; // { "2026-03-29": { registrations: 196, replays: 45, ... } }
+        const EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', 'purchases'];
+
         if (dates.length > 0) {
-            const { data: replayEvents } = await supabase
+            const { data: allEvents } = await supabase
                 .from('events')
-                .select('email, name, phone, event_time')
-                .eq('event_type', 'replays')
+                .select('event_type, email, name, phone, event_time')
+                .in('event_type', EVENT_TYPES)
                 .gte('event_time', `${dates[dates.length - 1]}T00:00:00`)
                 .lte('event_time', `${dates[0]}T23:59:59`)
-                .limit(5000);
+                .limit(10000);
 
-            if (replayEvents) {
-                for (const ev of replayEvents) {
+            if (allEvents) {
+                // Group by date + event_type, track unique users
+                const sets = {}; // key: "YYYY-MM-DD|event_type" → Set of user keys
+                for (const ev of allEvents) {
                     const d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-                    if (!uniqueReplayMap[d]) uniqueReplayMap[d] = new Set();
-                    // Use best available identifier: email > phone > name
-                    const key = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
-                    if (key) uniqueReplayMap[d].add(key);
+                    const k = `${d}|${ev.event_type}`;
+                    if (!sets[k]) sets[k] = new Set();
+                    const userKey = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
+                    if (userKey) sets[k].add(userKey);
                 }
-                for (const d of Object.keys(uniqueReplayMap)) {
-                    uniqueReplayMap[d] = uniqueReplayMap[d].size;
+                // Convert to counts — only override if we found identifiable users
+                for (const [k, userSet] of Object.entries(sets)) {
+                    if (userSet.size === 0) continue; // no identifiable users, fall back to raw count
+                    const [d, type] = k.split('|');
+                    if (!dedupMap[d]) dedupMap[d] = {};
+                    dedupMap[d][type] = userSet.size;
                 }
             }
         }
 
-        // Compute unique purchases per day (dedup double-processed payments)
-        let uniquePurchaseMap = {};
-        if (dates.length > 0) {
-            const { data: purchaseEvents } = await supabase
-                .from('events')
-                .select('email, name, phone, event_time')
-                .eq('event_type', 'purchases')
-                .gte('event_time', `${dates[dates.length - 1]}T00:00:00`)
-                .lte('event_time', `${dates[0]}T23:59:59`)
-                .limit(5000);
-
-            if (purchaseEvents) {
-                for (const ev of purchaseEvents) {
-                    const d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-                    if (!uniquePurchaseMap[d]) uniquePurchaseMap[d] = new Set();
-                    const key = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
-                    if (key) uniquePurchaseMap[d].add(key);
-                }
-                for (const d of Object.keys(uniquePurchaseMap)) {
-                    uniquePurchaseMap[d] = uniquePurchaseMap[d].size;
-                }
-            }
-        }
-
-        // Convert to frontend format (MM/DD/YYYY) — pure string, no timezone shift
+        // Convert to frontend format (MM/DD/YYYY) — use deduped counts where available
         const formatted = (data || []).map(row => {
             const dateStr = String(row.date).substring(0, 10);
             const mmddyyyy = dateStr.replace(/(\d{4})-(\d{2})-(\d{2})/, '$2/$3/$1');
+            const deduped = dedupMap[dateStr] || {};
             return {
                 date: mmddyyyy,
                 day: row.day_of_week,
                 fb_spend: Number(row.fb_spend),
-                registrations: row.registrations,
-                replays: row.replays,
-                unique_replays: uniqueReplayMap[dateStr] || 0,
-                viewedcta: row.viewedcta,
-                clickedcta: row.clickedcta,
-                purchases: row.purchases,
-                unique_purchases: uniquePurchaseMap[dateStr] || 0,
-                attended: row.attended,
+                registrations: deduped.registrations ?? row.registrations,
+                replays: deduped.replays ?? row.replays,
+                viewedcta: deduped.viewedcta ?? row.viewedcta,
+                clickedcta: deduped.clickedcta ?? row.clickedcta,
+                purchases: deduped.purchases ?? row.purchases,
+                attended: deduped.attended ?? row.attended,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
             };

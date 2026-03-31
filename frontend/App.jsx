@@ -121,9 +121,9 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "registrations", "replays", "unique_replays", "viewedcta", "clickedcta", "purchases", "unique_purchases", "attended"];
-const COL_LABELS = { fb_spend: "FB Spend", registrations: "Registrations", attended: "Attended", replays: "Replays", unique_replays: "Unique Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases: "Purchases", unique_purchases: "Unique Purchases" };
-const DEFAULT_HIDDEN = ["purchases"];
+const MK = ["fb_spend", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "attended"];
+const COL_LABELS = { fb_spend: "FB Spend", registrations: "Registrations", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases: "Purchases" };
+const DEFAULT_HIDDEN = [];
 const evalFormula = (f, row) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(k, "gi"), String(Number(row[k]) || 0)); if (/[^0-9+\-*/().%\s_]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
 const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` : fmt === "currency" ? `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
 
@@ -483,11 +483,9 @@ export default function App() {
                     {isColVisible("registrations") && <th style={S.th}>Registrations</th>}
                     {isColVisible("attended") && <th style={S.th}>Attended</th>}
                     {isColVisible("replays") && <th style={S.th}>Replays</th>}
-                    {isColVisible("unique_replays") && <th style={S.th}>Unique Replays</th>}
                     {isColVisible("viewedcta") && <th style={S.th}>Viewed CTA</th>}
                     {isColVisible("clickedcta") && <th style={S.th}>Clicked CTA</th>}
                     {isColVisible("purchases") && <th style={S.th}>Purchases</th>}
-                    {isColVisible("unique_purchases") && <th style={S.th}>Unique Purchases</th>}
                     {customs.map(cm => <th key={cm.id} style={{ ...S.th, color: "#12864A" }}>{cm.name}</th>)}
                     <th style={{ ...S.th, width: 72 }}>Actions</th>
                   </tr></thead>
@@ -504,11 +502,9 @@ export default function App() {
                           {isColVisible("registrations") && <td style={S.tdNum}>{(Number(row.registrations) || 0).toLocaleString()}</td>}
                           {isColVisible("attended") && <td style={S.tdNum}>{(Number(row.attended) || 0).toLocaleString()}</td>}
                           {isColVisible("replays") && <td style={S.tdNum}>{(Number(row.replays) || 0).toLocaleString()}</td>}
-                          {isColVisible("unique_replays") && <td style={S.tdNum}>{(Number(row.unique_replays) || 0).toLocaleString()}</td>}
                           {isColVisible("viewedcta") && <td style={S.tdNum}>{(Number(row.viewedcta) || 0).toLocaleString()}</td>}
                           {isColVisible("clickedcta") && <td style={S.tdNum}>{(Number(row.clickedcta) || 0).toLocaleString()}</td>}
                           {isColVisible("purchases") && <td style={S.tdNum}><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></td>}
-                          {isColVisible("unique_purchases") && <td style={S.tdNum}><span style={S.purchBadge}>{(Number(row.unique_purchases) || 0).toLocaleString()}</span></td>}
                           {customs.map(cm => { const v = evalFormula(cm.formula, row); return <td key={cm.id} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(v, cm.format)}</td>; })}
                           <td style={S.td}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
@@ -540,11 +536,9 @@ export default function App() {
                       {isColVisible("registrations") && <div style={S.bcItem}><span style={S.bcLabel}>Registrations</span><span style={S.bcVal}>{(Number(row.registrations) || 0).toLocaleString()}</span></div>}
                       {isColVisible("attended") && <div style={S.bcItem}><span style={S.bcLabel}>Attended</span><span style={S.bcVal}>{(Number(row.attended) || 0).toLocaleString()}</span></div>}
                       {isColVisible("replays") && <div style={S.bcItem}><span style={S.bcLabel}>Replays</span><span style={S.bcVal}>{(Number(row.replays) || 0).toLocaleString()}</span></div>}
-                      {isColVisible("unique_replays") && <div style={S.bcItem}><span style={S.bcLabel}>Unique Replays</span><span style={S.bcVal}>{(Number(row.unique_replays) || 0).toLocaleString()}</span></div>}
                       {isColVisible("viewedcta") && <div style={S.bcItem}><span style={S.bcLabel}>Viewed CTA</span><span style={S.bcVal}>{(Number(row.viewedcta) || 0).toLocaleString()}</span></div>}
                       {isColVisible("clickedcta") && <div style={S.bcItem}><span style={S.bcLabel}>Clicked CTA</span><span style={S.bcVal}>{(Number(row.clickedcta) || 0).toLocaleString()}</span></div>}
                       {isColVisible("purchases") && <div style={S.bcItem}><span style={S.bcLabel}>Purchases</span><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></div>}
-                      {isColVisible("unique_purchases") && <div style={S.bcItem}><span style={S.bcLabel}>Unique Purchases</span><span style={S.purchBadge}>{(Number(row.unique_purchases) || 0).toLocaleString()}</span></div>}
                       {customs.map(cm => { const v = evalFormula(cm.formula, row); return <div key={cm.id} style={S.bcItem}><span style={S.bcLabel}>{cm.name}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(v, cm.format)}</span></div>; })}
                     </div>
                     <div style={S.boardCardActions}>
