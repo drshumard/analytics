@@ -559,6 +559,91 @@ app.put('/api/me/preferences', dashboardLimiter, requireAuth, async (req, res) =
 });
 
 // =============================================================================
+// DASHBOARD LENSES (custom metric views)
+// =============================================================================
+
+// GET /api/lenses — list all lenses (any authenticated user)
+app.get('/api/lenses', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('dashboard_lenses')
+            .select('*')
+            .order('sort_order', { ascending: true });
+        if (error) throw error;
+        res.json({ data: data || [] });
+    } catch (err) {
+        console.error('❌ GET /api/lenses error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch lenses' });
+    }
+});
+
+// POST /api/lenses — create a lens (admin only)
+app.post('/api/lenses', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
+        const { name, metrics } = req.body;
+        if (!name || !Array.isArray(metrics) || metrics.length === 0) {
+            return res.status(400).json({ error: 'Send { name, metrics: ["fb_spend", ...] }' });
+        }
+
+        const { data, error } = await supabase
+            .from('dashboard_lenses')
+            .insert({ name, metrics, created_by: req.user.id })
+            .select()
+            .single();
+        if (error) throw error;
+        res.json({ data });
+    } catch (err) {
+        console.error('❌ POST /api/lenses error:', err.message);
+        res.status(500).json({ error: 'Failed to create lens' });
+    }
+});
+
+// PUT /api/lenses/:id — update a lens (admin only)
+app.put('/api/lenses/:id', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
+        const { name, metrics } = req.body;
+        const updates = {};
+        if (name) updates.name = name;
+        if (Array.isArray(metrics)) updates.metrics = metrics;
+
+        const { data, error } = await supabase
+            .from('dashboard_lenses')
+            .update(updates)
+            .eq('id', req.params.id)
+            .select()
+            .single();
+        if (error) throw error;
+        res.json({ data });
+    } catch (err) {
+        console.error('❌ PUT /api/lenses error:', err.message);
+        res.status(500).json({ error: 'Failed to update lens' });
+    }
+});
+
+// DELETE /api/lenses/:id — delete a lens (admin only, can't delete default)
+app.delete('/api/lenses/:id', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        if (req.params.id === 'default-all') return res.status(400).json({ error: 'Cannot delete the default lens' });
+
+        const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
+        const { error } = await supabase.from('dashboard_lenses').delete().eq('id', req.params.id);
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        console.error('❌ DELETE /api/lenses error:', err.message);
+        res.status(500).json({ error: 'Failed to delete lens' });
+    }
+});
+
+// =============================================================================
 // DASHBOARD ENDPOINTS (for the frontend)
 // =============================================================================
 
@@ -570,6 +655,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         const { data, error, count } = await supabase
             .from('daily_metrics')
             .select('*', { count: 'exact' })
+            .lte('date', dateToISO(getLADate()))  // hide future dates
             .order('date', { ascending: false })
             .range(Number(offset), Number(offset) + Number(limit) - 1);
 

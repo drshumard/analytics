@@ -151,18 +151,51 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [events, setEvents] = useState([]);
   const [evFilter, setEvFilter] = useState("");
-  const [hiddenCols, setHiddenCols] = useState(DEFAULT_HIDDEN);
-  const [colMenuOpen, setColMenuOpen] = useState(false);
-  const colMenuRef = useRef(null);
-  const savePrefsToServer = async (hidden) => {
+  const [lenses, setLenses] = useState([]);
+  const [activeLensId, setActiveLensId] = useState("default-all");
+  const [lensMenuOpen, setLensMenuOpen] = useState(false);
+  const [lensEditing, setLensEditing] = useState(null); // null | { id?, name, metrics }
+  const lensMenuRef = useRef(null);
+  const activeLens = lenses.find(l => l.id === activeLensId) || lenses[0] || { id: "default-all", name: "All Metrics", metrics: MK };
+  const isColVisible = (col) => activeLens.metrics.includes(col);
+  const fetchLenses = async () => {
     try {
       const headers = await getAuthHeaders();
-      await fetch(`${API_BASE}/api/me/preferences`, { method: "PUT", headers, body: JSON.stringify({ preferences: { hidden_cols: hidden } }) });
+      const res = await fetch(`${API_BASE}/api/lenses`, { headers });
+      const data = await res.json();
+      setLenses(data.data || []);
     } catch { /* silent */ }
   };
-  const toggleCol = (col) => { setHiddenCols(prev => { const next = prev.includes(col) ? prev.filter(c => c !== col) : [...prev, col]; savePrefsToServer(next); return next; }); };
-  const isColVisible = (col) => !hiddenCols.includes(col);
-  useEffect(() => { const h = (e) => { if (colMenuRef.current && !colMenuRef.current.contains(e.target)) setColMenuOpen(false); }; document.addEventListener("mousedown", h); return () => document.removeEventListener("mousedown", h); }, []);
+  const saveLens = async (lens) => {
+    try {
+      const headers = await getAuthHeaders();
+      if (lens.id) {
+        await fetch(`${API_BASE}/api/lenses/${lens.id}`, { method: "PUT", headers, body: JSON.stringify({ name: lens.name, metrics: lens.metrics }) });
+      } else {
+        await fetch(`${API_BASE}/api/lenses`, { method: "POST", headers, body: JSON.stringify({ name: lens.name, metrics: lens.metrics }) });
+      }
+      await fetchLenses();
+      setLensEditing(null);
+      flash(lens.id ? "Lens updated" : "Lens created");
+    } catch (e) { flash(e.message, "err"); }
+  };
+  const deleteLens = async (id) => {
+    try {
+      const headers = await getAuthHeaders();
+      await fetch(`${API_BASE}/api/lenses/${id}`, { method: "DELETE", headers });
+      if (activeLensId === id) setActiveLensId("default-all");
+      await fetchLenses();
+      flash("Lens deleted");
+    } catch (e) { flash(e.message, "err"); }
+  };
+  const setDefaultLens = async (id) => {
+    try {
+      const headers = await getAuthHeaders();
+      await fetch(`${API_BASE}/api/me/preferences`, { method: "PUT", headers, body: JSON.stringify({ preferences: { default_lens_id: id } }) });
+      flash("Default lens set");
+    } catch { /* silent */ }
+  };
+  useEffect(() => { const h = (e) => { if (lensMenuRef.current && !lensMenuRef.current.contains(e.target)) setLensMenuOpen(false); }; document.addEventListener("mousedown", h); return () => document.removeEventListener("mousedown", h); }, []);
   const tt = useRef(null);
 
   const flash = useCallback((msg, type = "ok") => { if (tt.current) clearTimeout(tt.current); setToast({ msg, type }); tt.current = setTimeout(() => setToast(null), 3000); }, []);
@@ -200,7 +233,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/me`, { headers: { Authorization: `Bearer ${token}` } });
       const data = await res.json();
       setUserRole(data.role || "viewer");
-      if (data.preferences?.hidden_cols) setHiddenCols(data.preferences.hidden_cols);
+      if (data.preferences?.default_lens_id) setActiveLensId(data.preferences.default_lens_id);
     } catch { setUserRole("viewer"); }
     setAuthLoading(false);
   };
@@ -220,7 +253,7 @@ export default function App() {
     setUserRole(null);
   };
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => { loadData(); fetchLenses(); }, [loadData]);
   useEffect(() => { const i = setInterval(loadData, 30000); return () => clearInterval(i); }, [loadData]);
 
   const refreshWebhook = useCallback(async () => {
@@ -457,16 +490,29 @@ export default function App() {
                   <div style={viewMode === "list" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("list")}><I d="M4 6h16M4 12h16M4 18h16" size={14} /> List</div>
                   <div style={viewMode === "board" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("board")}><I d="M4 4h4v16H4zM10 4h4v16h-4zM16 4h4v16h-4z" size={14} /> Board</div>
                 </div>
-                <div style={{ position: "relative" }} ref={colMenuRef}>
-                  <button style={S.btnLight} onClick={() => setColMenuOpen(p => !p)}><I d="M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" size={14} stroke="#6B7280" /> Columns</button>
-                  {colMenuOpen && (
-                    <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 6, background: "#fff", border: "1px solid #E5E7EB", borderRadius: 10, padding: "8px 0", boxShadow: "0 4px 12px rgba(0,0,0,0.1)", zIndex: 50, minWidth: 180 }}>
-                      {MK.map(col => (
-                        <label key={col} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 14px", cursor: "pointer", fontSize: 13, color: "#374151", fontWeight: 500 }} onMouseEnter={e => e.currentTarget.style.background = "#F9FAFB"} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-                          <input type="checkbox" checked={isColVisible(col)} onChange={() => toggleCol(col)} style={{ accentColor: "#111827" }} />
-                          {COL_LABELS[col]}
-                        </label>
+                <div style={{ position: "relative" }} ref={lensMenuRef}>
+                  <button style={S.btnLight} onClick={() => setLensMenuOpen(p => !p)}><I d="M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" size={14} stroke="#6B7280" /> {activeLens.name} ▾</button>
+                  {lensMenuOpen && (
+                    <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 6, background: "#fff", border: "1px solid #E5E7EB", borderRadius: 10, padding: "8px 0", boxShadow: "0 4px 12px rgba(0,0,0,0.1)", zIndex: 50, minWidth: 220 }}>
+                      <div style={{ padding: "6px 14px", fontSize: 10, fontWeight: 700, color: "#9CA3AF", textTransform: "uppercase", letterSpacing: "0.05em" }}>Lenses</div>
+                      {lenses.map(lens => (
+                        <div key={lens.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 14px", cursor: "pointer", fontSize: 13, color: "#374151", fontWeight: activeLensId === lens.id ? 600 : 500, background: activeLensId === lens.id ? "#F3F4F6" : "transparent" }} onMouseEnter={e => { if (activeLensId !== lens.id) e.currentTarget.style.background = "#F9FAFB"; }} onMouseLeave={e => { if (activeLensId !== lens.id) e.currentTarget.style.background = "transparent"; }}>
+                          <span style={{ flex: 1 }} onClick={() => { setActiveLensId(lens.id); setLensMenuOpen(false); }}>{lens.name}</span>
+                          {isAdmin && lens.id !== "default-all" && (
+                            <>
+                              <span title="Set as default" style={{ cursor: "pointer", fontSize: 14 }} onClick={() => { setDefaultLens(lens.id); setActiveLensId(lens.id); }}>⭐</span>
+                              <span title="Edit" style={{ cursor: "pointer", fontSize: 12, color: "#6B7280" }} onClick={() => { setLensEditing({ id: lens.id, name: lens.name, metrics: [...lens.metrics] }); setLensMenuOpen(false); }}>✏️</span>
+                              <span title="Delete" style={{ cursor: "pointer", fontSize: 12, color: "#DC2626" }} onClick={() => { deleteLens(lens.id); }}>🗑️</span>
+                            </>
+                          )}
+                        </div>
                       ))}
+                      {isAdmin && (
+                        <>
+                          <div style={{ height: 1, background: "#E5E7EB", margin: "4px 0" }} />
+                          <div style={{ padding: "7px 14px", cursor: "pointer", fontSize: 13, color: "#3538CD", fontWeight: 600 }} onMouseEnter={e => e.currentTarget.style.background = "#F9FAFB"} onMouseLeave={e => e.currentTarget.style.background = "transparent"} onClick={() => { setLensEditing({ name: "", metrics: [...MK] }); setLensMenuOpen(false); }}>+ Create Lens</div>
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
@@ -641,7 +687,42 @@ export default function App() {
 
       {delConfirm && <Modal title="Delete Entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
       {delCM && <Modal title="Delete Custom Metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
+      {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
       {toast && (<div className="fi" style={{ ...S.toast, borderLeft: `3px solid ${toast.type === "ok" ? "#12864A" : "#D92D20"}` }}><I d={toast.type === "ok" ? "M20 6L9 17l-5-5" : "M12 2a10 10 0 100 20 10 10 0 000-20zM12 8v4M12 16h.01"} size={16} stroke={toast.type === "ok" ? "#12864A" : "#D92D20"} sw={2.2} />{toast.msg}</div>)}
+    </div>
+  );
+}
+
+function LensEditor({ lens, onSave, onCancel }) {
+  const [name, setName] = useState(lens.name || "");
+  const [metrics, setMetrics] = useState(lens.metrics || [...MK]);
+  const toggle = (m) => setMetrics(prev => prev.includes(m) ? prev.filter(x => x !== m) : [...prev, m]);
+  return (
+    <div style={S.overlay} onClick={onCancel}>
+      <div style={{ ...S.modal, maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+        <div style={{ width: 44, height: 44, borderRadius: 12, background: "#EEF4FF", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><I d="M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" size={22} stroke="#3538CD" sw={2} /></div>
+        <div style={{ fontSize: 18, fontWeight: 600, color: "#111827", marginBottom: 6, textAlign: "center" }}>{lens.id ? "Edit Lens" : "Create Lens"}</div>
+        <div style={{ color: "#6B7280", fontSize: 13, marginBottom: 20, textAlign: "center" }}>Choose a name and the metrics to include</div>
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ fontSize: 12, fontWeight: 600, color: "#374151", display: "block", marginBottom: 6 }}>Lens Name</label>
+          <input style={S.inp} value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Funnel Overview" autoFocus />
+        </div>
+        <div style={{ marginBottom: 20 }}>
+          <label style={{ fontSize: 12, fontWeight: 600, color: "#374151", display: "block", marginBottom: 8 }}>Metrics</label>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+            {MK.map(m => (
+              <label key={m} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 8, border: `1px solid ${metrics.includes(m) ? "#3538CD" : "#E5E7EB"}`, background: metrics.includes(m) ? "#EEF4FF" : "#fff", cursor: "pointer", fontSize: 13, fontWeight: 500, color: metrics.includes(m) ? "#3538CD" : "#6B7280", transition: "all 0.15s" }}>
+                <input type="checkbox" checked={metrics.includes(m)} onChange={() => toggle(m)} style={{ accentColor: "#3538CD" }} />
+                {COL_LABELS[m]}
+              </label>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
+          <button style={{ ...S.btnDark, flex: 1, justifyContent: "center" }} disabled={!name.trim() || metrics.length === 0} onClick={() => onSave({ id: lens.id, name: name.trim(), metrics })}>{lens.id ? "Update" : "Create"}</button>
+        </div>
+      </div>
     </div>
   );
 }
