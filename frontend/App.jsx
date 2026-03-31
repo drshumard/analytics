@@ -121,9 +121,9 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "registrations", "replays", "unique_replays", "viewedcta", "clickedcta", "purchases", "attended"];
-const COL_LABELS = { fb_spend: "FB Spend", registrations: "Registrations", attended: "Attended", replays: "Replays", unique_replays: "Unique Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases: "Purchases" };
-const DEFAULT_HIDDEN = [];
+const MK = ["fb_spend", "registrations", "replays", "unique_replays", "viewedcta", "clickedcta", "purchases", "unique_purchases", "attended"];
+const COL_LABELS = { fb_spend: "FB Spend", registrations: "Registrations", attended: "Attended", replays: "Replays", unique_replays: "Unique Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases: "Purchases", unique_purchases: "Unique Purchases" };
+const DEFAULT_HIDDEN = ["purchases"];
 const evalFormula = (f, row) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(k, "gi"), String(Number(row[k]) || 0)); if (/[^0-9+\-*/().%\s_]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
 const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` : fmt === "currency" ? `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
 
@@ -382,6 +382,7 @@ export default function App() {
             <>
               <button style={S.btnLight} onClick={() => setView("insights")}>Insights</button>
               <button style={S.btnLight} onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}>Activity Log</button>
+              {isAdmin && <button style={S.btnLight} onClick={() => setView("query")}>Query Data</button>}
               {isAdmin && <button style={S.btnLight} onClick={() => { setEditCM(null); setView("custom-list"); }}>Manage Metrics</button>}
             </>
           )}
@@ -486,6 +487,7 @@ export default function App() {
                     {isColVisible("viewedcta") && <th style={S.th}>Viewed CTA</th>}
                     {isColVisible("clickedcta") && <th style={S.th}>Clicked CTA</th>}
                     {isColVisible("purchases") && <th style={S.th}>Purchases</th>}
+                    {isColVisible("unique_purchases") && <th style={S.th}>Unique Purchases</th>}
                     {customs.map(cm => <th key={cm.id} style={{ ...S.th, color: "#12864A" }}>{cm.name}</th>)}
                     <th style={{ ...S.th, width: 72 }}>Actions</th>
                   </tr></thead>
@@ -506,6 +508,7 @@ export default function App() {
                           {isColVisible("viewedcta") && <td style={S.tdNum}>{(Number(row.viewedcta) || 0).toLocaleString()}</td>}
                           {isColVisible("clickedcta") && <td style={S.tdNum}>{(Number(row.clickedcta) || 0).toLocaleString()}</td>}
                           {isColVisible("purchases") && <td style={S.tdNum}><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></td>}
+                          {isColVisible("unique_purchases") && <td style={S.tdNum}><span style={S.purchBadge}>{(Number(row.unique_purchases) || 0).toLocaleString()}</span></td>}
                           {customs.map(cm => { const v = evalFormula(cm.formula, row); return <td key={cm.id} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(v, cm.format)}</td>; })}
                           <td style={S.td}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
@@ -541,6 +544,7 @@ export default function App() {
                       {isColVisible("viewedcta") && <div style={S.bcItem}><span style={S.bcLabel}>Viewed CTA</span><span style={S.bcVal}>{(Number(row.viewedcta) || 0).toLocaleString()}</span></div>}
                       {isColVisible("clickedcta") && <div style={S.bcItem}><span style={S.bcLabel}>Clicked CTA</span><span style={S.bcVal}>{(Number(row.clickedcta) || 0).toLocaleString()}</span></div>}
                       {isColVisible("purchases") && <div style={S.bcItem}><span style={S.bcLabel}>Purchases</span><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></div>}
+                      {isColVisible("unique_purchases") && <div style={S.bcItem}><span style={S.bcLabel}>Unique Purchases</span><span style={S.purchBadge}>{(Number(row.unique_purchases) || 0).toLocaleString()}</span></div>}
                       {customs.map(cm => { const v = evalFormula(cm.formula, row); return <div key={cm.id} style={S.bcItem}><span style={S.bcLabel}>{cm.name}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(v, cm.format)}</span></div>; })}
                     </div>
                     <div style={S.boardCardActions}>
@@ -638,6 +642,7 @@ export default function App() {
           </div>
         )}
         {view === "insights" && <InsightsChat flash={flash} />}
+        {view === "query" && <QueryBuilder flash={flash} />}
       </main>
 
       {delConfirm && <Modal title="Delete Entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
@@ -724,6 +729,159 @@ function renderInline(text) {
     }
     return <span key={i}>{part}</span>;
   });
+}
+
+function QueryBuilder({ flash }) {
+  const [table, setTable] = useState("events");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [eventType, setEventType] = useState("");
+  const [search, setSearch] = useState("");
+  const [limit, setLimit] = useState("500");
+  const [results, setResults] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [sortBy, setSortBy] = useState("");
+  const [sortDir, setSortDir] = useState("desc");
+
+  const runQuery = async (overrideSort, overrideDir) => {
+    setLoading(true);
+    try {
+      const headers = await getAuthHeaders();
+      const body = { table, dateFrom: dateFrom || undefined, dateTo: dateTo || undefined, eventType: eventType || undefined, search: search || undefined, sortBy: overrideSort || sortBy || undefined, sortDir: overrideDir || sortDir, limit: Number(limit) || 500 };
+      const res = await fetch(`${API_BASE}/api/admin/query`, { method: "POST", headers, body: JSON.stringify(body) });
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Query failed: ${res.status}`); }
+      const data = await res.json();
+      setResults(data);
+    } catch (e) { flash(e.message, "err"); }
+    finally { setLoading(false); }
+  };
+
+  const handleSort = (col) => {
+    const newDir = sortBy === col && sortDir === "desc" ? "asc" : "desc";
+    setSortBy(col);
+    setSortDir(newDir);
+    runQuery(col, newDir);
+  };
+
+  const downloadCSV = () => {
+    if (!results?.data?.length) return;
+    const cols = Object.keys(results.data[0]);
+    const csv = [cols.join(","), ...results.data.map(row => cols.map(c => { const v = row[c]; if (v === null || v === undefined) return ""; const s = typeof v === "object" ? JSON.stringify(v) : String(v); return s.includes(",") || s.includes('"') || s.includes("\n") ? `"${s.replace(/"/g, '""')}"` : s; }).join(","))].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = `${table}_export_${new Date().toISOString().slice(0, 10)}.csv`; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const eventTypes = ["registrations", "attended", "replays", "viewedcta", "clickedcta", "purchases"];
+  const QS = {
+    wrap: { padding: "32px 40px", maxWidth: 1200, margin: "0 auto" },
+    header: { marginBottom: 24 },
+    badge: { display: "inline-block", padding: "4px 10px", borderRadius: 6, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", background: "#EEF4FF", color: "#3538CD", marginBottom: 10 },
+    title: { fontSize: 22, fontWeight: 700, color: "#111827", margin: 0 },
+    subtitle: { fontSize: 13, color: "#6B7280", marginTop: 4 },
+    filters: { display: "flex", flexWrap: "wrap", gap: 12, padding: 20, background: "#FAFAFA", borderRadius: 12, border: "1px solid #E8E8E6", marginBottom: 20 },
+    filterGroup: { display: "flex", flexDirection: "column", gap: 4 },
+    filterLabel: { fontSize: 11, fontWeight: 600, color: "#6B7280", textTransform: "uppercase", letterSpacing: "0.05em" },
+    filterInput: { padding: "8px 12px", borderRadius: 8, border: "1px solid #D1D5DB", fontSize: 13, outline: "none", minWidth: 140 },
+    filterSelect: { padding: "8px 12px", borderRadius: 8, border: "1px solid #D1D5DB", fontSize: 13, outline: "none", background: "#fff", cursor: "pointer", minWidth: 140 },
+    actions: { display: "flex", gap: 10, alignItems: "flex-end" },
+    resultBar: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 },
+    resultCount: { fontSize: 13, color: "#6B7280", fontWeight: 500 },
+    tableWrap: { overflowX: "auto", borderRadius: 10, border: "1px solid #E8E8E6" },
+    table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
+    th: { padding: "10px 14px", textAlign: "left", fontWeight: 600, color: "#6B7280", borderBottom: "1px solid #E8E8E6", background: "#FAFAFA", whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" },
+    td: { padding: "9px 14px", borderBottom: "1px solid #F3F4F6", color: "#374151", whiteSpace: "nowrap", maxWidth: 250, overflow: "hidden", textOverflow: "ellipsis" },
+    sortIcon: { marginLeft: 4, fontSize: 10 },
+  };
+
+  return (
+    <div style={QS.wrap}>
+      <div style={QS.header}>
+        <div style={QS.badge}>Admin</div>
+        <h2 style={QS.title}>Query Data</h2>
+        <p style={QS.subtitle}>Filter and export data from the database</p>
+      </div>
+
+      <div style={QS.filters}>
+        <div style={QS.filterGroup}>
+          <span style={QS.filterLabel}>Table</span>
+          <select style={QS.filterSelect} value={table} onChange={e => { setTable(e.target.value); setResults(null); setEventType(""); setSortBy(""); }}>
+            <option value="events">Events</option>
+            <option value="daily_metrics">Daily Metrics</option>
+          </select>
+        </div>
+        <div style={QS.filterGroup}>
+          <span style={QS.filterLabel}>From</span>
+          <input type="date" style={QS.filterInput} value={dateFrom} onChange={e => setDateFrom(e.target.value)} />
+        </div>
+        <div style={QS.filterGroup}>
+          <span style={QS.filterLabel}>To</span>
+          <input type="date" style={QS.filterInput} value={dateTo} onChange={e => setDateTo(e.target.value)} />
+        </div>
+        {table === "events" && (
+          <>
+            <div style={QS.filterGroup}>
+              <span style={QS.filterLabel}>Event Type</span>
+              <select style={QS.filterSelect} value={eventType} onChange={e => setEventType(e.target.value)}>
+                <option value="">All</option>
+                {eventTypes.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <div style={QS.filterGroup}>
+              <span style={QS.filterLabel}>Search (name/email/phone)</span>
+              <input style={QS.filterInput} placeholder="Search..." value={search} onChange={e => setSearch(e.target.value)} />
+            </div>
+          </>
+        )}
+        <div style={QS.filterGroup}>
+          <span style={QS.filterLabel}>Limit</span>
+          <select style={QS.filterSelect} value={limit} onChange={e => setLimit(e.target.value)}>
+            <option value="100">100</option>
+            <option value="500">500</option>
+            <option value="1000">1,000</option>
+            <option value="5000">5,000</option>
+          </select>
+        </div>
+        <div style={QS.actions}>
+          <button style={{ ...S.btnDark, padding: "8px 20px", borderRadius: 8, fontSize: 13 }} onClick={() => runQuery()} disabled={loading}>{loading ? "Querying…" : "Run Query"}</button>
+        </div>
+      </div>
+
+      {results && (
+        <>
+          <div style={QS.resultBar}>
+            <span style={QS.resultCount}>{results.count.toLocaleString()} result{results.count !== 1 ? "s" : ""}</span>
+            <button style={{ ...S.btnLight, padding: "6px 14px", fontSize: 12 }} onClick={downloadCSV}><I d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" size={14} stroke="#374151" /> Export CSV</button>
+          </div>
+          <div style={QS.tableWrap}>
+            <table style={QS.table}>
+              <thead><tr>
+                {results.data.length > 0 && Object.keys(results.data[0]).map(col => (
+                  <th key={col} style={QS.th} onClick={() => handleSort(col)}>
+                    {col}{sortBy === col && <span style={QS.sortIcon}>{sortDir === "asc" ? " ▲" : " ▼"}</span>}
+                  </th>
+                ))}
+              </tr></thead>
+              <tbody>
+                {results.data.length === 0 ? (
+                  <tr><td colSpan={99} style={{ ...QS.td, textAlign: "center", color: "#9CA3AF", padding: 32 }}>No results found</td></tr>
+                ) : results.data.map((row, i) => (
+                  <tr key={i} onMouseEnter={e => e.currentTarget.style.background = "#F9FAFB"} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                    {Object.values(row).map((v, j) => (
+                      <td key={j} style={QS.td} title={v !== null && v !== undefined ? String(typeof v === "object" ? JSON.stringify(v) : v) : ""}>
+                        {v === null ? <span style={{ color: "#D1D5DB" }}>—</span> : typeof v === "object" ? JSON.stringify(v) : String(v)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
 }
 
 function InsightsChat({ flash }) {
@@ -1022,7 +1180,7 @@ const S = {
   listToggleInactive: { padding: "6px 14px", borderRadius: 6, fontSize: 13, fontWeight: 500, color: "#6B7280", display: "flex", alignItems: "center", gap: 6, cursor: "pointer" },
   searchWrap: { display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", background: "#fff", border: "1px solid #E5E7EB", borderRadius: 8, width: 260, boxShadow: "0 1px 2px rgba(0,0,0,0.02)" },
   searchInput: { border: "none", outline: "none", background: "transparent", fontFamily: fn, fontSize: 13, color: "#111827", width: "100%", fontWeight: 400 },
-  tableWrap: { background: "#fff", border: "1px solid #E5E7EB", borderRadius: 12, overflow: "hidden", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" },
+  tableWrap: { background: "#fff", border: "1px solid #E5E7EB", borderRadius: 12, overflowX: "auto", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" },
   table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
   th: { padding: "14px 20px", textAlign: "center", fontSize: 11, fontWeight: 600, color: "#6B7280", textTransform: "uppercase", borderBottom: "1px solid #E5E7EB", background: "#FFFFFF", letterSpacing: "0.05em" },
   td: { padding: "14px 20px", borderBottom: "1px solid #F3F4F6", verticalAlign: "middle", textAlign: "center" },

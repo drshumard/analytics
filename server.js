@@ -292,20 +292,55 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
         }
 
-        const today = getLADate();
-        const isoToday = dateToISO(today);
-        const dayOfWeek = getLADayOfWeek(today);
+        // Dedup: skip if same email + event_type within last 5 minutes (webhook retry protection)
+        if (email) {
+            const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+            const { data: existing } = await supabase
+                .from('events')
+                .select('id')
+                .eq('event_type', field)
+                .eq('email', email)
+                .gte('event_time', fiveMinAgo)
+                .limit(1);
 
-        // Ensure today's row exists
+            if (existing && existing.length > 0) {
+                console.log(`⏭️  Dedup skip: ${field} for ${email} (duplicate within 5min)`);
+                return res.json({ success: true, duplicate: true, message: 'Duplicate event skipped' });
+            }
+        }
+
+        const today = getLADate();
+        let targetDate = today;
+
+        // If webinar_datetime_utc is provided, use the webinar date for counting
+        // Format from Stealth: "March 31st 2026, 2:16:43 pm"
+        if (rest.webinar_datetime_utc) {
+            try {
+                // Strip ordinal suffixes (st, nd, rd, th) for Date parsing
+                const cleaned = rest.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
+                const parsed = new Date(cleaned);
+                if (!isNaN(parsed.getTime())) {
+                    targetDate = parsed.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+                    console.log(`📅 Using webinar date: ${rest.webinar_datetime_utc} → ${targetDate}`);
+                }
+            } catch (e) {
+                console.warn('⚠️ Could not parse webinar_datetime_utc, using today:', rest.webinar_datetime_utc);
+            }
+        }
+
+        const isoDate = dateToISO(targetDate);
+        const dayOfWeek = getLADayOfWeek(targetDate);
+
+        // Ensure target date's row exists
         await supabase
             .from('daily_metrics')
-            .upsert({ date: isoToday, day_of_week: dayOfWeek }, { onConflict: 'date' });
+            .upsert({ date: isoDate, day_of_week: dayOfWeek }, { onConflict: 'date' });
 
         // Increment via read-modify-write
         const { data: current } = await supabase
             .from('daily_metrics')
             .select(field)
-            .eq('date', isoToday)
+            .eq('date', isoDate)
             .single();
 
         const newValue = (Number(current?.[field]) || 0) + Number(count);
@@ -313,7 +348,7 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
         const { data, error } = await supabase
             .from('daily_metrics')
             .update({ [field]: newValue })
-            .eq('date', isoToday)
+            .eq('date', isoDate)
             .select()
             .single();
 
@@ -332,8 +367,8 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             if (evErr) console.error('⚠️ Event insert error:', evErr.message);
         });
 
-        console.log(`✅ Increment ${field} +${count} for ${today}${name ? ` (${name})` : ''}`);
-        res.json({ success: true, date: today, field, previous: current?.[field], new: newValue });
+        console.log(`✅ Increment ${field} +${count} for ${targetDate}${name ? ` (${name})` : ''}`);
+        res.json({ success: true, date: targetDate, field, previous: current?.[field], new: newValue });
 
     } catch (err) {
         console.error('❌ POST /api/metrics/increment error:', err.message);
@@ -567,6 +602,30 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             }
         }
 
+        // Compute unique purchases per day (dedup double-processed payments)
+        let uniquePurchaseMap = {};
+        if (dates.length > 0) {
+            const { data: purchaseEvents } = await supabase
+                .from('events')
+                .select('email, name, phone, event_time')
+                .eq('event_type', 'purchases')
+                .gte('event_time', `${dates[dates.length - 1]}T00:00:00`)
+                .lte('event_time', `${dates[0]}T23:59:59`)
+                .limit(5000);
+
+            if (purchaseEvents) {
+                for (const ev of purchaseEvents) {
+                    const d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                    if (!uniquePurchaseMap[d]) uniquePurchaseMap[d] = new Set();
+                    const key = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
+                    if (key) uniquePurchaseMap[d].add(key);
+                }
+                for (const d of Object.keys(uniquePurchaseMap)) {
+                    uniquePurchaseMap[d] = uniquePurchaseMap[d].size;
+                }
+            }
+        }
+
         // Convert to frontend format (MM/DD/YYYY) — pure string, no timezone shift
         const formatted = (data || []).map(row => {
             const dateStr = String(row.date).substring(0, 10);
@@ -581,6 +640,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 viewedcta: row.viewedcta,
                 clickedcta: row.clickedcta,
                 purchases: row.purchases,
+                unique_purchases: uniquePurchaseMap[dateStr] || 0,
                 attended: row.attended,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
@@ -859,6 +919,58 @@ app.get('/api/fb-sync/status', dashboardLimiter, async (req, res) => {
     });
 });
 
+// =============================================================================
+// ADMIN — Visual Query Builder
+// =============================================================================
+
+app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        // Verify admin role
+        const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
+        const { table = 'events', dateFrom, dateTo, eventType, search, sortBy, sortDir = 'desc', limit = 500 } = req.body;
+
+        // Only allow querying safe tables
+        const ALLOWED_TABLES = ['events', 'daily_metrics'];
+        if (!ALLOWED_TABLES.includes(table)) return res.status(400).json({ error: 'Invalid table' });
+
+        let query = supabase.from(table).select('*');
+
+        if (table === 'events') {
+            // Convert LA date boundaries to UTC so query matches how the dashboard counts
+            const toLA_UTC = (dateStr, time) => {
+                // Create a date in LA timezone, get its UTC equivalent
+                const d = new Date(`${dateStr}T${time}`);
+                const utc = new Date(d.toLocaleString('en-US', { timeZone: 'UTC' }));
+                const la = new Date(d.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+                const offset = (utc - la) / 60000; // offset in minutes
+                const offsetH = String(Math.floor(Math.abs(offset) / 60)).padStart(2, '0');
+                const offsetM = String(Math.abs(offset) % 60).padStart(2, '0');
+                const sign = offset <= 0 ? '+' : '-';
+                return `${dateStr}T${time}${sign}${offsetH}:${offsetM}`;
+            };
+            if (dateFrom) query = query.gte('event_time', toLA_UTC(dateFrom, '00:00:00'));
+            if (dateTo) query = query.lte('event_time', toLA_UTC(dateTo, '23:59:59'));
+            if (eventType) query = query.eq('event_type', eventType);
+            if (search) query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
+            query = query.order(sortBy || 'event_time', { ascending: sortDir === 'asc' });
+        } else if (table === 'daily_metrics') {
+            if (dateFrom) query = query.gte('date', dateFrom);
+            if (dateTo) query = query.lte('date', dateTo);
+            query = query.order(sortBy || 'date', { ascending: sortDir === 'asc' });
+        }
+
+        query = query.limit(Math.min(Number(limit) || 500, 5000));
+        const { data, error } = await query;
+        if (error) throw error;
+
+        res.json({ data: data || [], count: data?.length || 0 });
+    } catch (err) {
+        console.error('❌ POST /api/admin/query error:', err.message);
+        res.status(500).json({ error: 'Query failed' });
+    }
+});
 
 // =============================================================================
 // INSIGHTS — AI Business Analyst (Claude API)
@@ -880,7 +992,7 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
         // Fetch context: last 90 days of metrics + recent events
         const [metricsRes, eventsRes] = await Promise.all([
             supabase.from('daily_metrics').select('*').order('date', { ascending: false }).limit(90),
-            supabase.from('events').select('*').order('event_time', { ascending: false }).limit(200),
+            supabase.from('events').select('*').order('event_time', { ascending: false }).limit(5000),
         ]);
 
         const metricsData = (metricsRes.data || []).map(r => ({
@@ -895,12 +1007,17 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
             purchases: r.purchases,
         }));
 
-        const eventsData = (eventsRes.data || []).map(e => ({
-            type: e.event_type,
-            name: e.name,
-            email: e.email,
-            time: e.event_time,
-        }));
+        const eventsData = (eventsRes.data || []).map(e => {
+            const laDate = new Date(e.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+            const laTime = new Date(e.event_time).toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', minute: '2-digit' });
+            return {
+                type: e.event_type,
+                name: e.name,
+                email: e.email,
+                date: laDate,
+                time_la: laTime,
+            };
+        });
 
         const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
 
@@ -928,7 +1045,7 @@ KEY METRICS TO TRACK:
 DAILY METRICS (last ${metricsData.length} days, newest first):
 ${JSON.stringify(metricsData, null, 0)}
 
-RECENT EVENTS (last ${eventsData.length} events — individual registrations/purchases with timestamps):
+RECENT EVENTS (last ${eventsData.length} events — individual registrations/purchases with date and time in Los Angeles timezone):
 ${JSON.stringify(eventsData, null, 0)}
 
 INSTRUCTIONS:
