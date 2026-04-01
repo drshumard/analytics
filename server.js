@@ -285,7 +285,7 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
 // Zapier sends: { field: "registrations", count: 1, name: "John Doe", email: "john@example.com" }
 app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
-        const { field, count = 1, name, email, phone, ...rest } = req.body;
+        const { field, count = 1, name, email, phone, execution_id, ...rest } = req.body;
         const validFields = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
 
         if (!validFields.includes(field)) {
@@ -362,6 +362,7 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             name: name || null,
             email: email || null,
             phone: phone || null,
+            execution_id: execution_id || null,
             metadata: Object.keys(metadata).length > 0 ? metadata : {},
         }).then(({ error: evErr }) => {
             if (evErr) console.error('⚠️ Event insert error:', evErr.message);
