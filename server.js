@@ -668,19 +668,41 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         const EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', 'purchases'];
 
         if (dates.length > 0) {
-            const { data: allEvents } = await supabase
-                .from('events')
-                .select('event_type, email, name, phone, event_time')
-                .in('event_type', EVENT_TYPES)
-                .gte('event_time', `${dates[dates.length - 1]}T00:00:00`)
-                .lte('event_time', `${dates[0]}T23:59:59`)
-                .limit(10000);
+            // Paginate past Supabase's 1000-row default cap
+            let allEvents = [];
+            const PAGE_SIZE = 50000;
+            let page = 0;
+            while (true) {
+                const { data: batch } = await supabase
+                    .from('events')
+                    .select('event_type, email, name, phone, event_time, metadata')
+                    .in('event_type', EVENT_TYPES)
+                    .gte('event_time', `${dates[dates.length - 1]}T00:00:00`)
+                    .lte('event_time', `${dates[0]}T23:59:59`)
+                    .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
+                if (!batch || batch.length === 0) break;
+                allEvents = allEvents.concat(batch);
+                if (batch.length < PAGE_SIZE) break;
+                page++;
+            }
 
             if (allEvents) {
                 // Group by date + event_type, track unique users
+                // For registrations: use webinar_datetime_utc from metadata
+                // For all other events: use event_time
                 const sets = {}; // key: "YYYY-MM-DD|event_type" → Set of user keys
                 for (const ev of allEvents) {
-                    const d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                    let d;
+                    if (ev.event_type === 'registrations' && ev.metadata?.webinar_datetime_utc) {
+                        // Parse webinar date: "March 31st 2026, 2:16:43 pm"
+                        const cleaned = ev.metadata.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
+                        const parsed = new Date(cleaned);
+                        d = !isNaN(parsed.getTime())
+                            ? parsed.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' })
+                            : new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                    } else {
+                        d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                    }
                     const k = `${d}|${ev.event_type}`;
                     if (!sets[k]) sets[k] = new Set();
                     const userKey = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
@@ -696,21 +718,24 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             }
         }
 
-        // Convert to frontend format (MM/DD/YYYY) — use deduped counts where available
+        // Convert to frontend format (MM/DD/YYYY)
+        // Priority: manual override > deduped count > raw daily_metrics
         const formatted = (data || []).map(row => {
             const dateStr = String(row.date).substring(0, 10);
             const mmddyyyy = dateStr.replace(/(\d{4})-(\d{2})-(\d{2})/, '$2/$3/$1');
             const deduped = dedupMap[dateStr] || {};
+            const ov = row.overrides || {};
+            const pick = (field) => ov[field] !== undefined ? ov[field] : (deduped[field] ?? row[field]);
             return {
                 date: mmddyyyy,
                 day: row.day_of_week,
-                fb_spend: Number(row.fb_spend),
-                registrations: deduped.registrations ?? row.registrations,
-                replays: deduped.replays ?? row.replays,
-                viewedcta: deduped.viewedcta ?? row.viewedcta,
-                clickedcta: deduped.clickedcta ?? row.clickedcta,
-                purchases: deduped.purchases ?? row.purchases,
-                attended: deduped.attended ?? row.attended,
+                fb_spend: ov.fb_spend !== undefined ? ov.fb_spend : Number(row.fb_spend),
+                registrations: pick('registrations'),
+                replays: pick('replays'),
+                viewedcta: pick('viewedcta'),
+                clickedcta: pick('clickedcta'),
+                purchases: pick('purchases'),
+                attended: pick('attended'),
                 created_at: row.created_at,
                 updated_at: row.updated_at,
             };
@@ -725,6 +750,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
 });
 
 // PUT /api/metrics/:date — Update a specific day (from dashboard edit)
+// Saves edited values into the 'overrides' column so they permanently take precedence
 app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
     try {
         const dateInput = parseDateInput(req.params.date);
@@ -733,14 +759,22 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
         const isoDate = dateToISO(dateInput);
         const body = req.body;
 
+        // Build the overrides object from the submitted fields
+        const OVERRIDE_FIELDS = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
+        const newOverrides = {};
         const updates = {};
-        if (body.fb_spend !== undefined) updates.fb_spend = parseFloat(body.fb_spend) || 0;
-        if (body.registrations !== undefined) updates.registrations = parseInt(body.registrations) || 0;
-        if (body.replays !== undefined) updates.replays = parseInt(body.replays) || 0;
-        if (body.viewedcta !== undefined) updates.viewedcta = parseInt(body.viewedcta) || 0;
-        if (body.clickedcta !== undefined) updates.clickedcta = parseInt(body.clickedcta) || 0;
-        if (body.purchases !== undefined) updates.purchases = parseInt(body.purchases) || 0;
-        if (body.attended !== undefined) updates.attended = parseInt(body.attended) || 0;
+        for (const f of OVERRIDE_FIELDS) {
+            if (body[f] !== undefined) {
+                const val = f === 'fb_spend' ? parseFloat(body[f]) || 0 : parseInt(body[f]) || 0;
+                updates[f] = val;
+                newOverrides[f] = val;
+            }
+        }
+
+        // Merge with existing overrides (don't wipe out other fields)
+        const { data: existing } = await supabase.from('daily_metrics').select('overrides').eq('date', isoDate).single();
+        const mergedOverrides = { ...(existing?.overrides || {}), ...newOverrides };
+        updates.overrides = mergedOverrides;
 
         const { data, error } = await supabase
             .from('daily_metrics')
