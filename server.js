@@ -11,7 +11,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cron from 'node-cron';
-import { syncFacebookSpend } from './fb-sync.js';
+import { syncFacebookSpend, fetchFacebookSpend, writeSpendToSupabase } from './fb-sync.js';
 import 'dotenv/config';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -981,7 +981,28 @@ if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
         }
     }, { timezone: 'America/Los_Angeles' });
 
-    console.log('📡 Facebook ad spend sync enabled (every 30 min)');
+    // Cron: daily at 4:00 AM PST — fetch *yesterday's* final ad spend
+    // By 4 AM the previous day's data is fully settled in Facebook's reporting
+    cron.schedule('0 4 * * *', async () => {
+        try {
+            const now = new Date();
+            const yesterdayLA = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+            yesterdayLA.setDate(yesterdayLA.getDate() - 1);
+            const y = yesterdayLA.getFullYear();
+            const m = String(yesterdayLA.getMonth() + 1).padStart(2, '0');
+            const d = String(yesterdayLA.getDate()).padStart(2, '0');
+            const yesterdayISO = `${y}-${m}-${d}`;
+
+            console.log(`🌙 Daily 4 AM cron: fetching final ad spend for ${yesterdayISO}`);
+            const spend = await fetchFacebookSpend(yesterdayISO);
+            await writeSpendToSupabase(yesterdayISO, spend);
+            console.log(`✅ Daily 4 AM cron: $${spend.toFixed(2)} written for ${yesterdayISO}`);
+        } catch (err) {
+            console.error('❌ Daily 4 AM ad-spend cron failed:', err.message);
+        }
+    }, { timezone: 'America/Los_Angeles' });
+
+    console.log('📡 Facebook ad spend sync enabled (every 30 min + daily 4 AM previous-day)');
 } else {
     console.log('⚠️  Facebook sync disabled — set FB_ACCESS_TOKEN and FB_AD_ACCOUNT_ID to enable');
 }
