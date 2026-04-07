@@ -528,8 +528,8 @@ export default function App() {
             </div>
 
             <div className="toolbar-row" style={S.toolbar}>
-              <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
-                <div style={S.listBoardToggle}>
+              <div className="toolbar-controls" style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                <div className="list-board-toggle" style={S.listBoardToggle}>
                   <div style={viewMode === "list" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("list")}><I d="M4 6h16M4 12h16M4 18h16" size={14} /> List</div>
                   <div style={viewMode === "board" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("board")}><I d="M4 4h4v16H4zM10 4h4v16h-4zM16 4h4v16h-4z" size={14} /> Board</div>
                 </div>
@@ -560,7 +560,7 @@ export default function App() {
                   )}
                 </div>
               </div>
-              <div style={S.searchWrap}><I d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" size={15} stroke="#AEAEA8" /><input style={S.searchInput} placeholder="Search records..." value={search} onChange={e => setSearch(e.target.value)} /></div>
+              <div className="search-wrap" style={S.searchWrap}><I d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" size={15} stroke="#AEAEA8" /><input style={S.searchInput} placeholder="Search records..." value={search} onChange={e => setSearch(e.target.value)} /></div>
             </div>
 
             {effectiveViewMode === "list" ? (
@@ -1351,8 +1351,16 @@ input:focus{outline:none;border-color:#D1D5DB!important;box-shadow:0 0 0 3px rgb
     align-items: stretch !important;
     gap: 10px !important;
   }
-  .toolbar-row > div:first-child {
+  .toolbar-controls {
     flex-wrap: wrap !important;
+  }
+  /* Hide List/Board toggle on mobile — board is auto-forced */
+  .list-board-toggle {
+    display: none !important;
+  }
+  /* Search bar full-width on mobile */
+  .search-wrap {
+    width: 100% !important;
   }
 
   /* Board grid on mobile */
