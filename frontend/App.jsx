@@ -207,6 +207,37 @@ export default function App() {
   const lensMenuRef = useRef(null);
   const activeLens = lenses.find(l => l.id === activeLensId) || lenses[0] || { id: "default-all", name: "All Metrics", metrics: MK };
   const isColVisible = (col) => activeLens.metrics.includes(col);
+
+  // ─── Column ordering ────────────────────────────────────────────
+  const [colOrder, setColOrder] = useState(null);
+  const [colEditorOpen, setColEditorOpen] = useState(false);
+
+  // Build the ordered list of column descriptors
+  const buildColList = useCallback(() => {
+    const baseCols = MK.map(k => ({ key: k, label: COL_LABELS[k], type: "base" }));
+    const customCols = customs.map(cm => ({ key: `cm:${cm.id}`, label: cm.name, type: "custom", cm }));
+    const all = [...baseCols, ...customCols];
+    if (!colOrder) return all;
+    // Sort by saved order, putting unknowns at the end
+    const orderMap = {};
+    colOrder.forEach((k, i) => { orderMap[k] = i; });
+    const ordered = [...all].sort((a, b) => {
+      const ai = orderMap[a.key] !== undefined ? orderMap[a.key] : 9999;
+      const bi = orderMap[b.key] !== undefined ? orderMap[b.key] : 9999;
+      return ai - bi;
+    });
+    return ordered;
+  }, [customs, colOrder]);
+
+  const orderedCols = buildColList();
+
+  const saveColOrder = async (keys) => {
+    setColOrder(keys);
+    try {
+      const headers = await getAuthHeaders();
+      await fetch(`${API_BASE}/api/me/preferences`, { method: "PUT", headers, body: JSON.stringify({ preferences: { col_order: keys } }) });
+    } catch {}
+  };
   const fetchLenses = async () => {
     try {
       const headers = await getAuthHeaders();
@@ -285,6 +316,7 @@ export default function App() {
       const data = await res.json();
       setUserRole(data.role || "viewer");
       if (data.preferences?.default_lens_id) setActiveLensId(data.preferences.default_lens_id);
+      if (data.preferences?.col_order) setColOrder(data.preferences.col_order);
     } catch { setUserRole("viewer"); }
     setAuthLoading(false);
   };
@@ -564,11 +596,12 @@ export default function App() {
             </div>
 
             <div className="toolbar-row" style={S.toolbar}>
-              <div className="toolbar-controls" style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+              <div className="toolbar-controls" style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
                 <div className="list-board-toggle" style={S.listBoardToggle}>
                   <div style={viewMode === "list" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("list")}><I d="M4 6h16M4 12h16M4 18h16" size={14} /> List</div>
                   <div style={viewMode === "board" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("board")}><I d="M4 4h4v16H4zM10 4h4v16h-4zM16 4h4v16h-4z" size={14} /> Board</div>
                 </div>
+                <button style={S.btnLight} onClick={() => setColEditorOpen(true)}><I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" size={14} stroke="#6B7280" /> Edit Columns</button>
                 <div style={{ position: "relative" }} ref={lensMenuRef}>
                   <button style={S.btnLight} onClick={() => setLensMenuOpen(p => !p)}><I d="M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" size={14} stroke="#6B7280" /> {activeLens.name} ▾</button>
                   {lensMenuOpen && (
@@ -603,15 +636,10 @@ export default function App() {
               <div className="table-wrap" style={S.tableWrap}>
                 <table style={S.table}>
                   <thead><tr>
-                    <th style={S.th}>Day</th><th style={S.th}>Date</th>
-                    {isColVisible("fb_spend") && <th style={S.th}>FB Spend</th>}
-                    {isColVisible("registrations") && <th style={S.th}>Registrations</th>}
-                    {isColVisible("attended") && <th style={S.th}>Attended</th>}
-                    {isColVisible("replays") && <th style={S.th}>Replays</th>}
-                    {isColVisible("viewedcta") && <th style={S.th}>Viewed CTA</th>}
-                    {isColVisible("clickedcta") && <th style={S.th}>Clicked CTA</th>}
-                    {isColVisible("purchases") && <th style={S.th}>Purchases</th>}
-                    {customs.map(cm => <th key={cm.id} style={{ ...S.th, color: "#12864A" }}>{cm.name}</th>)}
+                    <th className="sticky-col sticky-col-1" style={S.th}>Day</th><th className="sticky-col sticky-col-2" style={S.th}>Date</th>
+                    {orderedCols.filter(c => c.type === "base" ? isColVisible(c.key) : true).map(c => (
+                      <th key={c.key} style={{ ...S.th, ...(c.type === "custom" ? { color: "#12864A" } : {}) }}>{c.label}</th>
+                    ))}
                     <th style={{ ...S.th, width: 72 }}>Actions</th>
                   </tr></thead>
                   <tbody>
@@ -619,18 +647,19 @@ export default function App() {
                       <tr><td colSpan={2 + MK.filter(k => isColVisible(k)).length + customs.length + 1} style={S.emptyTd}>No entries found for this period.</td></tr>
                     ) : filtered.map((row) => {
                       const isToday = row.date === getLADate();
+                      const ctx = evalAllCustoms(customs, row);
                       return (
                         <tr key={row.date} className="trow" style={isToday ? { background: "#F8FDF9" } : {}}>
-                          <td style={S.td}><span style={S.dayPill}>{getLADayShort(row.date)}</span></td>
-                          <td style={{ ...S.td, whiteSpace: "nowrap", minWidth: 90 }}><span style={{ color: "#1A1A1A", fontWeight: 500, fontSize: 14 }}>{fmtDateNice(row.date)}</span></td>
-                          {isColVisible("fb_spend") && <td style={S.tdMoney}>${(Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>}
-                          {isColVisible("registrations") && <td style={S.tdNum}>{(Number(row.registrations) || 0).toLocaleString()}</td>}
-                          {isColVisible("attended") && <td style={S.tdNum}>{(Number(row.attended) || 0).toLocaleString()}</td>}
-                          {isColVisible("replays") && <td style={S.tdNum}>{(Number(row.replays) || 0).toLocaleString()}</td>}
-                          {isColVisible("viewedcta") && <td style={S.tdNum}>{(Number(row.viewedcta) || 0).toLocaleString()}</td>}
-                          {isColVisible("clickedcta") && <td style={S.tdNum}>{(Number(row.clickedcta) || 0).toLocaleString()}</td>}
-                          {isColVisible("purchases") && <td style={S.tdNum}><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></td>}
-                          {(() => { const ctx = evalAllCustoms(customs, row); return customs.map(cm => <td key={cm.id} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(ctx[cm.name], cm.format)}</td>); })()}
+                          <td className="sticky-col sticky-col-1" style={S.td}><span style={S.dayPill}>{getLADayShort(row.date)}</span></td>
+                          <td className="sticky-col sticky-col-2" style={{ ...S.td, whiteSpace: "nowrap", minWidth: 90 }}><span style={{ color: "#1A1A1A", fontWeight: 500, fontSize: 14 }}>{fmtDateNice(row.date)}</span></td>
+                          {orderedCols.filter(c => c.type === "base" ? isColVisible(c.key) : true).map(c => {
+                            if (c.type === "custom") {
+                              return <td key={c.key} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(ctx[c.cm.name], c.cm.format)}</td>;
+                            }
+                            if (c.key === "fb_spend") return <td key={c.key} style={S.tdMoney}>{"$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>;
+                            if (c.key === "purchases") return <td key={c.key} style={S.tdNum}><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></td>;
+                            return <td key={c.key} style={S.tdNum}>{(Number(row[c.key]) || 0).toLocaleString()}</td>;
+                          })}
                           <td style={S.td}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
                               <button className="rowBtn" style={{ ...S.rowAct, borderColor: "#DBEAFE", background: "#EFF6FF" }} title="Recalc spend from Facebook" onClick={() => recalcSpend(row.date)}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={14} stroke="#3B82F6" /></button>
@@ -648,7 +677,9 @@ export default function App() {
               <div style={S.boardGrid}>
                 {filtered.length === 0 ? (
                   <div style={{ ...S.emptyTd, gridColumn: "1 / -1", border: "1px dashed #E5E7EB", borderRadius: 12 }}>No entries found for this period.</div>
-                ) : filtered.map((row) => (
+                ) : filtered.map((row) => {
+                  const boardCtx = evalAllCustoms(customs, row);
+                  return (
                   <div key={row.date} style={S.boardCard}>
                     <div style={S.boardCardHeader}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -657,14 +688,14 @@ export default function App() {
                       </div>
                     </div>
                     <div style={S.boardCardBody}>
-                      {isColVisible("fb_spend") && <div style={S.bcItem}><span style={S.bcLabel}>FB Spend</span><span style={S.bcVal}>${(Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</span></div>}
-                      {isColVisible("registrations") && <div style={S.bcItem}><span style={S.bcLabel}>Registrations</span><span style={S.bcVal}>{(Number(row.registrations) || 0).toLocaleString()}</span></div>}
-                      {isColVisible("attended") && <div style={S.bcItem}><span style={S.bcLabel}>Attended</span><span style={S.bcVal}>{(Number(row.attended) || 0).toLocaleString()}</span></div>}
-                      {isColVisible("replays") && <div style={S.bcItem}><span style={S.bcLabel}>Replays</span><span style={S.bcVal}>{(Number(row.replays) || 0).toLocaleString()}</span></div>}
-                      {isColVisible("viewedcta") && <div style={S.bcItem}><span style={S.bcLabel}>Viewed CTA</span><span style={S.bcVal}>{(Number(row.viewedcta) || 0).toLocaleString()}</span></div>}
-                      {isColVisible("clickedcta") && <div style={S.bcItem}><span style={S.bcLabel}>Clicked CTA</span><span style={S.bcVal}>{(Number(row.clickedcta) || 0).toLocaleString()}</span></div>}
-                      {isColVisible("purchases") && <div style={S.bcItem}><span style={S.bcLabel}>Purchases</span><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></div>}
-                      {(() => { const ctx = evalAllCustoms(customs, row); return customs.map(cm => <div key={cm.id} style={S.bcItem}><span style={S.bcLabel}>{cm.name}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(ctx[cm.name], cm.format)}</span></div>); })()}
+                      {orderedCols.filter(c => c.type === "base" ? isColVisible(c.key) : true).map(c => {
+                        if (c.type === "custom") {
+                          return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(boardCtx[c.cm.name], c.cm.format)}</span></div>;
+                        }
+                        if (c.key === "fb_spend") return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{"$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</span></div>;
+                        if (c.key === "purchases") return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></div>;
+                        return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{(Number(row[c.key]) || 0).toLocaleString()}</span></div>;
+                      })}
                     </div>
                     <div style={S.boardCardActions}>
                       <button style={{ ...S.rowAct, borderColor: "#DBEAFE", background: "#EFF6FF" }} title="Recalc spend from Facebook" onClick={() => recalcSpend(row.date)}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={14} stroke="#3B82F6" /></button>
@@ -672,7 +703,8 @@ export default function App() {
                       {isAdmin && <button style={{ ...S.rowAct, borderColor: "#FECACA", background: "#FEF2F2" }} title="Delete row" onClick={() => setDelConfirm(row.date)}><I d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" size={14} stroke="#EF4444" /></button>}
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -767,6 +799,7 @@ export default function App() {
       {delConfirm && <Modal title="Delete Entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
       {delCM && <Modal title="Delete Custom Metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
       {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
+      {colEditorOpen && <ColumnEditor columns={orderedCols} onSave={(keys) => { saveColOrder(keys); setColEditorOpen(false); }} onCancel={() => setColEditorOpen(false)} />}
       {toast && (<div className="fi" style={{ ...S.toast, borderLeft: `3px solid ${toast.type === "ok" ? "#12864A" : "#D92D20"}` }}><I d={toast.type === "ok" ? "M20 6L9 17l-5-5" : "M12 2a10 10 0 100 20 10 10 0 000-20zM12 8v4M12 16h.01"} size={16} stroke={toast.type === "ok" ? "#12864A" : "#D92D20"} sw={2.2} />{toast.msg}</div>)}
     </div>
   );
@@ -800,6 +833,75 @@ function LensEditor({ lens, onSave, onCancel }) {
         <div style={{ display: "flex", gap: 10 }}>
           <button style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
           <button style={{ ...S.btnDark, flex: 1, justifyContent: "center" }} disabled={!name.trim() || metrics.length === 0} onClick={() => onSave({ id: lens.id, name: name.trim(), metrics })}>{lens.id ? "Update" : "Create"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ColumnEditor({ columns, onSave, onCancel }) {
+  const [items, setItems] = useState(columns.map(c => ({ ...c })));
+  const dragItem = useRef(null);
+  const dragOverItem = useRef(null);
+  const [dragIdx, setDragIdx] = useState(null);
+  const [overIdx, setOverIdx] = useState(null);
+
+  const handleDragStart = (idx) => { dragItem.current = idx; setDragIdx(idx); };
+  const handleDragEnter = (idx) => { dragOverItem.current = idx; setOverIdx(idx); };
+  const handleDragEnd = () => {
+    if (dragItem.current !== null && dragOverItem.current !== null && dragItem.current !== dragOverItem.current) {
+      const next = [...items];
+      const [dragged] = next.splice(dragItem.current, 1);
+      next.splice(dragOverItem.current, 0, dragged);
+      setItems(next);
+    }
+    dragItem.current = null;
+    dragOverItem.current = null;
+    setDragIdx(null);
+    setOverIdx(null);
+  };
+
+  const reset = () => setItems(MK.map(k => ({ key: k, label: COL_LABELS[k], type: "base" })).concat(columns.filter(c => c.type === "custom")));
+  const CE = {
+    list: { display: "flex", flexDirection: "column", gap: 2, maxHeight: 400, overflowY: "auto", marginBottom: 20 },
+    item: (isDragging, isOver) => ({ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: isDragging ? "#EEF2FF" : isOver ? "#F0FDF4" : "#F9FAFB", border: `1px solid ${isDragging ? "#818CF8" : isOver ? "#86EFAC" : "#E5E7EB"}`, borderRadius: 8, cursor: "grab", transition: "all 150ms ease", opacity: isDragging ? 0.6 : 1, transform: isDragging ? "scale(0.98)" : "scale(1)" }),
+    grip: { color: "#9CA3AF", fontSize: 14, cursor: "grab", userSelect: "none", display: "flex", flexDirection: "column", lineHeight: 0.5, letterSpacing: 2 },
+    label: { flex: 1, fontSize: 14, fontWeight: 500, color: "#111827" },
+    badge: { fontSize: 10, fontWeight: 600, padding: "2px 6px", borderRadius: 4, textTransform: "uppercase", letterSpacing: "0.04em" },
+  };
+  return (
+    <div style={S.overlay} onClick={onCancel}>
+      <div style={{ ...S.modal, maxWidth: 440, textAlign: "left" }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 600, color: "#111827" }}>Edit Column Order</div>
+            <div style={{ fontSize: 13, color: "#6B7280", marginTop: 4 }}>Drag to reorder. Day & Date are always first.</div>
+          </div>
+        </div>
+        <div style={CE.list}>
+          {items.map((col, i) => (
+            <div
+              key={col.key}
+              draggable
+              onDragStart={() => handleDragStart(i)}
+              onDragEnter={() => handleDragEnter(i)}
+              onDragEnd={handleDragEnd}
+              onDragOver={e => e.preventDefault()}
+              style={CE.item(dragIdx === i, overIdx === i && dragIdx !== i)}
+            >
+              <span style={CE.grip}>⠿</span>
+              <span style={{ color: "#9CA3AF", fontSize: 12, fontWeight: 600, width: 20, textAlign: "center" }}>{i + 1}</span>
+              <span style={CE.label}>{col.label}</span>
+              {col.type === "custom" && <span style={{ ...CE.badge, background: "#ECFDF5", color: "#047857" }}>Custom</span>}
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "space-between" }}>
+          <button style={{ ...S.btnGhost, fontSize: 13, color: "#6B7280" }} onClick={reset}>Reset to Default</button>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button style={{ ...S.btnLight, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
+            <button style={{ ...S.btnDark, justifyContent: "center" }} onClick={() => onSave(items.map(c => c.key))}>Save Order</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1304,7 +1406,23 @@ body{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 .spin{animation:sp 700ms linear infinite}
 .trow:hover{background:#F9FAFB!important}
 .trow:hover .rowBtn{opacity:1}
+.trow:nth-child(even){background:#FAFBFC}
 .rowBtn{opacity:0;transition:opacity 150ms ease}
+
+/* Sticky Day/Date columns */
+.sticky-col { position: sticky; z-index: 2; background: inherit; }
+.sticky-col-1 { left: 0; }
+.sticky-col-2 { left: 64px; }
+thead .sticky-col { background: #FAFAFA; z-index: 3; }
+.trow .sticky-col { background: #fff; }
+.trow:nth-child(even) .sticky-col { background: #FAFBFC; }
+.trow:hover .sticky-col { background: #F9FAFB !important; }
+.sticky-col-2::after {
+  content: ''; position: absolute; top: 0; right: -6px; bottom: 0; width: 6px;
+  background: linear-gradient(90deg, rgba(0,0,0,0.04), transparent);
+  pointer-events: none;
+}
+
 input:focus{outline:none;border-color:#D1D5DB!important;box-shadow:0 0 0 3px rgba(243,244,246,1)!important}
 ::selection{background:rgba(18,134,74,0.12)}
 @keyframes blink{0%,100%{opacity:0.3}50%{opacity:1}}
@@ -1503,12 +1621,12 @@ const S = {
   listToggleInactive: { padding: "6px 14px", borderRadius: 6, fontSize: 13, fontWeight: 500, color: "#6B7280", display: "flex", alignItems: "center", gap: 6, cursor: "pointer" },
   searchWrap: { display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", background: "#fff", border: "1px solid #E5E7EB", borderRadius: 8, width: 260, boxShadow: "0 1px 2px rgba(0,0,0,0.02)" },
   searchInput: { border: "none", outline: "none", background: "transparent", fontFamily: fn, fontSize: 13, color: "#111827", width: "100%", fontWeight: 400 },
-  tableWrap: { background: "#fff", border: "1px solid #E5E7EB", borderRadius: 12, overflowX: "auto", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" },
-  table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
-  th: { padding: "14px 20px", textAlign: "center", fontSize: 11, fontWeight: 600, color: "#6B7280", textTransform: "uppercase", borderBottom: "1px solid #E5E7EB", background: "#FFFFFF", letterSpacing: "0.05em" },
-  td: { padding: "14px 20px", borderBottom: "1px solid #F3F4F6", verticalAlign: "middle", textAlign: "center" },
-  tdNum: { padding: "14px 20px", borderBottom: "1px solid #F3F4F6", fontWeight: 500, fontVariantNumeric: "tabular-nums", color: "#111827", fontSize: 13, textAlign: "center" },
-  tdMoney: { padding: "14px 20px", borderBottom: "1px solid #F3F4F6", fontWeight: 500, fontVariantNumeric: "tabular-nums", color: "#111827", fontSize: 13, textAlign: "center" },
+  tableWrap: { background: "#fff", border: "1px solid #E5E7EB", overflowX: "auto", boxShadow: "0 1px 3px rgba(0,0,0,0.04)", marginLeft: "calc(-1 * (100vw - 100%) / 2)", marginRight: "calc(-1 * (100vw - 100%) / 2)", width: "100vw", maxWidth: "100vw", borderRadius: 0, borderLeft: "none", borderRight: "none" },
+  table: { width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 900 },
+  th: { padding: "10px 16px", textAlign: "center", fontSize: 11, fontWeight: 600, color: "#6B7280", textTransform: "uppercase", borderBottom: "2px solid #E5E7EB", background: "#FAFAFA", letterSpacing: "0.05em", whiteSpace: "nowrap" },
+  td: { padding: "10px 16px", borderBottom: "1px solid #F3F4F6", verticalAlign: "middle", textAlign: "center" },
+  tdNum: { padding: "10px 16px", borderBottom: "1px solid #F3F4F6", fontWeight: 500, fontVariantNumeric: "tabular-nums", color: "#111827", fontSize: 13, textAlign: "center" },
+  tdMoney: { padding: "10px 16px", borderBottom: "1px solid #F3F4F6", fontWeight: 500, fontVariantNumeric: "tabular-nums", color: "#111827", fontSize: 13, textAlign: "center" },
   dayPill: { display: "inline-block", padding: "4px 10px", background: "#F3F4F6", color: "#4B5563", fontSize: 11, fontWeight: 600, borderRadius: 6, letterSpacing: "0.02em", textTransform: "uppercase" },
   todayDot: { display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "#F97316", marginLeft: 4, verticalAlign: "middle" },
   purchBadge: { display: "inline-block", padding: "2px 8px", background: "#ECFDF5", color: "#047857", fontWeight: 600, borderRadius: 4, border: "1px solid #A7F3D0" },

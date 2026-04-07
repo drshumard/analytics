@@ -533,22 +533,25 @@ app.put('/api/me/preferences', dashboardLimiter, requireAuth, async (req, res) =
         // Check if user_roles row exists
         const { data: existing } = await supabase
             .from('user_roles')
-            .select('user_id')
+            .select('user_id, preferences')
             .eq('user_id', req.user.id)
             .single();
+
+        // Merge with existing preferences (don't overwrite other keys)
+        const merged = { ...(existing?.preferences || {}), ...preferences };
 
         let error;
         if (existing) {
             // Update only preferences, keep existing role
             ({ error } = await supabase
                 .from('user_roles')
-                .update({ preferences })
+                .update({ preferences: merged })
                 .eq('user_id', req.user.id));
         } else {
             // Insert new row with default viewer role
             ({ error } = await supabase
                 .from('user_roles')
-                .insert({ user_id: req.user.id, role: 'viewer', preferences }));
+                .insert({ user_id: req.user.id, role: 'viewer', preferences: merged }));
         }
 
         if (error) throw error;
