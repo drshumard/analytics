@@ -513,7 +513,7 @@ export default function App() {
                 return (
                   <div key={i} style={{ ...S.stripCell, borderRight: i < arr.length - 1 ? "1px solid #E8E8E6" : "none" }}>
                     <div style={S.stripLabel}>{c.label}</div>
-                    <div style={S.stripValRow}>
+                    <div className="strip-val-row" style={S.stripValRow}>
                       <span style={S.stripVal}>{c.val}</span>
                       {pct !== null && (
                         <span style={{ ...S.pctBadge, background: pct >= 0 ? "#EAFCFA" : "#FFF1F2", color: pct >= 0 ? "#047857" : "#BE123C" }}>
@@ -1344,6 +1344,13 @@ input:focus{outline:none;border-color:#D1D5DB!important;box-shadow:0 0 0 3px rgb
   }
   .summary-strip > div:nth-child(2) { border-right: none !important; }
   .summary-strip > div:nth-child(4) { border-right: none !important; }
+
+  /* Stack value + badge vertically on mobile */
+  .strip-val-row {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 6px !important;
+  }
 
   /* Toolbar */
   .toolbar-row {
