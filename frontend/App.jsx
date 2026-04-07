@@ -129,7 +129,20 @@ const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` :
 
 const I = ({ d, size = 16, stroke = "currentColor", sw = 1.8 }) => (<svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round"><path d={d} /></svg>);
 
+function useIsMobile(bp = 768) {
+  const [m, setM] = useState(() => typeof window !== 'undefined' && window.innerWidth <= bp);
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${bp}px)`);
+    const h = (e) => setM(e.matches);
+    mq.addEventListener('change', h);
+    return () => mq.removeEventListener('change', h);
+  }, [bp]);
+  return m;
+}
+
 export default function App() {
+  const isMobile = useIsMobile();
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [session, setSession] = useState(null);
   const [userRole, setUserRole] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -196,6 +209,8 @@ export default function App() {
     } catch { /* silent */ }
   };
   useEffect(() => { const h = (e) => { if (lensMenuRef.current && !lensMenuRef.current.contains(e.target)) setLensMenuOpen(false); }; document.addEventListener("mousedown", h); return () => document.removeEventListener("mousedown", h); }, []);
+  // Close mobile menu on nav
+  useEffect(() => { setMobileMenuOpen(false); }, [view]);
   const tt = useRef(null);
 
   const flash = useCallback((msg, type = "ok") => { if (tt.current) clearTimeout(tt.current); setToast({ msg, type }); tt.current = setTimeout(() => setToast(null), 3000); }, []);
@@ -360,8 +375,8 @@ export default function App() {
   // Login screen
   if (!session) return (
     <div style={S.app}><style>{CSS}</style>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh" }}>
-        <form onSubmit={handleLogin} style={{ width: 380, background: "#fff", borderRadius: 16, padding: "48px 36px", boxShadow: "0 8px 32px rgba(0,0,0,0.08)", border: "1px solid #E8E8E6" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", padding: "0 16px" }}>
+        <form onSubmit={handleLogin} className="login-form" style={{ width: "100%", maxWidth: 380, background: "#fff", borderRadius: 16, padding: "48px 36px", boxShadow: "0 8px 32px rgba(0,0,0,0.08)", border: "1px solid #E8E8E6" }}>
           <div style={{ textAlign: "center", marginBottom: 32 }}>
             <img src="https://portal-drshumard.b-cdn.net/trans_sized.png" alt="Logo" style={{ height: 36, objectFit: "contain", marginBottom: 16 }} />
             <h2 style={{ fontSize: 20, fontWeight: 700, color: "#111827", margin: 0 }}>Analytics Dashboard</h2>
@@ -402,37 +417,65 @@ export default function App() {
     </div>
   );
 
+  const effectiveViewMode = isMobile ? "board" : viewMode;
+
   return (
     <div style={S.app}><style>{CSS}</style>
-      <header style={S.hdr}>
+      <header className="app-header" style={S.hdr}>
         <div style={{ display: "flex", alignItems: "center" }}>
           <img src="https://portal-drshumard.b-cdn.net/trans_sized.png" alt="Dr Shumard Analytics" style={{ height: 32, objectFit: "contain" }} />
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <button style={S.btnGhost} onClick={refreshWebhook} title="Refresh Spend Data"><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={15} stroke="#8A8A88" /></button>
-
-          {view === "dash" && (
-            <>
-              <button style={S.btnLight} onClick={() => setView("insights")}>Insights</button>
-              <button style={S.btnLight} onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}>Activity Log</button>
-              {isAdmin && <button style={S.btnLight} onClick={() => setView("query")}>Query Data</button>}
-              {isAdmin && <button style={S.btnLight} onClick={() => { setEditCM(null); setView("custom-list"); }}>Manage Metrics</button>}
-            </>
-          )}
-
-          {view === "dash" ? (
-            isAdmin && <button style={{ ...S.btnDark, padding: "8px 16px", borderRadius: 8 }} onClick={() => { setEditRow(null); setView("entry"); }}>+ New Entry</button>
-          ) : (
-            <button style={S.btnLight} onClick={() => { setView("dash"); setEditRow(null); setEditCM(null); }}>← Back</button>
-          )}
-          <button style={S.btnGhost} onClick={handleLogout} title="Sign out"><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={15} stroke="#8A8A88" /></button>
+        <div className="header-actions">
+          {/* Hamburger toggle — visible only on mobile via CSS */}
+          <button className="mobile-menu-toggle" style={S.btnGhost} onClick={() => setMobileMenuOpen(p => !p)} aria-label="Menu">
+            <I d={mobileMenuOpen ? "M6 18L18 6M6 6l12 12" : "M4 6h16M4 12h16M4 18h16"} size={20} stroke="#374151" sw={2} />
+          </button>
+          {/* Desktop-visible buttons */}
+          <div className="nav-buttons-desktop">
+            <button style={S.btnGhost} onClick={refreshWebhook} title="Refresh Spend Data"><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={15} stroke="#8A8A88" /></button>
+            {view === "dash" && (
+              <>
+                <button style={S.btnLight} onClick={() => setView("insights")}>Insights</button>
+                <button style={S.btnLight} onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}>Activity Log</button>
+                {isAdmin && <button style={S.btnLight} onClick={() => setView("query")}>Query Data</button>}
+                {isAdmin && <button style={S.btnLight} onClick={() => { setEditCM(null); setView("custom-list"); }}>Manage Metrics</button>}
+              </>
+            )}
+            {view === "dash" ? (
+              isAdmin && <button style={{ ...S.btnDark, padding: "8px 16px", borderRadius: 8 }} onClick={() => { setEditRow(null); setView("entry"); }}>+ New Entry</button>
+            ) : (
+              <button style={S.btnLight} onClick={() => { setView("dash"); setEditRow(null); setEditCM(null); }}>← Back</button>
+            )}
+            <button style={S.btnGhost} onClick={handleLogout} title="Sign out"><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={15} stroke="#8A8A88" /></button>
+          </div>
         </div>
       </header>
 
-      <main style={S.main}>
+      {/* Mobile dropdown menu */}
+      {mobileMenuOpen && (
+        <div className="mobile-nav-dropdown">
+          <button className="mobile-nav-item" onClick={refreshWebhook}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={16} stroke="#6B7280" /> Refresh Data</button>
+          {view === "dash" && (
+            <>
+              <button className="mobile-nav-item" onClick={() => setView("insights")}><I d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" size={16} stroke="#6B7280" /> Insights</button>
+              <button className="mobile-nav-item" onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}><I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" size={16} stroke="#6B7280" /> Activity Log</button>
+              {isAdmin && <button className="mobile-nav-item" onClick={() => setView("query")}><I d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" size={16} stroke="#6B7280" /> Query Data</button>}
+              {isAdmin && <button className="mobile-nav-item" onClick={() => { setEditCM(null); setView("custom-list"); }}><I d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" size={16} stroke="#6B7280" /> Manage Metrics</button>}
+              {isAdmin && <button className="mobile-nav-item mobile-nav-primary" onClick={() => { setEditRow(null); setView("entry"); }}><I d="M12 4v16m8-8H4" size={16} stroke="#fff" /> New Entry</button>}
+            </>
+          )}
+          {view !== "dash" && (
+            <button className="mobile-nav-item" onClick={() => { setView("dash"); setEditRow(null); setEditCM(null); }}><I d="M10 19l-7-7m0 0l7-7m-7 7h18" size={16} stroke="#6B7280" /> Back to Dashboard</button>
+          )}
+          <div className="mobile-nav-divider" />
+          <button className="mobile-nav-item mobile-nav-danger" onClick={handleLogout}><I d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" size={16} stroke="#DC2626" /> Sign Out</button>
+        </div>
+      )}
+
+      <main className="main-content" style={S.main}>
         {view === "dash" && (
           <div className="fi">
-            <div style={S.titleRow}>
+            <div className="title-row" style={S.titleRow}>
               <div><h1 style={S.pageTitle}>Dashboard Summary</h1><div style={S.pageSub}>Last {metrics.length} days &middot; auto-refreshes every 30s</div></div>
               <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
                 <div style={{ ...S.searchWrap, width: "auto", padding: "6px 12px", boxShadow: "0 1px 2px rgba(0,0,0,0.05)" }}>
@@ -459,7 +502,7 @@ export default function App() {
               </div>
             </div>
 
-            <div style={S.strip}>
+            <div className="summary-strip" style={S.strip}>
               {[
                 { label: "Total Spend", val: `$${(totals.fb_spend || 0).toLocaleString("en-US", { maximumFractionDigits: 0 })}`, key: "fb_spend" },
                 { label: "Registrations", val: (totals.registrations || 0).toLocaleString(), key: "registrations" },
@@ -484,7 +527,7 @@ export default function App() {
               })}
             </div>
 
-            <div style={S.toolbar}>
+            <div className="toolbar-row" style={S.toolbar}>
               <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
                 <div style={S.listBoardToggle}>
                   <div style={viewMode === "list" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("list")}><I d="M4 6h16M4 12h16M4 18h16" size={14} /> List</div>
@@ -520,8 +563,8 @@ export default function App() {
               <div style={S.searchWrap}><I d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" size={15} stroke="#AEAEA8" /><input style={S.searchInput} placeholder="Search records..." value={search} onChange={e => setSearch(e.target.value)} /></div>
             </div>
 
-            {viewMode === "list" ? (
-              <div style={S.tableWrap}>
+            {effectiveViewMode === "list" ? (
+              <div className="table-wrap" style={S.tableWrap}>
                 <table style={S.table}>
                   <thead><tr>
                     <th style={S.th}>Day</th><th style={S.th}>Date</th>
@@ -598,7 +641,7 @@ export default function App() {
             )}
           </div>
         )}
-        {view === "entry" && <EntryForm initial={editRow} onSubmit={submitEntry} onCancel={() => { setView("dash"); setEditRow(null); }} />}
+        {view === "entry" && <EntryForm initial={editRow} onSubmit={submitEntry} onCancel={() => { setView("dash"); setEditRow(null); }} isMobile={isMobile} />}
         {view === "custom" && <CMForm initial={editCM} onSubmit={saveCM} onCancel={() => { setView("custom-list"); setEditCM(null); }} metrics={metrics} />}
         {view === "custom-list" && (
           <div className="fi" style={S.fc}>
@@ -631,7 +674,7 @@ export default function App() {
         )}
         {view === "events" && (
           <div className="fi">
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+            <div className="events-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
               <div><h1 style={S.pageTitle}>Activity Log</h1><div style={{ fontSize: 13, color: "#6B7280", marginTop: 4 }}>Recent events from your webhooks</div></div>
               <div style={{ ...S.searchWrap, width: "auto", padding: "6px 12px" }}>
                 <select style={S.searchInput} value={evFilter} onChange={async e => { setEvFilter(e.target.value); try { const r = await api.getEvents(100, e.target.value); setEvents(r.data || []); } catch { } }}>
@@ -681,7 +724,7 @@ export default function App() {
             </div>
           </div>
         )}
-        {view === "insights" && <InsightsChat flash={flash} />}
+        {view === "insights" && <InsightsChat flash={flash} isMobile={isMobile} />}
         {view === "query" && <QueryBuilder flash={flash} />}
       </main>
 
@@ -740,18 +783,18 @@ function Modal({ title, msg, onCancel, onConfirm }) {
   );
 }
 
-function EntryForm({ initial, onSubmit, onCancel }) {
+function EntryForm({ initial, onSubmit, onCancel, isMobile }) {
   const today = getLADate();
   const [f, setF] = useState({ date: initial?.date || today, fb_spend: initial?.fb_spend ?? "", registrations: initial?.registrations ?? "", replays: initial?.replays ?? "", viewedcta: initial?.viewedcta ?? "", clickedcta: initial?.clickedcta ?? "", purchases: initial?.purchases ?? "", attended: initial?.attended ?? "" });
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
   const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases: parseInt(f.purchases) || 0, attended: parseInt(f.attended) || 0 });
   const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases", l: "Purchases", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
   return (
-    <div className="fi" style={S.fc}>
+    <div className="fi form-container" style={S.fc}>
       <div style={S.fh}><div style={{ ...S.formBadge, background: initial ? "#EFF8FF" : "#ECFDF3", color: initial ? "#175CD3" : "#12864A" }}>{initial ? "EDIT ENTRY" : "NEW ENTRY"}</div><h2 style={S.ft}>{initial ? `Update ${fmtDateNice(initial.date)}` : "Add Daily Metrics"}</h2><p style={S.fs}>Enter metrics for the day. Fields default to 0 if empty.</p></div>
-      <div style={S.fcard}>
+      <div className="form-card" style={S.fcard}>
         <div style={{ marginBottom: 20 }}><label style={S.fl}>Date (MM/DD/YYYY)</label><input style={S.inp} value={f.date} onChange={e => set("date", e.target.value)} placeholder="03/14/2026" disabled={!!initial} />{!initial && f.date && <div style={S.hint}>{getLADay(f.date)}</div>}</div>
-        <div style={S.fgrid}>{fields.map(fi => (<div key={fi.k}><label style={S.fl}>{fi.l}</label><input style={S.inp} type="number" step={fi.step} placeholder={fi.ph} value={f[fi.k]} onChange={e => set(fi.k, e.target.value)} /></div>))}</div>
+        <div className="form-grid" style={S.fgrid}>{fields.map(fi => (<div key={fi.k}><label style={S.fl}>{fi.l}</label><input style={S.inp} type="number" step={fi.step} placeholder={fi.ph} value={f[fi.k]} onChange={e => set(fi.k, e.target.value)} /></div>))}</div>
         <div style={S.fa}><button style={S.btnLight} onClick={onCancel}>Cancel</button><button style={S.btnDark} onClick={go}>{initial ? "Update Entry" : "Add Entry"}</button></div>
       </div>
     </div>
@@ -850,7 +893,7 @@ function QueryBuilder({ flash }) {
 
   const eventTypes = ["registrations", "attended", "replays", "viewedcta", "clickedcta", "purchases"];
   const QS = {
-    wrap: { padding: "32px 40px", maxWidth: 1200, margin: "0 auto" },
+    wrap: { padding: "32px 40px", maxWidth: 1200, margin: "0 auto", className: "query-wrap" },
     header: { marginBottom: 24 },
     badge: { display: "inline-block", padding: "4px 10px", borderRadius: 6, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", background: "#EEF4FF", color: "#3538CD", marginBottom: 10 },
     title: { fontSize: 22, fontWeight: 700, color: "#111827", margin: 0 },
@@ -871,14 +914,14 @@ function QueryBuilder({ flash }) {
   };
 
   return (
-    <div style={QS.wrap}>
+    <div className="query-wrap" style={QS.wrap}>
       <div style={QS.header}>
         <div style={QS.badge}>Admin</div>
         <h2 style={QS.title}>Query Data</h2>
         <p style={QS.subtitle}>Filter and export data from the database</p>
       </div>
 
-      <div style={QS.filters}>
+      <div className="query-filters" style={QS.filters}>
         <div style={QS.filterGroup}>
           <span style={QS.filterLabel}>Table</span>
           <select style={QS.filterSelect} value={table} onChange={e => { setTable(e.target.value); setResults(null); setEventType(""); setSortBy(""); }}>
@@ -959,13 +1002,13 @@ function QueryBuilder({ flash }) {
   );
 }
 
-function InsightsChat({ flash }) {
+function InsightsChat({ flash, isMobile }) {
   const [history, setHistory] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [chatMsgs, setChatMsgs] = useState([]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(!isMobile);
   const [historyLoading, setHistoryLoading] = useState(true);
   const chatEndRef = useRef(null);
   // Cache of full conversation messages (sidebar list only has id/title/updated_at)
@@ -1080,8 +1123,8 @@ function InsightsChat({ flash }) {
   };
 
   const IC = {
-    outer: { display: "flex", height: "calc(100vh - 120px)", gap: 0 },
-    sidebar: { width: sidebarOpen ? 260 : 0, minWidth: sidebarOpen ? 260 : 0, background: "#F9FAFB", borderRight: sidebarOpen ? "1px solid #E5E7EB" : "none", display: "flex", flexDirection: "column", overflow: "hidden", transition: "width 0.2s, min-width 0.2s", borderRadius: "12px 0 0 12px" },
+    outer: { display: "flex", height: "calc(100vh - 120px)", gap: 0, position: "relative" },
+    sidebar: { width: sidebarOpen ? (isMobile ? "100%" : 260) : 0, minWidth: sidebarOpen ? (isMobile ? "100%" : 260) : 0, background: "#F9FAFB", borderRight: sidebarOpen && !isMobile ? "1px solid #E5E7EB" : "none", display: "flex", flexDirection: "column", overflow: "hidden", transition: "width 0.2s, min-width 0.2s", borderRadius: "12px 0 0 12px", ...(isMobile && sidebarOpen ? { position: "absolute", inset: 0, zIndex: 10, borderRadius: 12 } : {}) },
     sidebarHeader: { padding: "16px", borderBottom: "1px solid #E5E7EB", display: "flex", justifyContent: "space-between", alignItems: "center" },
     sidebarTitle: { fontSize: 13, fontWeight: 600, color: "#374151", letterSpacing: "0.02em", textTransform: "uppercase" },
     newBtn: { padding: "5px 10px", background: "#111827", color: "#fff", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "Inter, sans-serif" },
@@ -1115,7 +1158,7 @@ function InsightsChat({ flash }) {
   };
 
   return (
-    <div style={IC.outer}>
+    <div className="insights-outer" style={IC.outer}>
       {/* Sidebar */}
       <div style={IC.sidebar}>
         <div style={IC.sidebarHeader}>
@@ -1226,6 +1269,156 @@ input:focus{outline:none;border-color:#D1D5DB!important;box-shadow:0 0 0 3px rgb
 ::selection{background:rgba(18,134,74,0.12)}
 @keyframes blink{0%,100%{opacity:0.3}50%{opacity:1}}
 .blink-1{animation:blink 1.2s 0s infinite}.blink-2{animation:blink 1.2s 0.2s infinite}.blink-3{animation:blink 1.2s 0.4s infinite}
+
+/* ─── Desktop nav layout ───────────────────────────────────────── */
+.nav-buttons-desktop { display: flex; align-items: center; gap: 10px; }
+.header-actions { display: flex; align-items: center; gap: 10px; }
+
+/* ─── Mobile Menu Toggle (hidden on desktop) ───────────────────── */
+.mobile-menu-toggle { display: none !important; }
+
+/* ─── Mobile Nav Dropdown ──────────────────────────────────────── */
+.mobile-nav-dropdown {
+  display: none;
+  position: sticky; top: 0; z-index: 99;
+  background: #fff; border-bottom: 1px solid #E5E7EB;
+  padding: 8px 16px;
+  flex-direction: column; gap: 2px;
+  animation: fu 200ms cubic-bezier(0.16,1,0.3,1);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+}
+.mobile-nav-item {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; padding: 12px 14px;
+  background: none; border: none; border-radius: 10px;
+  font-family: 'Inter', -apple-system, sans-serif;
+  font-size: 14px; font-weight: 500; color: #374151;
+  cursor: pointer; text-align: left;
+  transition: background 0.1s;
+}
+.mobile-nav-item:hover, .mobile-nav-item:active { background: #F3F4F6; }
+.mobile-nav-primary {
+  background: #111827 !important; color: #fff !important;
+  margin-top: 4px; font-weight: 600;
+}
+.mobile-nav-primary:hover, .mobile-nav-primary:active { background: #1F2937 !important; }
+.mobile-nav-danger { color: #DC2626 !important; }
+.mobile-nav-divider { height: 1px; background: #E5E7EB; margin: 4px 0; }
+
+/* ─── Mobile Responsive (≤768px) ──────────────────────────────── */
+@media (max-width: 768px) {
+  /* Header */
+  .app-header {
+    padding: 12px 16px !important;
+  }
+  .app-header img { height: 26px !important; }
+  .mobile-menu-toggle { display: inline-flex !important; }
+  .nav-buttons-desktop { display: none !important; }
+  .mobile-nav-dropdown { display: flex !important; }
+  .header-actions {
+    display: flex !important; align-items: center !important; gap: 6px !important;
+  }
+
+  /* Main */
+  .main-content {
+    padding: 16px 12px 40px !important;
+  }
+
+  /* Title row */
+  .title-row {
+    flex-direction: column !important; align-items: stretch !important; gap: 12px !important;
+  }
+  .title-row h1 { font-size: 20px !important; }
+
+  /* Summary strip — 2×2 grid */
+  .summary-strip {
+    flex-wrap: wrap !important;
+  }
+  .summary-strip > div {
+    flex: 1 1 calc(50% - 1px) !important; min-width: calc(50% - 1px) !important;
+    padding: 16px !important;
+  }
+  .summary-strip > div:nth-child(1),
+  .summary-strip > div:nth-child(2) {
+    border-bottom: 1px solid #E8E8E6 !important;
+  }
+  .summary-strip > div:nth-child(2) { border-right: none !important; }
+  .summary-strip > div:nth-child(4) { border-right: none !important; }
+
+  /* Toolbar */
+  .toolbar-row {
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 10px !important;
+  }
+  .toolbar-row > div:first-child {
+    flex-wrap: wrap !important;
+  }
+
+  /* Board grid on mobile */
+  .boardGrid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Forms */
+  .form-container {
+    padding: 0 4px !important;
+  }
+  .form-card {
+    padding: 20px !important;
+  }
+  .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Events header */
+  .events-header {
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 12px !important;
+  }
+
+  /* Query builder */
+  .query-wrap {
+    padding: 16px !important;
+  }
+  .query-filters {
+    flex-direction: column !important;
+  }
+  .query-filters > div { width: 100% !important; }
+  .query-filters input, .query-filters select { width: 100% !important; min-width: 0 !important; }
+
+  /* Insights chat */
+  .insights-outer {
+    height: calc(100vh - 80px) !important;
+  }
+
+  /* Modal */
+  .modal-inner {
+    padding: 24px 20px !important;
+  }
+
+  /* Toast */
+  .toast-el {
+    max-width: calc(100vw - 32px) !important;
+    left: 16px !important; right: 16px !important;
+    transform: none !important;
+  }
+
+  /* Login form */
+  .login-form {
+    padding: 32px 20px !important;
+  }
+
+  /* table action buttons always visible on mobile (no hover) */
+  .rowBtn { opacity: 1 !important; }
+}
+
+/* Tablet (769px - 1024px) minor tweaks */
+@media (min-width: 769px) and (max-width: 1024px) {
+  .main-content { padding: 24px 20px 48px !important; }
+  .summary-strip > div { padding: 18px !important; }
+}
 `;
 
 const fn = "'Inter',-apple-system,BlinkMacSystemFont,sans-serif";
@@ -1243,7 +1436,7 @@ const S = {
   pageSub: { fontSize: 13, color: "#6B7280", fontWeight: 500, marginTop: 4, display: "none" },
   livePill: { display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px", background: "transparent", color: "#6B7280", fontSize: 12, fontWeight: 500, borderRadius: 100 },
   liveDot: { width: 6, height: 6, borderRadius: "50%", background: "#10B981", boxShadow: "0 0 6px rgba(16,185,129,0.4)" },
-  strip: { display: "flex", border: "1px solid #E5E7EB", borderRadius: 12, background: "#fff", marginBottom: 24, overflow: "hidden", boxShadow: "0 1px 2px rgba(0,0,0,0.02)" },
+  strip: { display: "flex", flexWrap: "wrap", border: "1px solid #E5E7EB", borderRadius: 12, background: "#fff", marginBottom: 24, overflow: "hidden", boxShadow: "0 1px 2px rgba(0,0,0,0.02)" },
   stripCell: { flex: 1, padding: "24px", display: "flex", flexDirection: "column", gap: 8 },
   stripLabel: { fontSize: 13, fontWeight: 500, color: "#6B7280" },
   stripValRow: { display: "flex", alignItems: "baseline", gap: 12 },
@@ -1286,7 +1479,7 @@ const S = {
   fmtB: { padding: "8px 16px", fontSize: 13, fontWeight: 500, fontFamily: fn, background: "#fff", color: "#4B5563", border: "1px solid #D1D5DB", borderRadius: 6, cursor: "pointer" },
   fmtA: { padding: "8px 16px", fontSize: 13, fontWeight: 500, fontFamily: fn, background: "#F3F4F6", color: "#111827", border: "1px solid #9CA3AF", borderRadius: 6, cursor: "pointer" },
   prev: { padding: 24, background: "#F9FAFB", border: "1px dashed #D1D5DB", borderRadius: 8, textAlign: "center" },
-  boardGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 24 },
+  boardGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 16 },
   boardCard: { background: "#fff", border: "1px solid #E5E7EB", borderRadius: 12, padding: 24, boxShadow: "0 1px 3px rgba(0,0,0,0.04)", display: "flex", flexDirection: "column" },
   boardCardHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, borderBottom: "1px solid #F3F4F6", paddingBottom: 16 },
   boardCardBody: { display: "flex", flexDirection: "column", gap: 12, flex: 1 },
