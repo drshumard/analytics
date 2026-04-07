@@ -511,11 +511,28 @@ app.get('/api/me', dashboardLimiter, requireAuth, async (req, res) => {
             .select('role, preferences')
             .eq('user_id', req.user.id)
             .single();
+
+        let defaultColOrder = null;
+
+        // If user doesn't have their own col_order, look up the admin's global default
+        if (!data?.preferences?.col_order) {
+            const { data: adminRow } = await supabase
+                .from('user_roles')
+                .select('preferences')
+                .eq('role', 'admin')
+                .limit(1)
+                .single();
+            if (adminRow?.preferences?.global_col_order) {
+                defaultColOrder = adminRow.preferences.global_col_order;
+            }
+        }
+
         res.json({
             id: req.user.id,
             email: req.user.email,
             role: data?.role || 'viewer',
             preferences: data?.preferences || {},
+            default_col_order: defaultColOrder,
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to fetch user info' });
@@ -558,6 +575,39 @@ app.put('/api/me/preferences', dashboardLimiter, requireAuth, async (req, res) =
         res.json({ success: true });
     } catch (err) {
         console.error('❌ PUT /api/me/preferences error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// POST /api/settings/propagate-col-order — Admin pushes their column order to all users
+app.post('/api/settings/propagate-col-order', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        // Verify admin
+        const { data: roleData } = await supabase.from('user_roles').select('role, preferences').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
+        const colOrder = roleData.preferences?.col_order;
+        if (!colOrder || !Array.isArray(colOrder)) {
+            return res.status(400).json({ error: 'You have no column order saved. Open Edit Columns, arrange, and save first.' });
+        }
+
+        // Store as global default in admin's preferences
+        const adminPrefs = { ...(roleData.preferences || {}), global_col_order: colOrder };
+        await supabase.from('user_roles').update({ preferences: adminPrefs }).eq('user_id', req.user.id);
+
+        // Push to all other users
+        const { data: allUsers } = await supabase.from('user_roles').select('user_id, preferences').neq('user_id', req.user.id);
+        let updated = 0;
+        for (const user of (allUsers || [])) {
+            const merged = { ...(user.preferences || {}), col_order: colOrder };
+            await supabase.from('user_roles').update({ preferences: merged }).eq('user_id', user.user_id);
+            updated++;
+        }
+
+        console.log(`✅ Admin propagated col_order to ${updated} users`);
+        res.json({ success: true, updated });
+    } catch (err) {
+        console.error('❌ POST /api/settings/propagate-col-order error:', err.message);
         res.status(500).json({ error: 'Internal server error' });
     }
 });

@@ -317,6 +317,7 @@ export default function App() {
       setUserRole(data.role || "viewer");
       if (data.preferences?.default_lens_id) setActiveLensId(data.preferences.default_lens_id);
       if (data.preferences?.col_order) setColOrder(data.preferences.col_order);
+      else if (data.default_col_order) setColOrder(data.default_col_order);
     } catch { setUserRole("viewer"); }
     setAuthLoading(false);
   };
@@ -799,7 +800,7 @@ export default function App() {
       {delConfirm && <Modal title="Delete Entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
       {delCM && <Modal title="Delete Custom Metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
       {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
-      {colEditorOpen && <ColumnEditor columns={orderedCols} onSave={(keys) => { saveColOrder(keys); setColEditorOpen(false); }} onCancel={() => setColEditorOpen(false)} />}
+      {colEditorOpen && <ColumnEditor columns={orderedCols} isAdmin={isAdmin} onSave={(keys) => { saveColOrder(keys); setColEditorOpen(false); }} onCancel={() => setColEditorOpen(false)} />}
       {toast && (<div className="fi" style={{ ...S.toast, borderLeft: `3px solid ${toast.type === "ok" ? "#12864A" : "#D92D20"}` }}><I d={toast.type === "ok" ? "M20 6L9 17l-5-5" : "M12 2a10 10 0 100 20 10 10 0 000-20zM12 8v4M12 16h.01"} size={16} stroke={toast.type === "ok" ? "#12864A" : "#D92D20"} sw={2.2} />{toast.msg}</div>)}
     </div>
   );
@@ -839,12 +840,14 @@ function LensEditor({ lens, onSave, onCancel }) {
   );
 }
 
-function ColumnEditor({ columns, onSave, onCancel }) {
+function ColumnEditor({ columns, onSave, onCancel, isAdmin }) {
   const [items, setItems] = useState(columns.map(c => ({ ...c })));
+  const [propagating, setPropagating] = useState(false);
   const dragItem = useRef(null);
   const dragOverItem = useRef(null);
   const [dragIdx, setDragIdx] = useState(null);
   const [overIdx, setOverIdx] = useState(null);
+  const [statusMsg, setStatusMsg] = useState(null);
 
   const handleDragStart = (idx) => { dragItem.current = idx; setDragIdx(idx); };
   const handleDragEnter = (idx) => { dragOverItem.current = idx; setOverIdx(idx); };
@@ -896,8 +899,34 @@ function ColumnEditor({ columns, onSave, onCancel }) {
             </div>
           ))}
         </div>
-        <div style={{ display: "flex", gap: 10, justifyContent: "space-between" }}>
-          <button style={{ ...S.btnGhost, fontSize: 13, color: "#6B7280" }} onClick={reset}>Reset to Default</button>
+        <div style={{ display: "flex", gap: 10, justifyContent: "space-between", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <button style={{ ...S.btnGhost, fontSize: 13, color: "#6B7280" }} onClick={reset}>Reset to Default</button>
+            {isAdmin && (
+              <button
+                style={{ ...S.btnGhost, fontSize: 12, color: "#3538CD", opacity: propagating ? 0.5 : 1 }}
+                disabled={propagating}
+                onClick={async () => {
+                  setPropagating(true);
+                  setStatusMsg(null);
+                  try {
+                    // First save the current order
+                    onSave(items.map(c => c.key));
+                    // Then propagate to all users
+                    const headers = await getAuthHeaders();
+                    const res = await fetch(`${API_BASE}/api/settings/propagate-col-order`, { method: "POST", headers });
+                    const data = await res.json();
+                    if (data.success) setStatusMsg(`Pushed to ${data.updated} user${data.updated !== 1 ? "s" : ""}`);
+                    else setStatusMsg(data.error || "Failed");
+                  } catch { setStatusMsg("Network error"); }
+                  setPropagating(false);
+                }}
+              >
+                {propagating ? "Pushing..." : "✨ Set as Default for All"}
+              </button>
+            )}
+            {statusMsg && <span style={{ fontSize: 12, color: "#047857", fontWeight: 500 }}>{statusMsg}</span>}
+          </div>
           <div style={{ display: "flex", gap: 10 }}>
             <button style={{ ...S.btnLight, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
             <button style={{ ...S.btnDark, justifyContent: "center" }} onClick={() => onSave(items.map(c => c.key))}>Save Order</button>
