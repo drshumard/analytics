@@ -124,8 +124,44 @@ const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); 
 const MK = ["fb_spend", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "attended"];
 const COL_LABELS = { fb_spend: "FB Spend", registrations: "Registrations", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases: "Purchases" };
 const DEFAULT_HIDDEN = [];
-const evalFormula = (f, row) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(k, "gi"), String(Number(row[k]) || 0)); if (/[^0-9+\-*/().%\s_]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
+const evalFormula = (f, row, ctx = {}) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(`\\b${k}\\b`, "gi"), String(Number(row[k]) || 0)); for (const [k, v] of Object.entries(ctx)) e = e.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi"), String(Number(v) || 0)); if (/[^0-9+\-*/().%\s]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
 const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` : fmt === "currency" ? `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
+
+// Evaluate all custom metrics for a row in dependency order (topo-sort)
+const evalAllCustoms = (customs, row) => {
+  const ctx = {};
+  // Build a name->formula+format map
+  const byName = {};
+  customs.forEach(cm => { byName[cm.name.toLowerCase()] = cm; });
+  // Topo-sort: detect which customs reference other customs
+  const resolved = new Set();
+  const visiting = new Set();
+  const order = [];
+  const visit = (cm) => {
+    const key = cm.name.toLowerCase();
+    if (resolved.has(key)) return true;
+    if (visiting.has(key)) return false; // circular
+    visiting.add(key);
+    // Check if this formula references other custom metric names
+    for (const other of customs) {
+      if (other.name === cm.name) continue;
+      const re = new RegExp(`\\b${other.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "i");
+      if (re.test(cm.formula)) {
+        if (!visit(other)) return false; // circular dep
+      }
+    }
+    visiting.delete(key);
+    resolved.add(key);
+    order.push(cm);
+    return true;
+  };
+  customs.forEach(cm => visit(cm));
+  // Evaluate in order
+  for (const cm of order) {
+    ctx[cm.name] = evalFormula(cm.formula, row, ctx);
+  }
+  return ctx;
+};
 
 const I = ({ d, size = 16, stroke = "currentColor", sw = 1.8 }) => (<svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round"><path d={d} /></svg>);
 
@@ -594,7 +630,7 @@ export default function App() {
                           {isColVisible("viewedcta") && <td style={S.tdNum}>{(Number(row.viewedcta) || 0).toLocaleString()}</td>}
                           {isColVisible("clickedcta") && <td style={S.tdNum}>{(Number(row.clickedcta) || 0).toLocaleString()}</td>}
                           {isColVisible("purchases") && <td style={S.tdNum}><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></td>}
-                          {customs.map(cm => { const v = evalFormula(cm.formula, row); return <td key={cm.id} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(v, cm.format)}</td>; })}
+                          {(() => { const ctx = evalAllCustoms(customs, row); return customs.map(cm => <td key={cm.id} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(ctx[cm.name], cm.format)}</td>); })()}
                           <td style={S.td}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
                               <button className="rowBtn" style={{ ...S.rowAct, borderColor: "#DBEAFE", background: "#EFF6FF" }} title="Recalc spend from Facebook" onClick={() => recalcSpend(row.date)}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={14} stroke="#3B82F6" /></button>
@@ -628,7 +664,7 @@ export default function App() {
                       {isColVisible("viewedcta") && <div style={S.bcItem}><span style={S.bcLabel}>Viewed CTA</span><span style={S.bcVal}>{(Number(row.viewedcta) || 0).toLocaleString()}</span></div>}
                       {isColVisible("clickedcta") && <div style={S.bcItem}><span style={S.bcLabel}>Clicked CTA</span><span style={S.bcVal}>{(Number(row.clickedcta) || 0).toLocaleString()}</span></div>}
                       {isColVisible("purchases") && <div style={S.bcItem}><span style={S.bcLabel}>Purchases</span><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></div>}
-                      {customs.map(cm => { const v = evalFormula(cm.formula, row); return <div key={cm.id} style={S.bcItem}><span style={S.bcLabel}>{cm.name}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(v, cm.format)}</span></div>; })}
+                      {(() => { const ctx = evalAllCustoms(customs, row); return customs.map(cm => <div key={cm.id} style={S.bcItem}><span style={S.bcLabel}>{cm.name}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(ctx[cm.name], cm.format)}</span></div>); })()}
                     </div>
                     <div style={S.boardCardActions}>
                       <button style={{ ...S.rowAct, borderColor: "#DBEAFE", background: "#EFF6FF" }} title="Recalc spend from Facebook" onClick={() => recalcSpend(row.date)}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={14} stroke="#3B82F6" /></button>
@@ -642,7 +678,7 @@ export default function App() {
           </div>
         )}
         {view === "entry" && <EntryForm initial={editRow} onSubmit={submitEntry} onCancel={() => { setView("dash"); setEditRow(null); }} isMobile={isMobile} />}
-        {view === "custom" && <CMForm initial={editCM} onSubmit={saveCM} onCancel={() => { setView("custom-list"); setEditCM(null); }} metrics={metrics} />}
+        {view === "custom" && <CMForm initial={editCM} onSubmit={saveCM} onCancel={() => { setView("custom-list"); setEditCM(null); }} metrics={metrics} customs={customs} />}
         {view === "custom-list" && (
           <div className="fi" style={S.fc}>
             <div style={{ ...S.fh, marginBottom: 16 }}><h2 style={S.ft}>Manage Custom Metrics</h2></div>
@@ -801,15 +837,19 @@ function EntryForm({ initial, onSubmit, onCancel, isMobile }) {
   );
 }
 
-function CMForm({ initial, onSubmit, onCancel, metrics }) {
+function CMForm({ initial, onSubmit, onCancel, metrics, customs = [] }) {
   const [f, setF] = useState({ id: initial?.id || "", name: initial?.name || "", formula: initial?.formula || "", format: initial?.format || "number" });
-  const preview = f.formula && metrics.length > 0 ? evalFormula(f.formula, metrics[0]) : null;
+  // Build context from other custom metrics for preview
+  const otherCustoms = customs.filter(cm => cm.name !== f.name);
+  const previewCtx = metrics.length > 0 ? evalAllCustoms(otherCustoms, metrics[0]) : {};
+  const preview = f.formula && metrics.length > 0 ? evalFormula(f.formula, metrics[0], previewCtx) : null;
+  const allVars = [...MK, ...otherCustoms.map(cm => cm.name)];
   return (
     <div className="fi" style={S.fc}>
       <div style={S.fh}><h2 style={S.ft}>{initial ? `Edit "${initial.name}"` : "Create Custom Metric"}</h2></div>
       <div style={S.fcard}>
         <div style={{ marginBottom: 20 }}><label style={S.fl}>Metric Name</label><input style={S.inp} value={f.name} onChange={e => setF(p => ({ ...p, name: e.target.value }))} placeholder="e.g. CTA Click Rate" /></div>
-        <div style={{ marginBottom: 20 }}><label style={S.fl}>Formula</label><input style={{ ...S.inp, fontFamily: "'IBM Plex Mono', monospace" }} value={f.formula} onChange={e => setF(p => ({ ...p, formula: e.target.value }))} placeholder="e.g. clickedcta / viewedcta * 100" /><div style={S.hint}>Available: {MK.join(", ")}</div></div>
+        <div style={{ marginBottom: 20 }}><label style={S.fl}>Formula</label><input style={{ ...S.inp, fontFamily: "'IBM Plex Mono', monospace" }} value={f.formula} onChange={e => setF(p => ({ ...p, formula: e.target.value }))} placeholder="e.g. clickedcta / viewedcta * 100" /><div style={S.hint}>Available: {allVars.join(", ")}</div></div>
         <div style={{ marginBottom: 20 }}><label style={S.fl}>Display Format</label><div style={{ display: "flex", gap: 8 }}>{[{ v: "number", l: "Number" }, { v: "percent", l: "Percent (%)" }, { v: "currency", l: "Currency ($)" }].map(o => (<button key={o.v} style={f.format === o.v ? S.fmtA : S.fmtB} onClick={() => setF(p => ({ ...p, format: o.v }))}>{o.l}</button>))}</div></div>
         {metrics.length > 0 && f.formula && (<div style={S.prev}><div style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.06em", textTransform: "uppercase", color: "#6B7280", marginBottom: 8 }}>Preview ({fmtDateNice(metrics[0].date)})</div><div style={{ fontSize: 28, fontWeight: 600, color: preview !== null ? "#111827" : "#DC2626" }}>{fmtVal(preview, f.format)}</div></div>)}
         <div style={S.fa}><button style={S.btnGhost} onClick={onCancel}>Cancel</button><button style={{ ...S.btnDark, opacity: f.name && f.formula ? 1 : 0.4 }} onClick={() => f.name && f.formula && onSubmit(f)} disabled={!f.name || !f.formula}>{initial ? "Update Metric" : "Create Metric"}</button></div>
