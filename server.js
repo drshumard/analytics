@@ -1170,10 +1170,10 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
             return res.status(400).json({ error: 'Send { messages: [{ role, content }] }' });
         }
 
-        // Fetch context: last 90 days of metrics + recent events
+        // Fetch context: last 90 days of metrics + recent events (summarized)
         const [metricsRes, eventsRes] = await Promise.all([
             supabase.from('daily_metrics').select('*').order('date', { ascending: false }).limit(90),
-            supabase.from('events').select('*').order('event_time', { ascending: false }).limit(5000),
+            supabase.from('events').select('event_type, name, email, event_time').order('event_time', { ascending: false }).limit(500),
         ]);
 
         const metricsData = (metricsRes.data || []).map(r => ({
@@ -1189,17 +1189,31 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
             purchases: r.purchases,
         }));
 
-        const eventsData = (eventsRes.data || []).map(e => {
+        // Summarize events by date + type (instead of sending thousands of individual records)
+        const eventSummary = {};
+        const recentEvents = [];
+        (eventsRes.data || []).forEach((e, i) => {
             const laDate = new Date(e.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-            const laTime = new Date(e.event_time).toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', minute: '2-digit' });
-            return {
-                type: e.event_type,
-                name: e.name,
-                email: e.email,
-                date: laDate,
-                time_la: laTime,
-            };
+            const k = `${laDate}|${e.event_type}`;
+            if (!eventSummary[k]) eventSummary[k] = 0;
+            eventSummary[k]++;
+            // Keep last 50 individual events for recent activity detail
+            if (i < 50) {
+                recentEvents.push({
+                    type: e.event_type,
+                    name: e.name,
+                    email: e.email,
+                    date: laDate,
+                });
+            }
         });
+        // Convert summary to compact format
+        const dailyEventCounts = {};
+        for (const [k, count] of Object.entries(eventSummary)) {
+            const [date, type] = k.split('|');
+            if (!dailyEventCounts[date]) dailyEventCounts[date] = {};
+            dailyEventCounts[date][type] = count;
+        }
 
         const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
 
@@ -1229,8 +1243,11 @@ KEY METRICS TO TRACK:
 DAILY METRICS (last ${metricsData.length} days, newest first):
 ${JSON.stringify(metricsData, null, 0)}
 
-RECENT EVENTS (last ${eventsData.length} events — individual registrations/purchases with date and time in Los Angeles timezone):
-${JSON.stringify(eventsData, null, 0)}
+DAILY EVENT COUNTS (from individual event tracking):
+${JSON.stringify(dailyEventCounts, null, 0)}
+
+RECENT EVENTS (last ${recentEvents.length} individual events):
+${JSON.stringify(recentEvents, null, 0)}
 
 INSTRUCTIONS:
 - Give specific, data-backed insights. Reference actual numbers and dates.
