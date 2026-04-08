@@ -34,11 +34,11 @@ function getDayOfWeek(isoDate) {
     return new Date(y, m - 1, d).toLocaleDateString('en-US', { weekday: 'long' });
 }
 
-// ─── Fetch spend from Facebook Graph API ─────────────────────────────────────
-async function fetchFacebookSpend(dateISO) {
+// ─── Fetch insights from Facebook Graph API ─────────────────────────────────
+async function fetchFacebookInsights(dateISO) {
     const url = new URL(`https://graph.facebook.com/${FB_API_VERSION}/${FB_AD_ACCOUNT_ID}/insights`);
     url.searchParams.set('access_token', FB_ACCESS_TOKEN);
-    url.searchParams.set('fields', 'spend');
+    url.searchParams.set('fields', 'spend,inline_link_clicks');
     url.searchParams.set('time_range', JSON.stringify({
         since: dateISO,
         until: dateISO,
@@ -57,14 +57,23 @@ async function fetchFacebookSpend(dateISO) {
 
     // If no data yet today (no impressions), Facebook returns empty data array
     if (!json.data || json.data.length === 0) {
-        return 0;
+        return { spend: 0, linkClicks: 0 };
     }
 
-    return parseFloat(json.data[0].spend) || 0;
+    return {
+        spend: parseFloat(json.data[0].spend) || 0,
+        linkClicks: parseInt(json.data[0].inline_link_clicks) || 0,
+    };
 }
 
-// ─── Write spend to Supabase ─────────────────────────────────────────────────
-async function writeSpendToSupabase(isoDate, spend) {
+// Backward-compatible wrapper (returns just spend)
+async function fetchFacebookSpend(dateISO) {
+    const { spend } = await fetchFacebookInsights(dateISO);
+    return spend;
+}
+
+// ─── Write insights to Supabase ──────────────────────────────────────────────
+async function writeInsightsToSupabase(isoDate, { spend, linkClicks }) {
     const dayOfWeek = getDayOfWeek(isoDate);
 
     // Ensure row exists for today
@@ -72,20 +81,28 @@ async function writeSpendToSupabase(isoDate, spend) {
         .from('daily_metrics')
         .upsert({ date: isoDate, day_of_week: dayOfWeek }, { onConflict: 'date' });
 
-    // Set the absolute spend value (Facebook returns the running total)
+    // Set the absolute values (Facebook returns running totals)
+    const updateFields = { fb_spend: spend };
+    if (linkClicks !== undefined) updateFields.fb_link_clicks = linkClicks;
+
     const { data, error } = await supabase
         .from('daily_metrics')
-        .update({ fb_spend: spend })
+        .update(updateFields)
         .eq('date', isoDate)
-        .select('date, fb_spend')
+        .select('date, fb_spend, fb_link_clicks')
         .single();
 
     if (error) throw error;
     return data;
 }
 
+// Backward-compatible wrapper
+async function writeSpendToSupabase(isoDate, spend) {
+    return writeInsightsToSupabase(isoDate, { spend });
+}
+
 // ─── Main sync function ──────────────────────────────────────────────────────
-export { fetchFacebookSpend, writeSpendToSupabase };
+export { fetchFacebookSpend, fetchFacebookInsights, writeSpendToSupabase, writeInsightsToSupabase };
 export async function syncFacebookSpend() {
     if (!FB_ACCESS_TOKEN || !FB_AD_ACCOUNT_ID) {
         console.warn('⚠️  FB sync skipped — FB_ACCESS_TOKEN or FB_AD_ACCOUNT_ID not set');
@@ -95,11 +112,11 @@ export async function syncFacebookSpend() {
     const { iso, display } = getTodayLA();
 
     try {
-        const spend = await fetchFacebookSpend(iso);
-        const result = await writeSpendToSupabase(iso, spend);
+        const insights = await fetchFacebookInsights(iso);
+        const result = await writeInsightsToSupabase(iso, insights);
 
-        console.log(`✅ FB sync: $${spend.toFixed(2)} for ${display} (${getDayOfWeek(iso)})`);
-        return { date: display, spend, result };
+        console.log(`✅ FB sync: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks for ${display} (${getDayOfWeek(iso)})`);
+        return { date: display, spend: insights.spend, linkClicks: insights.linkClicks, result };
 
     } catch (err) {
         console.error(`❌ FB sync failed for ${display}:`, err.message);

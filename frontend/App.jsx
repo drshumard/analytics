@@ -121,8 +121,8 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "attended"];
-const COL_LABELS = { fb_spend: "FB Spend", registrations: "Registrations", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases: "Purchases" };
+const MK = ["fb_spend", "fb_link_clicks", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "attended"];
+const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", registrations: "Registrations", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases: "Purchases" };
 const DEFAULT_HIDDEN = [];
 const evalFormula = (f, row, ctx = {}) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(`\\b${k}\\b`, "gi"), String(Number(row[k]) || 0)); for (const [k, v] of Object.entries(ctx)) e = e.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi"), String(Number(v) || 0)); if (/[^0-9+\-*/().%\s]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
 const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` : fmt === "currency" ? `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
@@ -574,6 +574,7 @@ export default function App() {
             <div className="summary-strip" style={S.strip}>
               {[
                 { label: "Total Spend", val: `$${(totals.fb_spend || 0).toLocaleString("en-US", { maximumFractionDigits: 0 })}`, key: "fb_spend" },
+                { label: "Reg. Page Visits", val: (totals.fb_link_clicks || 0).toLocaleString(), key: "fb_link_clicks" },
                 { label: "Registrations", val: (totals.registrations || 0).toLocaleString(), key: "registrations" },
                 { label: "Purchases", val: (totals.purchases || 0).toLocaleString(), key: "purchases" },
                 { label: "Total Replays", val: (totals.replays || 0).toLocaleString(), key: "replays" },
@@ -952,10 +953,10 @@ function Modal({ title, msg, onCancel, onConfirm }) {
 
 function EntryForm({ initial, onSubmit, onCancel, isMobile }) {
   const today = getLADate();
-  const [f, setF] = useState({ date: initial?.date || today, fb_spend: initial?.fb_spend ?? "", registrations: initial?.registrations ?? "", replays: initial?.replays ?? "", viewedcta: initial?.viewedcta ?? "", clickedcta: initial?.clickedcta ?? "", purchases: initial?.purchases ?? "", attended: initial?.attended ?? "" });
+  const [f, setF] = useState({ date: initial?.date || today, fb_spend: initial?.fb_spend ?? "", fb_link_clicks: initial?.fb_link_clicks ?? "", registrations: initial?.registrations ?? "", replays: initial?.replays ?? "", viewedcta: initial?.viewedcta ?? "", clickedcta: initial?.clickedcta ?? "", purchases: initial?.purchases ?? "", attended: initial?.attended ?? "" });
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
-  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases: parseInt(f.purchases) || 0, attended: parseInt(f.attended) || 0 });
-  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases", l: "Purchases", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
+  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases: parseInt(f.purchases) || 0, attended: parseInt(f.attended) || 0 });
+  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Total Reg. Page Visited", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases", l: "Purchases", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
   return (
     <div className="fi form-container" style={S.fc}>
       <div style={S.fh}><div style={{ ...S.formBadge, background: initial ? "#EFF8FF" : "#ECFDF3", color: initial ? "#175CD3" : "#12864A" }}>{initial ? "EDIT ENTRY" : "NEW ENTRY"}</div><h2 style={S.ft}>{initial ? `Update ${fmtDateNice(initial.date)}` : "Add Daily Metrics"}</h2><p style={S.fs}>Enter metrics for the day. Fields default to 0 if empty.</p></div>

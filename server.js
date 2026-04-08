@@ -11,7 +11,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cron from 'node-cron';
-import { syncFacebookSpend, fetchFacebookSpend, writeSpendToSupabase } from './fb-sync.js';
+import { syncFacebookSpend, fetchFacebookSpend, fetchFacebookInsights, writeSpendToSupabase, writeInsightsToSupabase } from './fb-sync.js';
 import 'dotenv/config';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -203,6 +203,7 @@ app.post('/api/metrics', webhookLimiter, authenticateWebhook, async (req, res) =
             date: isoDate,
             day_of_week: dayOfWeek,
             fb_spend: parseFloat(body.fb_spend) || 0,
+            fb_link_clicks: parseInt(body.fb_link_clicks) || 0,
             registrations: parseInt(body.registrations) || 0,
             replays: parseInt(body.replays) || 0,
             viewedcta: parseInt(body.viewedcta) || 0,
@@ -256,6 +257,7 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
                 date: dateToISO(date),
                 day_of_week: getLADayOfWeek(date),
                 fb_spend: parseFloat(entry.fb_spend) || 0,
+                fb_link_clicks: parseInt(entry.fb_link_clicks) || 0,
                 registrations: parseInt(entry.registrations) || 0,
                 replays: parseInt(entry.replays) || 0,
                 viewedcta: parseInt(entry.viewedcta) || 0,
@@ -286,7 +288,7 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
 app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
         const { field, count = 1, name, email, phone, execution_id, ...rest } = req.body;
-        const validFields = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
+        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -386,7 +388,7 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
 app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
         const { field, value, date: dateInput } = req.body;
-        const validFields = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
+        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -417,7 +419,7 @@ app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, re
             .single();
 
         const previous = current?.[field];
-        const newValue = field === 'fb_spend' ? parseFloat(value) : parseInt(value);
+        const newValue = (field === 'fb_spend') ? parseFloat(value) : parseInt(value);
 
         // Set the absolute value
         const { data, error } = await supabase
@@ -483,7 +485,7 @@ app.post('/api/refresh', dashboardLimiter, async (req, res) => {
     }
 });
 
-// POST /api/refresh-date — Re-fetch Facebook spend for a specific date
+// POST /api/refresh-date — Re-fetch Facebook insights for a specific date
 app.post('/api/refresh-date', dashboardLimiter, async (req, res) => {
     const { date } = req.body; // expects YYYY-MM-DD
     if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
@@ -491,12 +493,12 @@ app.post('/api/refresh-date', dashboardLimiter, async (req, res) => {
     }
 
     try {
-        const { fetchFacebookSpend, writeSpendToSupabase } = await import('./fb-sync.js');
-        const spend = await fetchFacebookSpend(date);
-        await writeSpendToSupabase(date, spend);
+        const { fetchFacebookInsights, writeInsightsToSupabase } = await import('./fb-sync.js');
+        const insights = await fetchFacebookInsights(date);
+        await writeInsightsToSupabase(date, insights);
 
-        console.log(`✅ Recalc spend for ${date}: $${spend.toFixed(2)}`);
-        return res.json({ message: `Spend for ${date} updated to $${spend.toFixed(2)}`, spend });
+        console.log(`✅ Recalc for ${date}: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks`);
+        return res.json({ message: `Insights for ${date} updated — $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks`, spend: insights.spend, linkClicks: insights.linkClicks });
     } catch (err) {
         console.error(`❌ Recalc spend for ${date} failed:`, err.message);
         return res.status(502).json({ error: `Facebook API error: ${err.message}` });
@@ -784,6 +786,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 date: mmddyyyy,
                 day: row.day_of_week,
                 fb_spend: ov.fb_spend !== undefined ? ov.fb_spend : Number(row.fb_spend),
+                fb_link_clicks: ov.fb_link_clicks !== undefined ? ov.fb_link_clicks : Number(row.fb_link_clicks || 0),
                 registrations: pick('registrations'),
                 replays: pick('replays'),
                 viewedcta: pick('viewedcta'),
@@ -814,12 +817,12 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
         const body = req.body;
 
         // Build the overrides object from the submitted fields
-        const OVERRIDE_FIELDS = ['fb_spend', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
+        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
         const newOverrides = {};
         const updates = {};
         for (const f of OVERRIDE_FIELDS) {
             if (body[f] !== undefined) {
-                const val = f === 'fb_spend' ? parseFloat(body[f]) || 0 : parseInt(body[f]) || 0;
+                const val = (f === 'fb_spend') ? parseFloat(body[f]) || 0 : parseInt(body[f]) || 0;
                 updates[f] = val;
                 newOverrides[f] = val;
             }
@@ -1046,10 +1049,10 @@ if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
             const d = String(yesterdayLA.getDate()).padStart(2, '0');
             const yesterdayISO = `${y}-${m}-${d}`;
 
-            console.log(`🌙 Daily 4 AM cron: fetching final ad spend for ${yesterdayISO}`);
-            const spend = await fetchFacebookSpend(yesterdayISO);
-            await writeSpendToSupabase(yesterdayISO, spend);
-            console.log(`✅ Daily 4 AM cron: $${spend.toFixed(2)} written for ${yesterdayISO}`);
+            console.log(`🌙 Daily 4 AM cron: fetching final ad insights for ${yesterdayISO}`);
+            const insights = await fetchFacebookInsights(yesterdayISO);
+            await writeInsightsToSupabase(yesterdayISO, insights);
+            console.log(`✅ Daily 4 AM cron: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks written for ${yesterdayISO}`);
         } catch (err) {
             console.error('❌ Daily 4 AM ad-spend cron failed:', err.message);
         }
@@ -1177,6 +1180,7 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
             date: r.date,
             day: r.day_of_week,
             fb_spend: Number(r.fb_spend),
+            fb_link_clicks: Number(r.fb_link_clicks || 0),
             registrations: r.registrations,
             attended: r.attended,
             replays: r.replays,
@@ -1205,14 +1209,16 @@ TODAY'S DATE: ${today} (Los Angeles timezone)
 
 THE FUNNEL STAGES (in order):
 1. FB Spend — daily Facebook ad budget  
-2. Registrations — people who signed up for the webinar
-3. Attended — people who actually attended the webinar
-4. Replays — people who watched the replay
-5. Viewed CTA — people who saw the call to action
-6. Clicked CTA — people who clicked the call to action  
-7. Purchases — people who purchased
+2. Total Registration Page Visited (fb_link_clicks) — people who clicked the ad link to the registration page
+3. Registrations — people who signed up for the webinar
+4. Attended — people who actually attended the webinar
+5. Replays — people who watched the replay
+6. Viewed CTA — people who saw the call to action
+7. Clicked CTA — people who clicked the call to action  
+8. Purchases — people who purchased
 
 KEY METRICS TO TRACK:
+- Landing Page Conversion Rate (registrations / fb_link_clicks × 100)
 - Cost per Registration (fb_spend / registrations)
 - Attendance Rate (attended / registrations × 100)
 - CTA View Rate (viewedcta / (attended + replays) × 100)

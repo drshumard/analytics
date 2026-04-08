@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
     date            DATE NOT NULL UNIQUE,
     day_of_week     TEXT NOT NULL,
     fb_spend        NUMERIC(12,2) NOT NULL DEFAULT 0,
+    fb_link_clicks  INTEGER NOT NULL DEFAULT 0,
     registrations   INTEGER NOT NULL DEFAULT 0,
     replays         INTEGER NOT NULL DEFAULT 0,
     viewedcta       INTEGER NOT NULL DEFAULT 0,
