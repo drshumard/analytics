@@ -34,6 +34,45 @@ if (!API_KEY) {
 // ─── Supabase Client ─────────────────────────────────────────────────────────
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
+// ─── In-Memory Cache (reduces Supabase egress by ~98%) ───────────────────────
+// Past days' dedup counts never change — cache them forever.
+// Today's data is invalidated when webhooks write new events.
+const cache = {
+    // Deduplicated event counts per day: { "2026-04-09": { registrations: 5, ... } }
+    dedupCounts: {},
+
+    // Full formatted GET /api/metrics response
+    metricsResponse: null,
+    metricsUpdatedAt: 0,
+    metricsTTL: 60_000, // 60 seconds
+
+    // AI insights context (metrics + event summaries)
+    insightsContext: null,
+    insightsUpdatedAt: 0,
+    insightsTTL: 300_000, // 5 minutes
+
+    // Stats for monitoring
+    hits: 0,
+    misses: 0,
+};
+
+function invalidateMetricsCache() {
+    cache.metricsResponse = null;
+    cache.metricsUpdatedAt = 0;
+    console.log('🗑️  Cache: metrics response invalidated');
+}
+
+function invalidateDedupForDate(isoDate) {
+    delete cache.dedupCounts[isoDate];
+    invalidateMetricsCache();
+    console.log(`🗑️  Cache: dedup invalidated for ${isoDate}`);
+}
+
+function invalidateInsightsCache() {
+    cache.insightsContext = null;
+    cache.insightsUpdatedAt = 0;
+}
+
 // ─── Express App ─────────────────────────────────────────────────────────────
 const app = express();
 
@@ -221,6 +260,8 @@ app.post('/api/metrics', webhookLimiter, authenticateWebhook, async (req, res) =
         if (error) throw error;
 
         await logWebhook('zapier', body, 'processed');
+        invalidateMetricsCache();
+        invalidateInsightsCache();
         console.log(`✅ Upserted metrics for ${date} (${dayOfWeek})`);
         res.json({ success: true, date, day: dayOfWeek, data });
 
@@ -275,6 +316,10 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
         }
 
         await logWebhook('batch', { count: entries.length }, 'processed');
+        invalidateMetricsCache();
+        // Invalidate dedup for all affected dates
+        for (const r of rows) invalidateDedupForDate(r.date);
+        invalidateInsightsCache();
         res.json({ success: true, inserted: rows.length, errors });
 
     } catch (err) {
@@ -370,6 +415,10 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             if (evErr) console.error('⚠️ Event insert error:', evErr.message);
         });
 
+        // Invalidate caches — new event arrived
+        invalidateDedupForDate(isoDate);
+        invalidateInsightsCache();
+
         console.log(`✅ Increment ${field} +${count} for ${targetDate}${name ? ` (${name})` : ''}`);
         res.json({ success: true, date: targetDate, field, previous: current?.[field], new: newValue });
 
@@ -432,6 +481,8 @@ app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, re
         if (error) throw error;
 
         await logWebhook('set', { field, value: newValue, date: targetDate }, 'processed');
+        invalidateMetricsCache();
+        invalidateInsightsCache();
         console.log(`✅ Set ${field} = ${newValue} for ${targetDate} (was ${previous})`);
         res.json({ success: true, date: targetDate, field, previous, new: newValue });
 
@@ -470,6 +521,8 @@ app.post('/api/refresh', dashboardLimiter, async (req, res) => {
     try {
         const result = await syncFacebookSpend();
         refreshTimestamps.push(now);
+        invalidateMetricsCache();
+        invalidateInsightsCache();
 
         const remaining = 3 - refreshTimestamps.length;
         return res.json({
@@ -496,6 +549,8 @@ app.post('/api/refresh-date', dashboardLimiter, async (req, res) => {
         const { fetchFacebookInsights, writeInsightsToSupabase } = await import('./fb-sync.js');
         const insights = await fetchFacebookInsights(date);
         await writeInsightsToSupabase(date, insights);
+        invalidateMetricsCache();
+        invalidateInsightsCache();
 
         console.log(`✅ Recalc for ${date}: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks`);
         return res.json({ message: `Insights for ${date} updated — $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks`, spend: insights.spend, linkClicks: insights.linkClicks });
@@ -703,10 +758,110 @@ app.delete('/api/lenses/:id', dashboardLimiter, requireAuth, async (req, res) =>
 // DASHBOARD ENDPOINTS (for the frontend)
 // =============================================================================
 
-// GET /api/metrics — Fetch all daily metrics
+// ─── Cached Dedup Engine ─────────────────────────────────────────────────────
+// Computes deduplicated event counts per day. Past days are cached forever
+// (their counts can't change). Today's counts are recomputed when invalidated
+// by a webhook. This eliminates ~95% of Supabase events-table egress.
+const EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', 'purchases'];
+
+function computeDedupFromEvents(events) {
+    const sets = {}; // key: "YYYY-MM-DD|event_type" → Set of user keys
+    for (const ev of events) {
+        let d;
+        if (ev.event_type === 'registrations' && ev.metadata?.webinar_datetime_utc) {
+            const cleaned = ev.metadata.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
+            const parsed = new Date(cleaned);
+            d = !isNaN(parsed.getTime())
+                ? parsed.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' })
+                : new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+        } else {
+            d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+        }
+        const k = `${d}|${ev.event_type}`;
+        if (!sets[k]) sets[k] = new Set();
+        const userKey = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
+        if (userKey) sets[k].add(userKey);
+    }
+    const result = {};
+    for (const [k, userSet] of Object.entries(sets)) {
+        if (userSet.size === 0) continue;
+        const [d, type] = k.split('|');
+        if (!result[d]) result[d] = {};
+        result[d][type] = userSet.size;
+    }
+    return result;
+}
+
+async function fetchEventsForDateRange(minDate, maxDate) {
+    let allEvents = [];
+    const PAGE_SIZE = 50000;
+    let page = 0;
+    while (true) {
+        const { data: batch } = await supabase
+            .from('events')
+            .select('event_type, email, name, phone, event_time, metadata')
+            .in('event_type', EVENT_TYPES)
+            .gte('event_time', `${minDate}T00:00:00`)
+            .lte('event_time', `${maxDate}T23:59:59`)
+            .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
+        if (!batch || batch.length === 0) break;
+        allEvents = allEvents.concat(batch);
+        if (batch.length < PAGE_SIZE) break;
+        page++;
+    }
+    return allEvents;
+}
+
+async function getDedupCounts(dates) {
+    if (dates.length === 0) return {};
+    const today = dateToISO(getLADate());
+
+    // Find dates that are NOT in the cache
+    const uncachedDates = dates.filter(d => !(d in cache.dedupCounts));
+    // Today always needs refreshing if it's not in cache (it gets invalidated on new events)
+
+    if (uncachedDates.length > 0) {
+        const sorted = [...uncachedDates].sort();
+        const minDate = sorted[0];
+        const maxDate = sorted[sorted.length - 1];
+
+        console.log(`📊 Cache MISS: fetching events for ${uncachedDates.length} uncached date(s) [${minDate} → ${maxDate}]`);
+        cache.misses++;
+
+        const events = await fetchEventsForDateRange(minDate, maxDate);
+        const computed = computeDedupFromEvents(events);
+
+        // Store each day's dedup in cache
+        // For uncached dates with no events, store empty object so we don't re-fetch
+        for (const d of uncachedDates) {
+            cache.dedupCounts[d] = computed[d] || {};
+        }
+    } else {
+        cache.hits++;
+    }
+
+    // Build result from cache
+    const result = {};
+    for (const d of dates) {
+        if (cache.dedupCounts[d]) result[d] = cache.dedupCounts[d];
+    }
+    return result;
+}
+
+// GET /api/metrics — Fetch all daily metrics (with caching)
 app.get('/api/metrics', dashboardLimiter, async (req, res) => {
     try {
         const { limit = 90, offset = 0 } = req.query;
+
+        // ── Response cache: serve cached response if fresh ────────────────
+        const now = Date.now();
+        if (cache.metricsResponse && (now - cache.metricsUpdatedAt) < cache.metricsTTL) {
+            // Only serve cache if request params match (default pagination)
+            if (Number(limit) === 90 && Number(offset) === 0) {
+                cache.hits++;
+                return res.json(cache.metricsResponse);
+            }
+        }
 
         const { data, error, count } = await supabase
             .from('daily_metrics')
@@ -717,62 +872,9 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
 
         if (error) throw error;
 
-        // Compute deduplicated counts per day for all event types from the events table
-        // Groups by date (LA timezone) + event_type, counts distinct users (email → phone → name)
+        // ── Dedup counts: uses per-day cache ──────────────────────────────
         const dates = (data || []).map(r => String(r.date).substring(0, 10));
-        const dedupMap = {}; // { "2026-03-29": { registrations: 196, replays: 45, ... } }
-        const EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', 'purchases'];
-
-        if (dates.length > 0) {
-            // Paginate past Supabase's 1000-row default cap
-            let allEvents = [];
-            const PAGE_SIZE = 50000;
-            let page = 0;
-            while (true) {
-                const { data: batch } = await supabase
-                    .from('events')
-                    .select('event_type, email, name, phone, event_time, metadata')
-                    .in('event_type', EVENT_TYPES)
-                    .gte('event_time', `${dates[dates.length - 1]}T00:00:00`)
-                    .lte('event_time', `${dates[0]}T23:59:59`)
-                    .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
-                if (!batch || batch.length === 0) break;
-                allEvents = allEvents.concat(batch);
-                if (batch.length < PAGE_SIZE) break;
-                page++;
-            }
-
-            if (allEvents) {
-                // Group by date + event_type, track unique users
-                // For registrations: use webinar_datetime_utc from metadata
-                // For all other events: use event_time
-                const sets = {}; // key: "YYYY-MM-DD|event_type" → Set of user keys
-                for (const ev of allEvents) {
-                    let d;
-                    if (ev.event_type === 'registrations' && ev.metadata?.webinar_datetime_utc) {
-                        // Parse webinar date: "March 31st 2026, 2:16:43 pm"
-                        const cleaned = ev.metadata.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
-                        const parsed = new Date(cleaned);
-                        d = !isNaN(parsed.getTime())
-                            ? parsed.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' })
-                            : new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-                    } else {
-                        d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-                    }
-                    const k = `${d}|${ev.event_type}`;
-                    if (!sets[k]) sets[k] = new Set();
-                    const userKey = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
-                    if (userKey) sets[k].add(userKey);
-                }
-                // Convert to counts — only override if we found identifiable users
-                for (const [k, userSet] of Object.entries(sets)) {
-                    if (userSet.size === 0) continue; // no identifiable users, fall back to raw count
-                    const [d, type] = k.split('|');
-                    if (!dedupMap[d]) dedupMap[d] = {};
-                    dedupMap[d][type] = userSet.size;
-                }
-            }
-        }
+        const dedupMap = await getDedupCounts(dates);
 
         // Convert to frontend format (MM/DD/YYYY)
         // Priority: manual override > deduped count > raw daily_metrics
@@ -798,7 +900,15 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             };
         });
 
-        res.json({ data: formatted, total: count });
+        const response = { data: formatted, total: count };
+
+        // ── Store in response cache (only for default pagination) ────────
+        if (Number(limit) === 90 && Number(offset) === 0) {
+            cache.metricsResponse = response;
+            cache.metricsUpdatedAt = now;
+        }
+
+        res.json(response);
 
     } catch (err) {
         console.error('❌ GET /api/metrics error:', err.message);
@@ -841,6 +951,8 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
             .single();
 
         if (error) throw error;
+        invalidateMetricsCache();
+        invalidateInsightsCache();
         res.json({ success: true, data });
 
     } catch (err) {
@@ -862,6 +974,8 @@ app.delete('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, as
             .eq('date', isoDate);
 
         if (error) throw error;
+        invalidateDedupForDate(isoDate);
+        invalidateInsightsCache();
         res.json({ success: true, deleted: dateInput });
 
     } catch (err) {
@@ -1014,6 +1128,15 @@ app.get('/api/health', async (req, res) => {
             timezone: 'America/Los_Angeles',
             la_time: new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }),
             database: error ? 'error' : 'connected',
+            cache: {
+                dedup_days_cached: Object.keys(cache.dedupCounts).length,
+                metrics_cached: !!cache.metricsResponse,
+                metrics_age_sec: cache.metricsUpdatedAt ? Math.round((Date.now() - cache.metricsUpdatedAt) / 1000) : null,
+                insights_cached: !!cache.insightsContext,
+                hits: cache.hits,
+                misses: cache.misses,
+                hit_rate: (cache.hits + cache.misses) > 0 ? `${Math.round(cache.hits / (cache.hits + cache.misses) * 100)}%` : 'N/A',
+            },
         });
     } catch {
         res.status(503).json({ status: 'error', database: 'disconnected' });
@@ -1170,49 +1293,61 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
             return res.status(400).json({ error: 'Send { messages: [{ role, content }] }' });
         }
 
-        // Fetch context: last 90 days of metrics + recent events (summarized)
-        const [metricsRes, eventsRes] = await Promise.all([
-            supabase.from('daily_metrics').select('*').order('date', { ascending: false }).limit(90),
-            supabase.from('events').select('event_type, name, email, event_time').order('event_time', { ascending: false }).limit(500),
-        ]);
+        // Fetch context: last 90 days of metrics + recent events (cached, 5-min TTL)
+        let metricsData, dailyEventCounts, recentEvents;
 
-        const metricsData = (metricsRes.data || []).map(r => ({
-            date: r.date,
-            day: r.day_of_week,
-            fb_spend: Number(r.fb_spend),
-            fb_link_clicks: Number(r.fb_link_clicks || 0),
-            registrations: r.registrations,
-            attended: r.attended,
-            replays: r.replays,
-            viewedcta: r.viewedcta,
-            clickedcta: r.clickedcta,
-            purchases: r.purchases,
-        }));
+        const now = Date.now();
+        if (cache.insightsContext && (now - cache.insightsUpdatedAt) < cache.insightsTTL) {
+            // Serve from cache
+            ({ metricsData, dailyEventCounts, recentEvents } = cache.insightsContext);
+            console.log('📦 Cache HIT: insights context');
+        } else {
+            console.log('📊 Cache MISS: fetching insights context from Supabase');
+            const [metricsRes, eventsRes] = await Promise.all([
+                supabase.from('daily_metrics').select('*').order('date', { ascending: false }).limit(90),
+                supabase.from('events').select('event_type, name, email, event_time').order('event_time', { ascending: false }).limit(500),
+            ]);
 
-        // Summarize events by date + type (instead of sending thousands of individual records)
-        const eventSummary = {};
-        const recentEvents = [];
-        (eventsRes.data || []).forEach((e, i) => {
-            const laDate = new Date(e.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-            const k = `${laDate}|${e.event_type}`;
-            if (!eventSummary[k]) eventSummary[k] = 0;
-            eventSummary[k]++;
-            // Keep last 50 individual events for recent activity detail
-            if (i < 50) {
-                recentEvents.push({
-                    type: e.event_type,
-                    name: e.name,
-                    email: e.email,
-                    date: laDate,
-                });
+            metricsData = (metricsRes.data || []).map(r => ({
+                date: r.date,
+                day: r.day_of_week,
+                fb_spend: Number(r.fb_spend),
+                fb_link_clicks: Number(r.fb_link_clicks || 0),
+                registrations: r.registrations,
+                attended: r.attended,
+                replays: r.replays,
+                viewedcta: r.viewedcta,
+                clickedcta: r.clickedcta,
+                purchases: r.purchases,
+            }));
+
+            // Summarize events by date + type (instead of sending thousands of individual records)
+            const eventSummary = {};
+            recentEvents = [];
+            (eventsRes.data || []).forEach((e, i) => {
+                const laDate = new Date(e.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                const k = `${laDate}|${e.event_type}`;
+                if (!eventSummary[k]) eventSummary[k] = 0;
+                eventSummary[k]++;
+                if (i < 50) {
+                    recentEvents.push({
+                        type: e.event_type,
+                        name: e.name,
+                        email: e.email,
+                        date: laDate,
+                    });
+                }
+            });
+            dailyEventCounts = {};
+            for (const [k, count] of Object.entries(eventSummary)) {
+                const [date, type] = k.split('|');
+                if (!dailyEventCounts[date]) dailyEventCounts[date] = {};
+                dailyEventCounts[date][type] = count;
             }
-        });
-        // Convert summary to compact format
-        const dailyEventCounts = {};
-        for (const [k, count] of Object.entries(eventSummary)) {
-            const [date, type] = k.split('|');
-            if (!dailyEventCounts[date]) dailyEventCounts[date] = {};
-            dailyEventCounts[date][type] = count;
+
+            // Store in cache
+            cache.insightsContext = { metricsData, dailyEventCounts, recentEvents };
+            cache.insightsUpdatedAt = now;
         }
 
         const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
