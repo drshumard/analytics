@@ -769,8 +769,9 @@ function computeDedupFromEvents(events) {
     const sets = {}; // key: "YYYY-MM-DD|event_type" → Set of user keys
     for (const ev of events) {
         let d;
-        if (ev.event_type === 'registrations' && ev.metadata?.webinar_datetime_utc) {
-            // Append ' UTC' — Stealth sends this field in UTC despite the non-ISO format
+        if (ev.metadata?.webinar_datetime_utc) {
+            // Use webinar date for any event type that includes it (registrations, attended, replays, etc.)
+            // Falls through to event_time for old data that doesn't have this field
             const cleaned = ev.metadata.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
             const parsed = new Date(cleaned + ' UTC');
             d = !isNaN(parsed.getTime())
