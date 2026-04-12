@@ -804,22 +804,33 @@ async function fetchEventsForDateRange(minDate, maxDate) {
     maxPadded.setUTCDate(maxPadded.getUTCDate() + 1);
     const maxDatePadded = maxPadded.toISOString().slice(0, 10);
 
+    console.log(`📡 Supabase fetch: events from ${minDate} to ${maxDatePadded} (padded from ${maxDate})`);
+
     let allEvents = [];
     const PAGE_SIZE = 50000;
     let page = 0;
     while (true) {
-        const { data: batch } = await supabase
+        const { data: batch, error } = await supabase
             .from('events')
             .select('event_type, email, name, phone, event_time, metadata')
             .in('event_type', EVENT_TYPES)
             .gte('event_time', `${minDate}T00:00:00`)
             .lte('event_time', `${maxDatePadded}T23:59:59`)
             .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
+
+        if (error) {
+            console.error(`❌ Supabase fetch error (page ${page}):`, error.message, error.code);
+            break;
+        }
         if (!batch || batch.length === 0) break;
+
+        console.log(`   Page ${page}: ${batch.length} events returned`);
         allEvents = allEvents.concat(batch);
         if (batch.length < PAGE_SIZE) break;
         page++;
     }
+
+    console.log(`📡 Total events fetched: ${allEvents.length}`);
     return allEvents;
 }
 
@@ -841,6 +852,13 @@ async function getDedupCounts(dates) {
 
         const events = await fetchEventsForDateRange(minDate, maxDate);
         const computed = computeDedupFromEvents(events);
+
+        // Log per-day breakdown for diagnostics
+        const dayCounts = {};
+        for (const [d, counts] of Object.entries(computed)) {
+            dayCounts[d] = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(', ');
+        }
+        console.log(`📊 Dedup results per day:`, JSON.stringify(dayCounts, null, 2));
 
         // Store each day's dedup in cache
         // For uncached dates with no events, store empty object so we don't re-fetch
