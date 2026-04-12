@@ -796,6 +796,14 @@ function computeDedupFromEvents(events) {
 }
 
 async function fetchEventsForDateRange(minDate, maxDate) {
+    // LA is UTC-7 (PDT) or UTC-8 (PST). Events occurring in the LA evening
+    // have UTC timestamps on the next calendar day (e.g. Apr 11 8pm PDT = Apr 12 03:00 UTC).
+    // Pad maxDate by 1 day so we don't miss them. The dedup grouping step
+    // correctly assigns fetched events to their actual LA date regardless.
+    const maxPadded = new Date(maxDate + 'T00:00:00Z');
+    maxPadded.setUTCDate(maxPadded.getUTCDate() + 1);
+    const maxDatePadded = maxPadded.toISOString().slice(0, 10);
+
     let allEvents = [];
     const PAGE_SIZE = 50000;
     let page = 0;
@@ -805,7 +813,7 @@ async function fetchEventsForDateRange(minDate, maxDate) {
             .select('event_type, email, name, phone, event_time, metadata')
             .in('event_type', EVENT_TYPES)
             .gte('event_time', `${minDate}T00:00:00`)
-            .lte('event_time', `${maxDate}T23:59:59`)
+            .lte('event_time', `${maxDatePadded}T23:59:59`)
             .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
         if (!batch || batch.length === 0) break;
         allEvents = allEvents.concat(batch);
