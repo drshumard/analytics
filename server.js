@@ -364,8 +364,9 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
         if (rest.webinar_datetime_utc) {
             try {
                 // Strip ordinal suffixes (st, nd, rd, th) for Date parsing
+                // Append ' UTC' because Stealth sends this field in UTC despite the non-ISO format
                 const cleaned = rest.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
-                const parsed = new Date(cleaned);
+                const parsed = new Date(cleaned + ' UTC');
                 if (!isNaN(parsed.getTime())) {
                     targetDate = parsed.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
                     console.log(`📅 Using webinar date: ${rest.webinar_datetime_utc} → ${targetDate}`);
@@ -769,8 +770,9 @@ function computeDedupFromEvents(events) {
     for (const ev of events) {
         let d;
         if (ev.event_type === 'registrations' && ev.metadata?.webinar_datetime_utc) {
+            // Append ' UTC' — Stealth sends this field in UTC despite the non-ISO format
             const cleaned = ev.metadata.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
-            const parsed = new Date(cleaned);
+            const parsed = new Date(cleaned + ' UTC');
             d = !isNaN(parsed.getTime())
                 ? parsed.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' })
                 : new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
