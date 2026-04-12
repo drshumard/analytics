@@ -807,7 +807,9 @@ async function fetchEventsForDateRange(minDate, maxDate) {
     console.log(`📡 Supabase fetch: events from ${minDate} to ${maxDatePadded} (padded from ${maxDate})`);
 
     let allEvents = [];
-    const PAGE_SIZE = 50000;
+    // Supabase caps results at 1000 rows per query. Use 1000 as page size
+    // and paginate through all results to ensure we get every event.
+    const PAGE_SIZE = 1000;
     let page = 0;
     while (true) {
         const { data: batch, error } = await supabase
