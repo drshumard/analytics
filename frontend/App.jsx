@@ -553,7 +553,7 @@ export default function App() {
         {view === "dash" && (
           <div className="fi">
             <div className="title-row" style={S.titleRow}>
-              <div><h1 style={S.pageTitle}>Dashboard Summary 🖥️</h1><div style={S.pageSub}>Last {metrics.length} days &middot; auto-refreshes every 30s</div></div>
+              <div><h1 style={S.pageTitle}>Dashboard Summary</h1><div style={S.pageSub}>Last {metrics.length} days &middot; auto-refreshes every 30s</div></div>
               <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
                 <div style={{ ...S.searchWrap, width: "auto", padding: "6px 12px", boxShadow: "0 1px 2px rgba(0,0,0,0.05)" }}>
                   <I d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" size={14} stroke="#6B7280" />
