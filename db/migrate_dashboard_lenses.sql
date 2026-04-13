@@ -15,6 +15,6 @@ INSERT INTO dashboard_lenses (id, name, metrics, sort_order)
 VALUES (
     'default-all',
     'All Metrics',
-    '["fb_spend","registrations","attended","replays","viewedcta","clickedcta","purchases"]',
+    '["fb_spend","fb_link_clicks","registrations","attended","replays","viewedcta","clickedcta","purchases_fb","purchases_native","purchases_youtube","purchases_aibot","purchases_postwebinar","total_purchases"]',
     0
-) ON CONFLICT (id) DO NOTHING;
+) ON CONFLICT (id) DO UPDATE SET metrics = EXCLUDED.metrics;

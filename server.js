@@ -121,17 +121,28 @@ const dashboardLimiter = rateLimit({
 });
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
-function authenticateWebhook(req, res, next) {
-    const key = req.headers['x-api-key'] || req.query.api_key;
+// Unified webhook auth: checks env API_KEY first (fast, no DB), then api_keys table
+async function authenticateWebhook(req, res, next) {
+    const key = req.headers['x-api-key'] || req.query.api_key || req.body?.api_key;
     if (!key) {
         return res.status(401).json({ error: 'Missing API key. Send X-API-Key header.' });
     }
+    // Fast path: check against env API_KEY
     const keyBuf = Buffer.from(key);
     const apiBuf = Buffer.from(API_KEY);
-    if (keyBuf.length !== apiBuf.length || !crypto.timingSafeEqual(keyBuf, apiBuf)) {
-        return res.status(403).json({ error: 'Invalid API key' });
+    if (keyBuf.length === apiBuf.length && crypto.timingSafeEqual(keyBuf, apiBuf)) {
+        return next();
     }
-    next();
+    // Slow path: check api_keys table (supports multiple keys with revocation)
+    try {
+        const hash = crypto.createHash('sha256').update(key).digest('hex');
+        const { data: dbKey } = await supabase.from('api_keys').select('id, is_active').eq('key_hash', hash).single();
+        if (dbKey && dbKey.is_active) {
+            await supabase.from('api_keys').update({ last_used_at: new Date().toISOString() }).eq('id', dbKey.id);
+            return next();
+        }
+    } catch { /* DB key lookup failed, fall through */ }
+    return res.status(403).json({ error: 'Invalid API key' });
 }
 
 // Supabase JWT auth — verifies the user is logged in
@@ -180,22 +191,35 @@ function parseDateInput(input) {
     if (!input) return null;
     const str = String(input).trim();
 
+    let mmddyyyy = null;
+
     // MM/DD/YYYY
-    if (/^\d{2}\/\d{2}\/\d{4}$/.test(str)) return str;
-
+    if (/^\d{2}\/\d{2}\/\d{4}$/.test(str)) {
+        mmddyyyy = str;
+    }
     // YYYY-MM-DD
-    if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
+    else if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
         const [y, m, d] = str.substring(0, 10).split('-');
-        return `${m}/${d}/${y}`;
+        mmddyyyy = `${m}/${d}/${y}`;
     }
-
     // Try parsing as date
-    const parsed = new Date(str);
-    if (!isNaN(parsed.getTime())) {
-        return parsed.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+    else {
+        const parsed = new Date(str);
+        if (!isNaN(parsed.getTime())) {
+            mmddyyyy = parsed.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+        }
     }
 
-    return null;
+    // Validate the resulting date is real (reject month 13, day 32, etc.)
+    if (mmddyyyy) {
+        const [m, d, y] = mmddyyyy.split('/').map(Number);
+        const test = new Date(y, m - 1, d);
+        if (test.getFullYear() !== y || test.getMonth() !== m - 1 || test.getDate() !== d) {
+            return null; // e.g. 13/32/2026 → invalid
+        }
+    }
+
+    return mmddyyyy;
 }
 
 function dateToISO(mmddyyyy) {
@@ -224,8 +248,27 @@ async function logWebhook(source, payload, status, errorMessage = null) {
 
 // POST /api/metrics — Upsert daily metrics
 // Zapier/Make sends: { date, fb_spend, registrations, replays, viewedcta, clickedcta, purchases }
-app.post('/api/metrics', webhookLimiter, authenticateWebhook, async (req, res) => {
+app.post('/api/metrics', webhookLimiter, async (req, res) => {
     try {
+        // Accept EITHER webhook API-key auth OR admin Bearer-token auth
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+            // Admin auth path
+            const token = authHeader.split(' ')[1];
+            const { data: { user }, error } = await supabase.auth.getUser(token);
+            if (error || !user) return res.status(401).json({ error: 'Invalid or expired session' });
+            const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', user.id).single();
+            if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+            req.user = user;
+        } else {
+            // Webhook API-key path — delegate to unified authenticateWebhook
+            const authResult = await new Promise((resolve) => {
+                authenticateWebhook(req, res, () => resolve('ok'));
+            });
+            // If authenticateWebhook already sent a response (401/403), stop here
+            if (authResult !== 'ok') return;
+        }
+
         const body = req.body;
         await logWebhook('zapier', body, 'received');
 
@@ -247,9 +290,17 @@ app.post('/api/metrics', webhookLimiter, authenticateWebhook, async (req, res) =
             replays: parseInt(body.replays) || 0,
             viewedcta: parseInt(body.viewedcta) || 0,
             clickedcta: parseInt(body.clickedcta) || 0,
-            purchases: parseInt(body.purchases) || 0,
             attended: parseInt(body.attended) || 0,
         };
+
+        // Only include purchase source columns if explicitly provided
+        // Prevents admin form edits from clobbering webhook-sourced data to 0
+        const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar'];
+        for (const col of PURCHASE_COLS) {
+            if (body[col] !== undefined && body[col] !== '' && body[col] !== null) {
+                row[col] = parseInt(body[col]) || 0;
+            }
+        }
 
         const { data, error } = await supabase
             .from('daily_metrics')
@@ -294,7 +345,7 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
                 errors.push({ index: i, error: 'Invalid date', input: entry.date });
                 continue;
             }
-            rows.push({
+            const row = {
                 date: dateToISO(date),
                 day_of_week: getLADayOfWeek(date),
                 fb_spend: parseFloat(entry.fb_spend) || 0,
@@ -303,9 +354,16 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
                 replays: parseInt(entry.replays) || 0,
                 viewedcta: parseInt(entry.viewedcta) || 0,
                 clickedcta: parseInt(entry.clickedcta) || 0,
-                purchases: parseInt(entry.purchases) || 0,
                 attended: parseInt(entry.attended) || 0,
-            });
+            };
+            // Only include purchase columns if explicitly provided (prevents clobbering)
+            const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar'];
+            for (const col of PURCHASE_COLS) {
+                if (entry[col] !== undefined && entry[col] !== '' && entry[col] !== null) {
+                    row[col] = parseInt(entry[col]) || 0;
+                }
+            }
+            rows.push(row);
         }
 
         if (rows.length > 0) {
@@ -333,7 +391,17 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
 app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
         const { field, count = 1, name, email, phone, execution_id, ...rest } = req.body;
+        // Purchase source columns are NOT in validFields — purchases must always go through
+        // field:'purchases' with a 'source' param so source routing and Post Webinar detection run.
         const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
+
+        // ── Purchase source mapping ──────────────────────────────────────
+        const PURCHASE_SOURCE_MAP = {
+            'Paid Ads': 'purchases_fb',
+            'Native':   'purchases_native',
+            'Youtube':  'purchases_youtube',
+            'AI Bot':   'purchases_aibot',
+        };
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -384,44 +452,103 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             .from('daily_metrics')
             .upsert({ date: isoDate, day_of_week: dayOfWeek }, { onConflict: 'date' });
 
-        // Increment via read-modify-write
-        const { data: current } = await supabase
-            .from('daily_metrics')
-            .select(field)
-            .eq('date', isoDate)
-            .single();
+        // ── Purchase source routing ───────────────────────────────────
+        let incrementField = field;
+        let resolvedSource = rest.source || null;
 
-        const newValue = (Number(current?.[field]) || 0) + Number(count);
+        if (field === 'purchases') {
+            const rawSource = rest.source || 'Paid Ads'; // default to Paid Ads
+            let sourceColumn = PURCHASE_SOURCE_MAP[rawSource] || 'purchases_fb';
 
-        const { data, error } = await supabase
-            .from('daily_metrics')
-            .update({ [field]: newValue })
-            .eq('date', isoDate)
-            .select()
-            .single();
+            // Post Webinar detection: if "Paid Ads" and buyer attended 12h+ ago
+            if (rawSource === 'Paid Ads' && email) {
+                try {
+                    const { data: attendedEvt } = await supabase
+                        .from('events')
+                        .select('event_time')
+                        .eq('event_type', 'attended')
+                        .ilike('email', email)
+                        .order('event_time', { ascending: false })
+                        .limit(1);
 
-        if (error) throw error;
+                    if (attendedEvt?.length > 0) {
+                        const hoursSince = (Date.now() - new Date(attendedEvt[0].event_time).getTime()) / 3600000;
+                        if (hoursSince >= 12) {
+                            sourceColumn = 'purchases_postwebinar';
+                            resolvedSource = 'Post Webinar';
+                            console.log(`🎯 Post Webinar purchase: ${email} attended ${Math.round(hoursSince)}h ago`);
+                        }
+                    }
+                } catch (e) {
+                    console.warn('⚠️ Post Webinar check failed:', e.message);
+                }
+            }
 
-        // Store the individual event with user details
+            if (!resolvedSource) resolvedSource = rawSource;
+            incrementField = sourceColumn;
+            console.log(`🛒 Purchase source: "${rawSource}" → ${sourceColumn}`);
+        }
+
+        // ── Step 1: Record the event FIRST (source of truth for dedup) ──
+        // This must land before the counter increment so retries are safe:
+        //   - Event fails → counter untouched → retry is clean
+        //   - Event succeeds, counter fails → retry hits 5-min dedup → skip
+        //   - Counter is 1 behind temporarily, but dashboard uses dedup > raw
         const metadata = { ...rest };
         delete metadata.api_key; // don't store keys
-        await supabase.from('events').insert({
+        if (field === 'purchases' && resolvedSource) {
+            metadata.source = resolvedSource;
+        }
+        const { error: evErr } = await supabase.from('events').insert({
             event_type: field,
             name: name || null,
             email: email || null,
             phone: phone || null,
             execution_id: execution_id || null,
             metadata: Object.keys(metadata).length > 0 ? metadata : {},
-        }).then(({ error: evErr }) => {
-            if (evErr) console.error('⚠️ Event insert error:', evErr.message);
         });
+        if (evErr) {
+            console.error('❌ Event insert FAILED:', evErr.message);
+            throw new Error(`Event recording failed: ${evErr.message}`);
+        }
+
+        // ── Step 2: Increment the denormalized counter ──
+        const { data, error } = await supabase.rpc('increment_field', {
+            p_date: isoDate,
+            p_field: incrementField,
+            p_amount: Number(count)
+        });
+
+        if (error) {
+            // Only fall back to read-modify-write for "function not found" (42883).
+            // Transient/ambiguous errors must NOT fall through — they risk double-counting.
+            if (error.code === '42883') {
+                console.warn('⚠️ RPC increment_field not deployed, falling back to read-modify-write');
+                const { data: current } = await supabase
+                    .from('daily_metrics')
+                    .select(incrementField)
+                    .eq('date', isoDate)
+                    .single();
+                const newValue = (Number(current?.[incrementField]) || 0) + Number(count);
+                const { error: updErr } = await supabase
+                    .from('daily_metrics')
+                    .update({ [incrementField]: newValue })
+                    .eq('date', isoDate);
+                if (updErr) throw updErr;
+            } else {
+                // Counter failed but event is recorded — dedup will show correct count.
+                // Log and continue rather than returning 500 (which would trigger a retry
+                // that dedup would skip, leaving the counter permanently behind).
+                console.error('⚠️ Counter increment failed (event recorded, dedup is accurate):', error.message);
+            }
+        }
 
         // Invalidate caches — new event arrived
         invalidateDedupForDate(isoDate);
         invalidateInsightsCache();
 
-        console.log(`✅ Increment ${field} +${count} for ${targetDate}${name ? ` (${name})` : ''}`);
-        res.json({ success: true, date: targetDate, field, previous: current?.[field], new: newValue });
+        console.log(`✅ Increment ${incrementField} +${count} for ${targetDate}${name ? ` (${name})` : ''}`);
+        res.json({ success: true, date: targetDate, field: incrementField, count: Number(count) });
 
     } catch (err) {
         console.error('❌ POST /api/metrics/increment error:', err.message);
@@ -438,7 +565,7 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
 app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
         const { field, value, date: dateInput } = req.body;
-        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
+        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'attended'];
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -765,6 +892,15 @@ app.delete('/api/lenses/:id', dashboardLimiter, requireAuth, async (req, res) =>
 // by a webhook. This eliminates ~95% of Supabase events-table egress.
 const EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', 'purchases'];
 
+// Map purchase event metadata.source to the dedup sub-key
+const PURCHASE_DEDUP_MAP = {
+    'Paid Ads':      'purchases_fb',
+    'Native':        'purchases_native',
+    'Youtube':       'purchases_youtube',
+    'AI Bot':        'purchases_aibot',
+    'Post Webinar':  'purchases_postwebinar',
+};
+
 function computeDedupFromEvents(events) {
     const sets = {}; // key: "YYYY-MM-DD|event_type" → Set of user keys
     for (const ev of events) {
@@ -780,7 +916,17 @@ function computeDedupFromEvents(events) {
         } else {
             d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
         }
-        const k = `${d}|${ev.event_type}`;
+
+        // For purchases, break down by source into sub-keys (purchases_fb, purchases_native, etc.)
+        let eventKey = ev.event_type;
+        if (ev.event_type === 'purchases') {
+            const src = ev.metadata?.source || 'Paid Ads';
+            // Map event source to sub-key; unrecognized sources default to purchases_fb
+            // for backward compat with old events that have no metadata.source
+            eventKey = PURCHASE_DEDUP_MAP[src] || 'purchases_fb';
+        }
+
+        const k = `${d}|${eventKey}`;
         if (!sets[k]) sets[k] = new Set();
         const userKey = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
         if (userKey) sets[k].add(userKey);
@@ -840,32 +986,71 @@ async function getDedupCounts(dates) {
     if (dates.length === 0) return {};
     const today = dateToISO(getLADate());
 
+    // Today's dedup expires after 3 seconds to handle concurrent webhook races (#14)
+    // Past days are cached forever (their counts can't change)
+    if (cache.dedupCounts[today] && cache.dedupTimestamps?.[today]) {
+        if (Date.now() - cache.dedupTimestamps[today] > 3000) {
+            delete cache.dedupCounts[today];
+        }
+    }
+
     // Find dates that are NOT in the cache
     const uncachedDates = dates.filter(d => !(d in cache.dedupCounts));
-    // Today always needs refreshing if it's not in cache (it gets invalidated on new events)
 
     if (uncachedDates.length > 0) {
-        const sorted = [...uncachedDates].sort();
-        const minDate = sorted[0];
-        const maxDate = sorted[sorted.length - 1];
-
-        console.log(`📊 Cache MISS: fetching events for ${uncachedDates.length} uncached date(s) [${minDate} → ${maxDate}]`);
         cache.misses++;
 
-        const events = await fetchEventsForDateRange(minDate, maxDate);
-        const computed = computeDedupFromEvents(events);
-
-        // Log per-day breakdown for diagnostics
-        const dayCounts = {};
-        for (const [d, counts] of Object.entries(computed)) {
-            dayCounts[d] = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(', ');
+        // Split uncached dates into contiguous ranges to avoid fetching
+        // already-cached intermediate dates (#9)
+        const sorted = [...uncachedDates].sort();
+        const ranges = [];
+        let rangeStart = sorted[0];
+        let rangePrev = sorted[0];
+        for (let i = 1; i < sorted.length; i++) {
+            const prevDate = new Date(rangePrev + 'T00:00:00Z');
+            const currDate = new Date(sorted[i] + 'T00:00:00Z');
+            const gapDays = (currDate - prevDate) / 86400000;
+            if (gapDays > 3) {
+                // Gap too large — start a new range
+                ranges.push([rangeStart, rangePrev]);
+                rangeStart = sorted[i];
+            }
+            rangePrev = sorted[i];
         }
-        console.log(`📊 Dedup results per day:`, JSON.stringify(dayCounts, null, 2));
+        ranges.push([rangeStart, rangePrev]);
 
-        // Store each day's dedup in cache
-        // For uncached dates with no events, store empty object so we don't re-fetch
-        for (const d of uncachedDates) {
-            cache.dedupCounts[d] = computed[d] || {};
+        console.log(`📊 Cache MISS: ${uncachedDates.length} uncached date(s) across ${ranges.length} range(s)`);
+
+        // Fetch each range, log, and cache in a single pass
+        if (!cache.dedupTimestamps) cache.dedupTimestamps = {};
+        for (const [minDate, maxDate] of ranges) {
+            const events = await fetchEventsForDateRange(minDate, maxDate);
+            const computed = computeDedupFromEvents(events);
+
+            // Log per-day breakdown for diagnostics
+            const dayCounts = {};
+            for (const [d, counts] of Object.entries(computed)) {
+                dayCounts[d] = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(', ');
+            }
+            if (Object.keys(dayCounts).length > 0) {
+                console.log(`📊 Dedup [${minDate}→${maxDate}]:`, JSON.stringify(dayCounts));
+            }
+
+            // Store in cache — only for dates we actually need
+            for (const d of uncachedDates) {
+                if (d >= minDate && d <= maxDate) {
+                    cache.dedupCounts[d] = computed[d] || {};
+                    if (d === today) cache.dedupTimestamps[d] = Date.now();
+                }
+            }
+        }
+
+        // Prune dedup cache: drop dates older than 120 days to prevent unbounded growth (#5)
+        const pruneCutoff = new Date();
+        pruneCutoff.setDate(pruneCutoff.getDate() - 120);
+        const pruneISO = pruneCutoff.toISOString().slice(0, 10);
+        for (const d of Object.keys(cache.dedupCounts)) {
+            if (d < pruneISO) delete cache.dedupCounts[d];
         }
     } else {
         cache.hits++;
@@ -924,7 +1109,18 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 replays: pick('replays'),
                 viewedcta: pick('viewedcta'),
                 clickedcta: pick('clickedcta'),
-                purchases: pick('purchases'),
+                purchases_fb: pick('purchases_fb'),
+                purchases_native: pick('purchases_native'),
+                purchases_youtube: pick('purchases_youtube'),
+                purchases_aibot: pick('purchases_aibot'),
+                purchases_postwebinar: pick('purchases_postwebinar'),
+                total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
+                                 (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
+                                 (pick('purchases_postwebinar') || 0),
+                // 'purchases' is an alias for total_purchases (backward compat for custom formulas)
+                purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
+                           (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
+                           (pick('purchases_postwebinar') || 0),
                 attended: pick('attended'),
                 created_at: row.created_at,
                 updated_at: row.updated_at,
@@ -957,26 +1153,23 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
         const isoDate = dateToISO(dateInput);
         const body = req.body;
 
-        // Build the overrides object from the submitted fields
-        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
+        // Only write to overrides — raw columns stay as the automated data source.
+        // This prevents overrides from drifting separately from raw columns (#6).
+        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar'];
         const newOverrides = {};
-        const updates = {};
         for (const f of OVERRIDE_FIELDS) {
             if (body[f] !== undefined) {
-                const val = (f === 'fb_spend') ? parseFloat(body[f]) || 0 : parseInt(body[f]) || 0;
-                updates[f] = val;
-                newOverrides[f] = val;
+                newOverrides[f] = (f === 'fb_spend') ? parseFloat(body[f]) || 0 : parseInt(body[f]) || 0;
             }
         }
 
         // Merge with existing overrides (don't wipe out other fields)
         const { data: existing } = await supabase.from('daily_metrics').select('overrides').eq('date', isoDate).single();
         const mergedOverrides = { ...(existing?.overrides || {}), ...newOverrides };
-        updates.overrides = mergedOverrides;
 
         const { data, error } = await supabase
             .from('daily_metrics')
-            .update(updates)
+            .update({ overrides: mergedOverrides })
             .eq('date', isoDate)
             .select()
             .single();
@@ -1145,6 +1338,23 @@ app.get('/api/webhook-log', dashboardLimiter, async (req, res) => {
     }
 });
 
+
+// =============================================================================
+// CACHE MANAGEMENT
+// =============================================================================
+
+// POST /api/cache/clear — Admin-only: flush all caches (use after direct DB edits)
+app.post('/api/cache/clear', requireAuth, async (req, res) => {
+    const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+    if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
+    const daysBefore = Object.keys(cache.dedupCounts).length;
+    cache.dedupCounts = {};
+    invalidateMetricsCache();
+    invalidateInsightsCache();
+    console.log(`🧹 Cache: full clear by admin (${daysBefore} days flushed)`);
+    res.json({ success: true, message: `Cache cleared (${daysBefore} days flushed)` });
+});
 
 // =============================================================================
 // HEALTH CHECK
@@ -1339,18 +1549,36 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
                 supabase.from('events').select('event_type, name, email, event_time').order('event_time', { ascending: false }).limit(500),
             ]);
 
-            metricsData = (metricsRes.data || []).map(r => ({
-                date: r.date,
-                day: r.day_of_week,
-                fb_spend: Number(r.fb_spend),
-                fb_link_clicks: Number(r.fb_link_clicks || 0),
-                registrations: r.registrations,
-                attended: r.attended,
-                replays: r.replays,
-                viewedcta: r.viewedcta,
-                clickedcta: r.clickedcta,
-                purchases: r.purchases,
-            }));
+            // Build dedup-aware metrics (same priority chain as GET /api/metrics)
+            const rawRows = metricsRes.data || [];
+            const dates = rawRows.map(r => String(r.date).substring(0, 10));
+            const dedupMap = await getDedupCounts(dates);
+
+            metricsData = rawRows.map(r => {
+                const dateStr = String(r.date).substring(0, 10);
+                const deduped = dedupMap[dateStr] || {};
+                const ov = r.overrides || {};
+                const pick = (field) => ov[field] !== undefined ? ov[field] : (deduped[field] ?? r[field]);
+                return {
+                    date: r.date,
+                    day: r.day_of_week,
+                    fb_spend: ov.fb_spend !== undefined ? ov.fb_spend : Number(r.fb_spend),
+                    fb_link_clicks: ov.fb_link_clicks !== undefined ? ov.fb_link_clicks : Number(r.fb_link_clicks || 0),
+                    registrations: pick('registrations'),
+                    attended: pick('attended'),
+                    replays: pick('replays'),
+                    viewedcta: pick('viewedcta'),
+                    clickedcta: pick('clickedcta'),
+                    purchases_fb: pick('purchases_fb') || 0,
+                    purchases_native: pick('purchases_native') || 0,
+                    purchases_youtube: pick('purchases_youtube') || 0,
+                    purchases_aibot: pick('purchases_aibot') || 0,
+                    purchases_postwebinar: pick('purchases_postwebinar') || 0,
+                    total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
+                                     (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
+                                     (pick('purchases_postwebinar') || 0),
+                };
+            });
 
             // Summarize events by date + type (instead of sending thousands of individual records)
             const eventSummary = {};
@@ -1395,7 +1623,13 @@ THE FUNNEL STAGES (in order):
 5. Replays — people who watched the replay
 6. Viewed CTA — people who saw the call to action
 7. Clicked CTA — people who clicked the call to action  
-8. Purchases — people who purchased
+8. Purchases — broken down by source:
+   - purchases_fb (FB Purchases) — from Facebook Paid Ads
+   - purchases_native (Native Ads) — from native ad placements
+   - purchases_youtube (Youtube) — from Youtube campaigns
+   - purchases_aibot (AI Chat Bot) — from AI chatbot interactions
+   - purchases_postwebinar (Post Webinar) — Paid Ads purchases made 12+ hours AFTER attending a webinar
+   - total_purchases — sum of all purchase sources above
 
 KEY METRICS TO TRACK:
 - Landing Page Conversion Rate (registrations / fb_link_clicks × 100)
@@ -1403,8 +1637,9 @@ KEY METRICS TO TRACK:
 - Attendance Rate (attended / registrations × 100)
 - CTA View Rate (viewedcta / (attended + replays) × 100)
 - CTA Click Rate (clickedcta / viewedcta × 100)
-- Conversion Rate (purchases / clickedcta × 100)
-- Cost per Acquisition (fb_spend / purchases)
+- Conversion Rate (total_purchases / clickedcta × 100)
+- Cost per Acquisition (fb_spend / total_purchases)
+- Post Webinar Rate (purchases_postwebinar / total_purchases × 100) — fraction of sales from delayed converters
 
 DAILY METRICS (last ${metricsData.length} days, newest first):
 ${JSON.stringify(metricsData, null, 0)}

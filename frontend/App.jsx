@@ -35,9 +35,10 @@ const api = {
     return res.json();
   },
   async upsertMetric(entry) {
+    const headers = await getAuthHeaders();
     const res = await fetch(`${API_BASE}/api/metrics`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-API-Key": getLocalKey() },
+      headers,
       body: JSON.stringify(entry),
     });
     if (!res.ok) throw new Error(`Failed to save: ${res.status}`);
@@ -121,8 +122,8 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "fb_link_clicks", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "attended"];
-const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", registrations: "Registrations", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases: "Purchases" };
+const MK = ["fb_spend", "fb_link_clicks", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "total_purchases", "attended"];
+const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", registrations: "Registrations", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", total_purchases: "Total Purchases" };
 const DEFAULT_HIDDEN = [];
 const evalFormula = (f, row, ctx = {}) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(`\\b${k}\\b`, "gi"), String(Number(row[k]) || 0)); for (const [k, v] of Object.entries(ctx)) e = e.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi"), String(Number(v) || 0)); if (/[^0-9+\-*/().%\s]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
 const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` : fmt === "currency" ? `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
@@ -205,7 +206,13 @@ export default function App() {
   const [lensMenuOpen, setLensMenuOpen] = useState(false);
   const [lensEditing, setLensEditing] = useState(null); // null | { id?, name, metrics }
   const lensMenuRef = useRef(null);
-  const activeLens = lenses.find(l => l.id === activeLensId) || lenses[0] || { id: "default-all", name: "All Metrics", metrics: MK };
+  const activeLens = (() => {
+    const found = lenses.find(l => l.id === activeLensId);
+    if (!found) return lenses[0] || { id: "default-all", name: "All Metrics", metrics: MK };
+    // "All Metrics" lens always uses the current full MK list
+    if (found.id === "default-all") return { ...found, metrics: MK };
+    return found;
+  })();
   const isColVisible = (col) => activeLens.metrics.includes(col);
 
   // ─── Column ordering ────────────────────────────────────────────
@@ -214,7 +221,7 @@ export default function App() {
 
   // Build the ordered list of column descriptors
   const buildColList = useCallback(() => {
-    const baseCols = MK.map(k => ({ key: k, label: COL_LABELS[k], type: "base" }));
+    const baseCols = MK.filter(k => COL_LABELS[k]).map(k => ({ key: k, label: COL_LABELS[k], type: "base" }));
     const customCols = customs.map(cm => ({ key: `cm:${cm.id}`, label: cm.name, type: "custom", cm }));
     const all = [...baseCols, ...customCols];
     if (!colOrder) return all;
@@ -402,7 +409,8 @@ export default function App() {
     return true;
   });
 
-  const totalsFiltered = filtered.filter(m => {
+  // displayRows = rows matching BOTH search + date filter (used for table, cards, and totals)
+  const displayRows = filtered.filter(m => {
     const d = parseMDate(m.date);
     const today = parseMDate(getLADate()); // LA-pinned "today", not browser-local
     if (dateFilter === "today" && d.getTime() !== today.getTime()) return false;
@@ -417,11 +425,11 @@ export default function App() {
     return true;
   });
 
-  const totals = totalsFiltered.reduce((a, r) => { MK.forEach(k => { a[k] = (a[k] || 0) + (Number(r[k]) || 0); }); return a; }, {});
+  const totals = displayRows.reduce((a, r) => { MK.forEach(k => { a[k] = (a[k] || 0) + (Number(r[k]) || 0); }); return a; }, {});
 
-  const half = Math.floor(totalsFiltered.length / 2);
-  const recent = totalsFiltered.slice(0, half || 1);
-  const older = totalsFiltered.slice(half || 1);
+  const half = Math.floor(displayRows.length / 2);
+  const recent = displayRows.slice(0, half || 1);
+  const older = displayRows.slice(half || 1);
   const pctChange = (key) => {
     const rSum = recent.reduce((a, r) => a + (Number(r[key]) || 0), 0);
     const oSum = older.reduce((a, r) => a + (Number(r[key]) || 0), 0);
@@ -624,7 +632,7 @@ export default function App() {
                       {isAdmin && (
                         <>
                           <div style={{ height: 1, background: "#E5E7EB", margin: "4px 0" }} />
-                          <div style={{ padding: "7px 14px", cursor: "pointer", fontSize: 13, color: "#3538CD", fontWeight: 600 }} onMouseEnter={e => e.currentTarget.style.background = "#F9FAFB"} onMouseLeave={e => e.currentTarget.style.background = "transparent"} onClick={() => { setLensEditing({ name: "", metrics: [...MK] }); setLensMenuOpen(false); }}>+ Create Lens</div>
+                          <div style={{ padding: "7px 14px", cursor: "pointer", fontSize: 13, color: "#3538CD", fontWeight: 600 }} onMouseEnter={e => e.currentTarget.style.background = "#F9FAFB"} onMouseLeave={e => e.currentTarget.style.background = "transparent"} onClick={() => { setLensEditing({ name: "", metrics: MK.filter(k => COL_LABELS[k]) }); setLensMenuOpen(false); }}>+ Create Lens</div>
                         </>
                       )}
                     </div>
@@ -640,14 +648,14 @@ export default function App() {
                   <thead><tr>
                     <th className="sticky-col sticky-col-1" style={S.th}>Day</th><th className="sticky-col sticky-col-2" style={S.th}>Date</th>
                     {orderedCols.filter(c => c.type === "base" ? isColVisible(c.key) : true).map(c => (
-                      <th key={c.key} style={{ ...S.th, ...(c.type === "custom" ? { color: "#12864A" } : {}) }}>{c.label}</th>
+                      <th key={c.key} style={{ ...S.th, ...(c.type === "custom" ? { color: "#12864A" } : {}), ...(c.key === "total_purchases" ? S.thHighlight : {}) }}>{c.label}</th>
                     ))}
                     <th style={{ ...S.th, width: 72 }}>Actions</th>
                   </tr></thead>
                   <tbody>
-                    {filtered.length === 0 ? (
+                    {displayRows.length === 0 ? (
                       <tr><td colSpan={2 + MK.filter(k => isColVisible(k)).length + customs.length + 1} style={S.emptyTd}>No entries found for this period.</td></tr>
-                    ) : filtered.map((row) => {
+                    ) : displayRows.map((row) => {
                       const isToday = row.date === getLADate();
                       const ctx = evalAllCustoms(customs, row);
                       return (
@@ -658,8 +666,8 @@ export default function App() {
                             if (c.type === "custom") {
                               return <td key={c.key} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(ctx[c.cm.name], c.cm.format)}</td>;
                             }
+                            if (c.key === "total_purchases") return <td key={c.key} style={S.tdNum}><span style={S.purchBadge}>{(Number(row.total_purchases) || 0).toLocaleString()}</span></td>;
                             if (c.key === "fb_spend") return <td key={c.key} style={S.tdMoney}>{"$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>;
-                            if (c.key === "purchases") return <td key={c.key} style={S.tdNum}><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></td>;
                             return <td key={c.key} style={S.tdNum}>{(Number(row[c.key]) || 0).toLocaleString()}</td>;
                           })}
                           <td style={S.td}>
@@ -677,9 +685,9 @@ export default function App() {
               </div>
             ) : (
               <div style={S.boardGrid}>
-                {filtered.length === 0 ? (
+                {displayRows.length === 0 ? (
                   <div style={{ ...S.emptyTd, gridColumn: "1 / -1", border: "1px dashed #E5E7EB", borderRadius: 12 }}>No entries found for this period.</div>
-                ) : filtered.map((row) => {
+                ) : displayRows.map((row) => {
                   const boardCtx = evalAllCustoms(customs, row);
                   return (
                   <div key={row.date} style={S.boardCard}>
@@ -695,7 +703,7 @@ export default function App() {
                           return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(boardCtx[c.cm.name], c.cm.format)}</span></div>;
                         }
                         if (c.key === "fb_spend") return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{"$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</span></div>;
-                        if (c.key === "purchases") return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.purchBadge}>{(Number(row.purchases) || 0).toLocaleString()}</span></div>;
+                        if (c.key === "total_purchases") return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.purchBadge}>{(Number(row.total_purchases) || 0).toLocaleString()}</span></div>;
                         return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{(Number(row[c.key]) || 0).toLocaleString()}</span></div>;
                       })}
                     </div>
@@ -809,7 +817,7 @@ export default function App() {
 
 function LensEditor({ lens, onSave, onCancel }) {
   const [name, setName] = useState(lens.name || "");
-  const [metrics, setMetrics] = useState(lens.metrics || [...MK]);
+  const [metrics, setMetrics] = useState((lens.metrics || MK).filter(k => COL_LABELS[k]));
   const toggle = (m) => setMetrics(prev => prev.includes(m) ? prev.filter(x => x !== m) : [...prev, m]);
   return (
     <div style={S.overlay} onClick={onCancel}>
@@ -824,7 +832,7 @@ function LensEditor({ lens, onSave, onCancel }) {
         <div style={{ marginBottom: 20 }}>
           <label style={{ fontSize: 12, fontWeight: 600, color: "#374151", display: "block", marginBottom: 8 }}>Metrics</label>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-            {MK.map(m => (
+            {MK.filter(m => COL_LABELS[m]).map(m => (
               <label key={m} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 8, border: `1px solid ${metrics.includes(m) ? "#3538CD" : "#E5E7EB"}`, background: metrics.includes(m) ? "#EEF4FF" : "#fff", cursor: "pointer", fontSize: 13, fontWeight: 500, color: metrics.includes(m) ? "#3538CD" : "#6B7280", transition: "all 0.15s" }}>
                 <input type="checkbox" checked={metrics.includes(m)} onChange={() => toggle(m)} style={{ accentColor: "#3538CD" }} />
                 {COL_LABELS[m]}
@@ -865,7 +873,7 @@ function ColumnEditor({ columns, onSave, onCancel, isAdmin }) {
     setOverIdx(null);
   };
 
-  const reset = () => setItems(MK.map(k => ({ key: k, label: COL_LABELS[k], type: "base" })).concat(columns.filter(c => c.type === "custom")));
+  const reset = () => setItems(MK.filter(k => COL_LABELS[k]).map(k => ({ key: k, label: COL_LABELS[k], type: "base" })).concat(columns.filter(c => c.type === "custom")));
   const CE = {
     list: { display: "flex", flexDirection: "column", gap: 2, maxHeight: 400, overflowY: "auto", marginBottom: 20 },
     item: (isDragging, isOver) => ({ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: isDragging ? "#EEF2FF" : isOver ? "#F0FDF4" : "#F9FAFB", border: `1px solid ${isDragging ? "#818CF8" : isOver ? "#86EFAC" : "#E5E7EB"}`, borderRadius: 8, cursor: "grab", transition: "all 150ms ease", opacity: isDragging ? 0.6 : 1, transform: isDragging ? "scale(0.98)" : "scale(1)" }),
@@ -953,10 +961,13 @@ function Modal({ title, msg, onCancel, onConfirm }) {
 
 function EntryForm({ initial, onSubmit, onCancel, isMobile }) {
   const today = getLADate();
-  const [f, setF] = useState({ date: initial?.date || today, fb_spend: initial?.fb_spend ?? "", fb_link_clicks: initial?.fb_link_clicks ?? "", registrations: initial?.registrations ?? "", replays: initial?.replays ?? "", viewedcta: initial?.viewedcta ?? "", clickedcta: initial?.clickedcta ?? "", purchases: initial?.purchases ?? "", attended: initial?.attended ?? "" });
+  const defaults = initial
+    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, registrations: initial.registrations ?? 0, replays: initial.replays ?? 0, viewedcta: initial.viewedcta ?? 0, clickedcta: initial.clickedcta ?? 0, purchases_fb: initial.purchases_fb ?? 0, purchases_native: initial.purchases_native ?? 0, purchases_youtube: initial.purchases_youtube ?? 0, purchases_aibot: initial.purchases_aibot ?? 0, purchases_postwebinar: initial.purchases_postwebinar ?? 0, attended: initial.attended ?? 0 }
+    : { fb_spend: "", fb_link_clicks: "", registrations: "", replays: "", viewedcta: "", clickedcta: "", purchases_fb: "", purchases_native: "", purchases_youtube: "", purchases_aibot: "", purchases_postwebinar: "", attended: "" };
+  const [f, setF] = useState({ date: initial?.date || today, ...defaults });
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
-  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases: parseInt(f.purchases) || 0, attended: parseInt(f.attended) || 0 });
-  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Total Reg. Page Visited", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases", l: "Purchases", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
+  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases_fb: parseInt(f.purchases_fb) || 0, purchases_native: parseInt(f.purchases_native) || 0, purchases_youtube: parseInt(f.purchases_youtube) || 0, purchases_aibot: parseInt(f.purchases_aibot) || 0, purchases_postwebinar: parseInt(f.purchases_postwebinar) || 0, attended: parseInt(f.attended) || 0 });
+  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Total Reg. Page Visited", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases_fb", l: "FB Purchases", ph: "0" }, { k: "purchases_native", l: "Native Ads", ph: "0" }, { k: "purchases_youtube", l: "Youtube", ph: "0" }, { k: "purchases_aibot", l: "AI Chat Bot", ph: "0" }, { k: "purchases_postwebinar", l: "Post Webinar", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
   return (
     <div className="fi form-container" style={S.fc}>
       <div style={S.fh}><div style={{ ...S.formBadge, background: initial ? "#EFF8FF" : "#ECFDF3", color: initial ? "#175CD3" : "#12864A" }}>{initial ? "EDIT ENTRY" : "NEW ENTRY"}</div><h2 style={S.ft}>{initial ? `Update ${fmtDateNice(initial.date)}` : "Add Daily Metrics"}</h2><p style={S.fs}>Enter metrics for the day. Fields default to 0 if empty.</p></div>
@@ -1080,7 +1091,7 @@ function QueryBuilder({ flash }) {
     resultCount: { fontSize: 13, color: "#6B7280", fontWeight: 500 },
     tableWrap: { overflowX: "auto", borderRadius: 10, border: "1px solid #E8E8E6" },
     table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
-    th: { padding: "10px 14px", textAlign: "left", fontWeight: 600, color: "#6B7280", borderBottom: "1px solid #E8E8E6", background: "#FAFAFA", whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" },
+    th: { padding: "10px 14px", textAlign: "left", fontWeight: 600, color: "#6B7280", borderBottom: "1px solid #E8E8E6", background: "#FAFAFA", whiteSpace: "normal", maxWidth: 100, lineHeight: 1.3, cursor: "pointer", userSelect: "none" },
     td: { padding: "9px 14px", borderBottom: "1px solid #F3F4F6", color: "#374151", whiteSpace: "nowrap", maxWidth: 250, overflow: "hidden", textOverflow: "ellipsis" },
     sortIcon: { marginLeft: 4, fontSize: 10 },
   };
@@ -1653,13 +1664,15 @@ const S = {
   searchInput: { border: "none", outline: "none", background: "transparent", fontFamily: fn, fontSize: 13, color: "#111827", width: "100%", fontWeight: 400 },
   tableWrap: { background: "#fff", border: "1px solid #E5E7EB", overflowX: "auto", boxShadow: "0 1px 3px rgba(0,0,0,0.04)", marginLeft: "calc(-1 * (100vw - 100%) / 2)", marginRight: "calc(-1 * (100vw - 100%) / 2)", width: "100vw", maxWidth: "100vw", borderRadius: 0, borderLeft: "none", borderRight: "none" },
   table: { width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 900 },
-  th: { padding: "10px 16px", textAlign: "center", fontSize: 11, fontWeight: 600, color: "#6B7280", textTransform: "uppercase", borderBottom: "2px solid #E5E7EB", background: "#FAFAFA", letterSpacing: "0.05em", whiteSpace: "nowrap" },
+  th: { padding: "10px 12px", textAlign: "center", fontSize: 11, fontWeight: 600, color: "#6B7280", textTransform: "uppercase", borderBottom: "2px solid #E5E7EB", background: "#FAFAFA", letterSpacing: "0.05em", whiteSpace: "normal", maxWidth: 90, lineHeight: 1.35 },
   td: { padding: "10px 16px", borderBottom: "1px solid #F3F4F6", verticalAlign: "middle", textAlign: "center" },
   tdNum: { padding: "10px 16px", borderBottom: "1px solid #F3F4F6", fontWeight: 500, fontVariantNumeric: "tabular-nums", color: "#111827", fontSize: 13, textAlign: "center" },
   tdMoney: { padding: "10px 16px", borderBottom: "1px solid #F3F4F6", fontWeight: 500, fontVariantNumeric: "tabular-nums", color: "#111827", fontSize: 13, textAlign: "center" },
   dayPill: { display: "inline-block", padding: "4px 10px", background: "#F3F4F6", color: "#4B5563", fontSize: 11, fontWeight: 600, borderRadius: 6, letterSpacing: "0.02em", textTransform: "uppercase" },
   todayDot: { display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "#F97316", marginLeft: 4, verticalAlign: "middle" },
-  purchBadge: { display: "inline-block", padding: "2px 8px", background: "#ECFDF5", color: "#047857", fontWeight: 600, borderRadius: 4, border: "1px solid #A7F3D0" },
+  purchBadge: { display: "inline-block", padding: "2px 8px", background: "#ECFDF5", color: "#047857", fontWeight: 700, borderRadius: 4, border: "1px solid #A7F3D0" },
+  thHighlight: { background: "#F0FDF4", color: "#047857", borderBottom: "2px solid #10B981" },
+  tdHighlight: { background: "#F0FDF4" },
   emptyTd: { padding: 48, textAlign: "center", color: "#9CA3AF", fontSize: 14, fontWeight: 500 },
   rowAct: { background: "#fff", border: "1px solid #E5E7EB", borderRadius: 6, cursor: "pointer", padding: "6px", display: "inline-flex", alignItems: "center", boxShadow: "0 1px 2px rgba(0,0,0,0.02)" },
   btnDark: { display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 16px", fontSize: 13, fontWeight: 500, fontFamily: fn, background: "#111827", color: "#F9FAFB", border: "1px solid #111827", borderRadius: 8, cursor: "pointer", boxShadow: "0 1px 2px rgba(0,0,0,0.05)" },
