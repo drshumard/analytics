@@ -407,20 +407,55 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
         }
 
-        // Dedup: skip if same email + event_type within last 5 minutes (webhook retry protection)
+        // Dedup: registrations dedup by email + webinar day (PDT) so the same person
+        // can register for different days' webinars in quick succession, but duplicate
+        // registrations for the same day are blocked. All other event types use the
+        // original 5-minute window as webhook retry protection.
         if (email) {
-            const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-            const { data: existing } = await supabase
-                .from('events')
-                .select('id')
-                .eq('event_type', field)
-                .eq('email', email)
-                .gte('event_time', fiveMinAgo)
-                .limit(1);
+            if (field === 'registrations' && rest.webinar_datetime_utc) {
+                // Parse the incoming webinar date to a PDT/PST calendar day
+                const cleaned = rest.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
+                const parsed = new Date(cleaned + ' UTC');
+                if (!isNaN(parsed.getTime())) {
+                    const webinarDayISO = parsed.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                    // Check if this email already has a registration whose webinar_datetime_utc
+                    // resolves to the same PDT calendar day
+                    const { data: existing } = await supabase
+                        .from('events')
+                        .select('id, metadata')
+                        .eq('event_type', 'registrations')
+                        .eq('email', email);
 
-            if (existing && existing.length > 0) {
-                console.log(`⏭️  Dedup skip: ${field} for ${email} (duplicate within 5min)`);
-                return res.json({ success: true, duplicate: true, message: 'Duplicate event skipped' });
+                    const isDup = (existing || []).some(ev => {
+                        const evRaw = ev.metadata?.webinar_datetime_utc;
+                        if (!evRaw) return false;
+                        const evCleaned = evRaw.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
+                        const evParsed = new Date(evCleaned + ' UTC');
+                        if (isNaN(evParsed.getTime())) return false;
+                        const evDay = evParsed.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                        return evDay === webinarDayISO;
+                    });
+
+                    if (isDup) {
+                        console.log(`⏭️  Dedup skip: registration for ${email} (already registered for webinar day ${webinarDayISO})`);
+                        return res.json({ success: true, duplicate: true, message: 'Duplicate registration skipped (same webinar day)' });
+                    }
+                }
+            } else {
+                // All other event types: 5-minute dedup window (webhook retry protection)
+                const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+                const { data: existing } = await supabase
+                    .from('events')
+                    .select('id')
+                    .eq('event_type', field)
+                    .eq('email', email)
+                    .gte('event_time', fiveMinAgo)
+                    .limit(1);
+
+                if (existing && existing.length > 0) {
+                    console.log(`⏭️  Dedup skip: ${field} for ${email} (duplicate within 5min)`);
+                    return res.json({ success: true, duplicate: true, message: 'Duplicate event skipped' });
+                }
             }
         }
 
