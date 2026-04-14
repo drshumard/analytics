@@ -1477,19 +1477,59 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
         const { table = 'events', dateFrom, dateTo, eventType, search, sortBy, sortDir = 'desc', limit = 500 } = req.body;
 
         // Only allow querying safe tables
-        const ALLOWED_TABLES = ['events', 'daily_metrics'];
+        const ALLOWED_TABLES = ['events', 'daily_metrics', 'dashboard'];
         if (!ALLOWED_TABLES.includes(table)) return res.status(400).json({ error: 'Invalid table' });
+
+        // ── Dashboard view: same numbers the frontend shows ──────────────
+        if (table === 'dashboard') {
+            let query = supabase.from('daily_metrics').select('*').order('date', { ascending: sortDir === 'asc' });
+            if (dateFrom) query = query.gte('date', dateFrom);
+            if (dateTo) query = query.lte('date', dateTo);
+            query = query.limit(Math.min(Number(limit) || 500, 5000));
+            const { data: rawRows, error: dbErr } = await query;
+            if (dbErr) throw dbErr;
+
+            const dates = (rawRows || []).map(r => String(r.date).substring(0, 10));
+            const dedupMap = await getDedupCounts(dates);
+
+            const formatted = (rawRows || []).map(row => {
+                const dateStr = String(row.date).substring(0, 10);
+                const deduped = dedupMap[dateStr] || {};
+                const ov = row.overrides || {};
+                const pick = (field) => ov[field] !== undefined ? ov[field] : (deduped[field] ?? row[field]);
+                return {
+                    date: dateStr,
+                    day: row.day_of_week,
+                    fb_spend: ov.fb_spend !== undefined ? ov.fb_spend : Number(row.fb_spend),
+                    fb_link_clicks: ov.fb_link_clicks !== undefined ? ov.fb_link_clicks : Number(row.fb_link_clicks || 0),
+                    registrations: pick('registrations'),
+                    attended: pick('attended'),
+                    replays: pick('replays'),
+                    viewedcta: pick('viewedcta'),
+                    clickedcta: pick('clickedcta'),
+                    purchases_fb: pick('purchases_fb') || 0,
+                    purchases_native: pick('purchases_native') || 0,
+                    purchases_youtube: pick('purchases_youtube') || 0,
+                    purchases_aibot: pick('purchases_aibot') || 0,
+                    purchases_postwebinar: pick('purchases_postwebinar') || 0,
+                    total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
+                                     (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
+                                     (pick('purchases_postwebinar') || 0),
+                };
+            });
+
+            return res.json({ data: formatted, count: formatted.length });
+        }
 
         let query = supabase.from(table).select('*');
 
         if (table === 'events') {
             // Convert LA date boundaries to UTC so query matches how the dashboard counts
             const toLA_UTC = (dateStr, time) => {
-                // Create a date in LA timezone, get its UTC equivalent
                 const d = new Date(`${dateStr}T${time}`);
                 const utc = new Date(d.toLocaleString('en-US', { timeZone: 'UTC' }));
                 const la = new Date(d.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-                const offset = (utc - la) / 60000; // offset in minutes
+                const offset = (utc - la) / 60000;
                 const offsetH = String(Math.floor(Math.abs(offset) / 60)).padStart(2, '0');
                 const offsetM = String(Math.abs(offset) % 60).padStart(2, '0');
                 const sign = offset <= 0 ? '+' : '-';

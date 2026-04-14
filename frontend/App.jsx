@@ -1108,8 +1108,9 @@ function QueryBuilder({ flash }) {
         <div style={QS.filterGroup}>
           <span style={QS.filterLabel}>Table</span>
           <select style={QS.filterSelect} value={table} onChange={e => { setTable(e.target.value); setResults(null); setEventType(""); setSortBy(""); }}>
-            <option value="events">Events</option>
-            <option value="daily_metrics">Daily Metrics</option>
+            <option value="events">Events (Raw)</option>
+            <option value="daily_metrics">Daily Metrics (Raw)</option>
+            <option value="dashboard">Dashboard (Processed)</option>
           </select>
         </div>
         <div style={QS.filterGroup}>
