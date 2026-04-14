@@ -1121,7 +1121,7 @@ function QueryBuilder({ flash }) {
           <span style={QS.filterLabel}>To</span>
           <input type="date" style={QS.filterInput} value={dateTo} onChange={e => setDateTo(e.target.value)} />
         </div>
-        {table === "events" && (
+        {(table === "events" || table === "dashboard") && (
           <>
             <div style={QS.filterGroup}>
               <span style={QS.filterLabel}>Event Type</span>

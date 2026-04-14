@@ -1480,45 +1480,72 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
         const ALLOWED_TABLES = ['events', 'daily_metrics', 'dashboard'];
         if (!ALLOWED_TABLES.includes(table)) return res.status(400).json({ error: 'Invalid table' });
 
-        // ── Dashboard view: same numbers the frontend shows ──────────────
+        // ── Dashboard Events: the actual deduped people the dashboard counted ──
         if (table === 'dashboard') {
-            let query = supabase.from('daily_metrics').select('*').order('date', { ascending: sortDir === 'asc' });
-            if (dateFrom) query = query.gte('date', dateFrom);
-            if (dateTo) query = query.lte('date', dateTo);
-            query = query.limit(Math.min(Number(limit) || 500, 5000));
-            const { data: rawRows, error: dbErr } = await query;
-            if (dbErr) throw dbErr;
+            // Fetch events for the requested date range
+            const fetchFrom = dateFrom || '2020-01-01';
+            const fetchTo = dateTo || dateToISO(getLADate());
+            const events = await fetchEventsForDateRange(fetchFrom, fetchTo);
 
-            const dates = (rawRows || []).map(r => String(r.date).substring(0, 10));
-            const dedupMap = await getDedupCounts(dates);
+            // Apply the same dedup logic as computeDedupFromEvents, but keep the winning rows
+            const seen = {}; // key: "YYYY-MM-DD|eventKey|userKey" → first event
+            const dedupedEvents = [];
 
-            const formatted = (rawRows || []).map(row => {
-                const dateStr = String(row.date).substring(0, 10);
-                const deduped = dedupMap[dateStr] || {};
-                const ov = row.overrides || {};
-                const pick = (field) => ov[field] !== undefined ? ov[field] : (deduped[field] ?? row[field]);
-                return {
-                    date: dateStr,
-                    day: row.day_of_week,
-                    fb_spend: ov.fb_spend !== undefined ? ov.fb_spend : Number(row.fb_spend),
-                    fb_link_clicks: ov.fb_link_clicks !== undefined ? ov.fb_link_clicks : Number(row.fb_link_clicks || 0),
-                    registrations: pick('registrations'),
-                    attended: pick('attended'),
-                    replays: pick('replays'),
-                    viewedcta: pick('viewedcta'),
-                    clickedcta: pick('clickedcta'),
-                    purchases_fb: pick('purchases_fb') || 0,
-                    purchases_native: pick('purchases_native') || 0,
-                    purchases_youtube: pick('purchases_youtube') || 0,
-                    purchases_aibot: pick('purchases_aibot') || 0,
-                    purchases_postwebinar: pick('purchases_postwebinar') || 0,
-                    total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
-                                     (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
-                                     (pick('purchases_postwebinar') || 0),
-                };
+            for (const ev of events) {
+                // Compute dashboard-attributed date (same logic as computeDedupFromEvents)
+                let dashDate;
+                if (ev.metadata?.webinar_datetime_utc) {
+                    const cleaned = ev.metadata.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
+                    const parsed = new Date(cleaned + ' UTC');
+                    dashDate = !isNaN(parsed.getTime())
+                        ? parsed.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' })
+                        : new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                } else {
+                    dashDate = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                }
+
+                // Compute event key (purchases split by source)
+                let eventKey = ev.event_type;
+                if (ev.event_type === 'purchases') {
+                    const src = ev.metadata?.source || 'Paid Ads';
+                    eventKey = PURCHASE_DEDUP_MAP[src] || 'purchases_fb';
+                }
+
+                // Date filter: only include events attributed to the requested range
+                if (dateFrom && dashDate < dateFrom) continue;
+                if (dateTo && dashDate > dateTo) continue;
+
+                // Event type filter
+                if (eventType && ev.event_type !== eventType) continue;
+
+                // Dedup: first unique user per date+eventKey wins
+                const userKey = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
+                if (!userKey) continue; // anonymous events can't be deduped
+
+                const dedupKey = `${dashDate}|${eventKey}|${userKey}`;
+                if (seen[dedupKey]) continue;
+                seen[dedupKey] = true;
+
+                dedupedEvents.push({
+                    dashboard_date: dashDate,
+                    event_type: ev.event_type,
+                    source: ev.event_type === 'purchases' ? (ev.metadata?.source || 'Paid Ads') : null,
+                    name: ev.name,
+                    email: ev.email,
+                    phone: ev.phone,
+                    event_time: ev.event_time,
+                });
+            }
+
+            // Sort
+            const sField = sortBy || 'dashboard_date';
+            dedupedEvents.sort((a, b) => {
+                const av = a[sField] || '', bv = b[sField] || '';
+                return sortDir === 'asc' ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1);
             });
 
-            return res.json({ data: formatted, count: formatted.length });
+            const capped = dedupedEvents.slice(0, Math.min(Number(limit) || 500, 5000));
+            return res.json({ data: capped, count: dedupedEvents.length });
         }
 
         let query = supabase.from(table).select('*');
