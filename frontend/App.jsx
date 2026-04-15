@@ -109,6 +109,12 @@ const api = {
     if (!res.ok) throw new Error(`Failed to delete conversation: ${res.status}`);
     return res.json();
   },
+  async clearCache() {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/cache/clear`, { method: "POST", headers });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Cache clear failed: ${res.status}`); }
+    return res.json();
+  },
 };
 
 function getLocalKey() {
@@ -364,6 +370,17 @@ export default function App() {
     }
   }, [loadData, flash]);
 
+  const clearCache = useCallback(async () => {
+    flash("Clearing server cache…", "ok");
+    try {
+      const body = await api.clearCache();
+      await loadData();
+      flash(body.message || "Cache cleared", "ok");
+    } catch (e) {
+      flash(e.message || "Cache clear failed", "err");
+    }
+  }, [loadData, flash]);
+
   const recalcSpend = useCallback(async (dateRaw) => {
     const iso = dateRaw.includes('/') ? dateRaw.replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$1-$2') : dateRaw;
     flash(`Recalculating spend for ${iso}…`, "ok");
@@ -510,6 +527,7 @@ export default function App() {
           {/* Desktop-visible buttons */}
           <div className="nav-buttons-desktop">
             <button style={S.btnGhost} onClick={refreshWebhook} title="Refresh Spend Data"><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={15} stroke="#8A8A88" /></button>
+            {isAdmin && <button style={S.btnGhost} onClick={clearCache} title="Clear Server Cache">🧹</button>}
             {view === "dash" && (
               <>
                 <button style={S.btnLight} onClick={() => setView("insights")}>Insights</button>
