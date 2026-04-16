@@ -1378,16 +1378,13 @@ app.get('/api/webhook-log', dashboardLimiter, async (req, res) => {
 // CACHE MANAGEMENT
 // =============================================================================
 
-// POST /api/cache/clear — Admin-only: flush all caches (use after direct DB edits)
+// POST /api/cache/clear — Authenticated: flush all caches (use after direct DB edits)
 app.post('/api/cache/clear', requireAuth, async (req, res) => {
-    const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
-    if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
-
     const daysBefore = Object.keys(cache.dedupCounts).length;
     cache.dedupCounts = {};
     invalidateMetricsCache();
     invalidateInsightsCache();
-    console.log(`🧹 Cache: full clear by admin (${daysBefore} days flushed)`);
+    console.log(`🧹 Cache: full clear by ${req.user.email} (${daysBefore} days flushed)`);
     res.json({ success: true, message: `Cache cleared (${daysBefore} days flushed)` });
 });
 

@@ -527,7 +527,7 @@ export default function App() {
           {/* Desktop-visible buttons */}
           <div className="nav-buttons-desktop">
             <button style={S.btnGhost} onClick={refreshWebhook} title="Refresh Spend Data"><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={15} stroke="#8A8A88" /></button>
-            {isAdmin && <button style={S.btnGhost} onClick={clearCache} title="Clear Server Cache">🧹</button>}
+            <button style={S.btnLight} onClick={clearCache}>Clear Cache</button>
             {view === "dash" && (
               <>
                 <button style={S.btnLight} onClick={() => setView("insights")}>Insights</button>
