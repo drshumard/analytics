@@ -1133,8 +1133,17 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             const dateStr = String(row.date).substring(0, 10);
             const mmddyyyy = dateStr.replace(/(\d{4})-(\d{2})-(\d{2})/, '$2/$3/$1');
             const deduped = dedupMap[dateStr] || {};
+            const hasDedup = Object.keys(deduped).length > 0;
             const ov = row.overrides || {};
-            const pick = (field) => ov[field] !== undefined ? ov[field] : (deduped[field] ?? row[field]);
+            // For purchase sub-columns: if dedup ran for this date (hasDedup), a missing key
+            // means 0 events — don't fall through to a potentially stale/corrupted raw column.
+            const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar']);
+            const pick = (field) => {
+                if (ov[field] !== undefined) return ov[field];
+                if (deduped[field] !== undefined) return deduped[field];
+                if (hasDedup && PURCHASE_SUB_COLS.has(field)) return 0;
+                return row[field];
+            };
             return {
                 date: mmddyyyy,
                 day: row.day_of_week,
@@ -1656,8 +1665,15 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
             metricsData = rawRows.map(r => {
                 const dateStr = String(r.date).substring(0, 10);
                 const deduped = dedupMap[dateStr] || {};
+                const hasDedup = Object.keys(deduped).length > 0;
                 const ov = r.overrides || {};
-                const pick = (field) => ov[field] !== undefined ? ov[field] : (deduped[field] ?? r[field]);
+                const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar']);
+                const pick = (field) => {
+                    if (ov[field] !== undefined) return ov[field];
+                    if (deduped[field] !== undefined) return deduped[field];
+                    if (hasDedup && PURCHASE_SUB_COLS.has(field)) return 0;
+                    return r[field];
+                };
                 return {
                     date: r.date,
                     day: r.day_of_week,

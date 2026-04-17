@@ -131,6 +131,31 @@ const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); 
 const MK = ["fb_spend", "fb_link_clicks", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "total_purchases", "attended"];
 const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", registrations: "Registrations", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", total_purchases: "Total Purchases" };
 const DEFAULT_HIDDEN = [];
+
+// Summary card defaults and metric options for the configurable summary strip
+const DEFAULT_SUMMARY_CARDS = [
+  { label: "Total Spend", key: "fb_spend", agg: "total", format: "currency" },
+  { label: "Reg. Page Visits", key: "fb_link_clicks", agg: "total", format: "number" },
+  { label: "Registrations", key: "registrations", agg: "total", format: "number" },
+  { label: "Purchases", key: "purchases", agg: "total", format: "number" },
+  { label: "Total Replays", key: "replays", agg: "total", format: "number" },
+];
+const SUMMARY_METRIC_OPTIONS = [
+  { key: "fb_spend", label: "FB Spend", defaultFormat: "currency" },
+  { key: "fb_link_clicks", label: "Reg. Page Visits", defaultFormat: "number" },
+  { key: "registrations", label: "Registrations", defaultFormat: "number" },
+  { key: "attended", label: "Attended", defaultFormat: "number" },
+  { key: "replays", label: "Replays", defaultFormat: "number" },
+  { key: "viewedcta", label: "Viewed CTA", defaultFormat: "number" },
+  { key: "clickedcta", label: "Clicked CTA", defaultFormat: "number" },
+  { key: "purchases", label: "Total Purchases", defaultFormat: "number" },
+  { key: "purchases_fb", label: "FB Purchases", defaultFormat: "number" },
+  { key: "purchases_native", label: "Native Ads", defaultFormat: "number" },
+  { key: "purchases_youtube", label: "Youtube", defaultFormat: "number" },
+  { key: "purchases_aibot", label: "AI Chat Bot", defaultFormat: "number" },
+  { key: "purchases_postwebinar", label: "Post Webinar", defaultFormat: "number" },
+  { key: "total_purchases", label: "Total Purchases (alt)", defaultFormat: "number" },
+];
 const evalFormula = (f, row, ctx = {}) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(`\\b${k}\\b`, "gi"), String(Number(row[k]) || 0)); for (const [k, v] of Object.entries(ctx)) e = e.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi"), String(Number(v) || 0)); if (/[^0-9+\-*/().%\s]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
 const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` : fmt === "currency" ? `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
 
@@ -211,6 +236,8 @@ export default function App() {
   const [activeLensId, setActiveLensId] = useState("default-all");
   const [lensMenuOpen, setLensMenuOpen] = useState(false);
   const [lensEditing, setLensEditing] = useState(null); // null | { id?, name, metrics }
+  const [summaryCards, setSummaryCards] = useState(DEFAULT_SUMMARY_CARDS);
+  const [summaryEditorOpen, setSummaryEditorOpen] = useState(false);
   const lensMenuRef = useRef(null);
   const activeLens = (() => {
     const found = lenses.find(l => l.id === activeLensId);
@@ -331,6 +358,7 @@ export default function App() {
       if (data.preferences?.default_lens_id) setActiveLensId(data.preferences.default_lens_id);
       if (data.preferences?.col_order) setColOrder(data.preferences.col_order);
       else if (data.default_col_order) setColOrder(data.default_col_order);
+      if (data.preferences?.summary_cards) setSummaryCards(data.preferences.summary_cards);
     } catch { setUserRole("viewer"); }
     setAuthLoading(false);
   };
@@ -443,6 +471,41 @@ export default function App() {
   });
 
   const totals = displayRows.reduce((a, r) => { MK.forEach(k => { a[k] = (a[k] || 0) + (Number(r[k]) || 0); }); return a; }, {});
+  const averages = {};
+  if (displayRows.length > 0) { MK.forEach(k => { averages[k] = Math.round(((totals[k] || 0) / displayRows.length) * 100) / 100; }); }
+
+  const saveSummaryCards = async (cards) => {
+    setSummaryCards(cards);
+    try {
+      const headers = await getAuthHeaders();
+      await fetch(`${API_BASE}/api/me/preferences`, { method: "PUT", headers, body: JSON.stringify({ preferences: { summary_cards: cards } }) });
+    } catch { }
+  };
+
+  const formatSummaryVal = (val, format) => {
+    if (format === "currency") return `$${val.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
+    if (format === "decimal") return val.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return val.toLocaleString("en-US", { maximumFractionDigits: 1 });
+  };
+
+  const getSummaryCardVal = (card) => {
+    // Custom metric keys are prefixed with "cm:"
+    if (card.key.startsWith("cm:")) {
+      const cmId = card.key.slice(3);
+      const cm = customs.find(c => String(c.id) === cmId);
+      if (!cm || displayRows.length === 0) return formatSummaryVal(0, card.format);
+      // Evaluate formula for each row and aggregate
+      const vals = displayRows.map(row => {
+        const ctx = evalAllCustoms(customs, row);
+        return ctx[cm.name] ?? 0;
+      });
+      const sum = vals.reduce((a, v) => a + (Number(v) || 0), 0);
+      const raw = card.agg === "avg" ? sum / displayRows.length : sum;
+      return formatSummaryVal(Math.round(raw * 100) / 100, card.format);
+    }
+    const raw = card.agg === "avg" ? (averages[card.key] || 0) : (totals[card.key] || 0);
+    return formatSummaryVal(raw, card.format);
+  };
 
   const half = Math.floor(displayRows.length / 2);
   const recent = displayRows.slice(0, half || 1);
@@ -597,20 +660,17 @@ export default function App() {
               </div>
             </div>
 
-            <div className="summary-strip" style={S.strip}>
-              {[
-                { label: "Total Spend", val: `$${(totals.fb_spend || 0).toLocaleString("en-US", { maximumFractionDigits: 0 })}`, key: "fb_spend" },
-                { label: "Reg. Page Visits", val: (totals.fb_link_clicks || 0).toLocaleString(), key: "fb_link_clicks" },
-                { label: "Registrations", val: (totals.registrations || 0).toLocaleString(), key: "registrations" },
-                { label: "Purchases", val: (totals.purchases || 0).toLocaleString(), key: "purchases" },
-                { label: "Total Replays", val: (totals.replays || 0).toLocaleString(), key: "replays" },
-              ].map((c, i, arr) => {
+            <div className="summary-strip" style={{ ...S.strip, position: "relative" }}>
+              {summaryCards.map((c, i, arr) => {
                 const pct = pctChange(c.key);
                 return (
                   <div key={i} style={{ ...S.stripCell, borderRight: i < arr.length - 1 ? "1px solid #E8E8E6" : "none" }}>
-                    <div style={S.stripLabel}>{c.label}</div>
+                    <div style={S.stripLabel}>
+                      {c.label}
+                      {c.agg === "avg" && <span style={{ fontSize: 10, color: "#9CA3AF", fontWeight: 400, marginLeft: 4 }}>(avg)</span>}
+                    </div>
                     <div className="strip-val-row" style={S.stripValRow}>
-                      <span style={S.stripVal}>{c.val}</span>
+                      <span style={S.stripVal}>{getSummaryCardVal(c)}</span>
                       {pct !== null && (
                         <span style={{ ...S.pctBadge, background: pct >= 0 ? "#EAFCFA" : "#FFF1F2", color: pct >= 0 ? "#047857" : "#BE123C" }}>
                           {pct >= 0 ? "+" : ""}{pct}%
@@ -621,6 +681,18 @@ export default function App() {
                   </div>
                 );
               })}
+              {isAdmin && (
+                <button
+                  onClick={() => setSummaryEditorOpen(true)}
+                  title="Edit summary cards"
+                  style={{ position: "absolute", top: 8, right: 8, background: "transparent", border: "1px solid transparent", borderRadius: 6, padding: 4, cursor: "pointer", color: "#9CA3AF", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.15s" }}
+                  onMouseEnter={e => { e.currentTarget.style.background = "#F3F4F6"; e.currentTarget.style.borderColor = "#E5E7EB"; e.currentTarget.style.color = "#6B7280"; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.borderColor = "transparent"; e.currentTarget.style.color = "#9CA3AF"; }}
+                >
+                  <I d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" size={14} />
+                  <I d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" size={14} />
+                </button>
+              )}
             </div>
 
             <div className="toolbar-row" style={S.toolbar}>
@@ -828,7 +900,141 @@ export default function App() {
       {delCM && <Modal title="Delete Custom Metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
       {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
       {colEditorOpen && <ColumnEditor columns={orderedCols} isAdmin={isAdmin} onSave={(keys) => { saveColOrder(keys); setColEditorOpen(false); }} onCancel={() => setColEditorOpen(false)} />}
+      {summaryEditorOpen && <SummaryEditor cards={summaryCards} customs={customs} onSave={(cards) => { saveSummaryCards(cards); setSummaryEditorOpen(false); flash("Summary cards updated"); }} onCancel={() => setSummaryEditorOpen(false)} />}
       {toast && (<div className="fi" style={{ ...S.toast, borderLeft: `3px solid ${toast.type === "ok" ? "#12864A" : "#D92D20"}` }}><I d={toast.type === "ok" ? "M20 6L9 17l-5-5" : "M12 2a10 10 0 100 20 10 10 0 000-20zM12 8v4M12 16h.01"} size={16} stroke={toast.type === "ok" ? "#12864A" : "#D92D20"} sw={2.2} />{toast.msg}</div>)}
+    </div>
+  );
+}
+
+function SummaryEditor({ cards: initialCards, customs, onSave, onCancel }) {
+  const [cards, setCards] = useState(initialCards.map(c => ({ ...c })));
+  const [addOpen, setAddOpen] = useState(false);
+
+  // Build full options list: base metrics + custom metrics
+  const allOptions = [
+    ...SUMMARY_METRIC_OPTIONS,
+    ...(customs || []).map(cm => ({ key: `cm:${cm.id}`, label: cm.name, defaultFormat: cm.format === "currency" ? "currency" : cm.format === "percent" ? "decimal" : "number" })),
+  ];
+
+  const updateCard = (idx, field, val) => {
+    setCards(prev => prev.map((c, i) => i === idx ? { ...c, [field]: val } : c));
+  };
+  const removeCard = (idx) => setCards(prev => prev.filter((_, i) => i !== idx));
+  const moveCard = (idx, dir) => {
+    setCards(prev => {
+      const arr = [...prev];
+      const target = idx + dir;
+      if (target < 0 || target >= arr.length) return arr;
+      [arr[idx], arr[target]] = [arr[target], arr[idx]];
+      return arr;
+    });
+  };
+  const addCard = (key) => {
+    const opt = allOptions.find(o => o.key === key);
+    if (!opt) return;
+    setCards(prev => [...prev, { label: opt.label, key: opt.key, agg: "total", format: opt.defaultFormat }]);
+    setAddOpen(false);
+  };
+
+  const SE = {
+    cardRow: { display: "flex", alignItems: "center", gap: 8, padding: "12px 14px", border: "1px solid #E5E7EB", borderRadius: 10, background: "#FAFAFA", marginBottom: 8 },
+    fieldGroup: { display: "flex", flexDirection: "column", gap: 3 },
+    miniLabel: { fontSize: 10, fontWeight: 600, color: "#9CA3AF", textTransform: "uppercase", letterSpacing: "0.04em" },
+    miniSelect: { padding: "5px 8px", fontSize: 12, fontWeight: 500, border: "1px solid #D1D5DB", borderRadius: 6, background: "#fff", color: "#374151", outline: "none", cursor: "pointer", fontFamily: "inherit" },
+    miniInput: { padding: "5px 8px", fontSize: 12, fontWeight: 500, border: "1px solid #D1D5DB", borderRadius: 6, background: "#fff", color: "#374151", outline: "none", fontFamily: "inherit", width: 120 },
+    moveBtn: { background: "transparent", border: "none", cursor: "pointer", padding: 2, color: "#9CA3AF", fontSize: 14, lineHeight: 1, display: "flex", alignItems: "center" },
+    removeBtn: { background: "transparent", border: "none", cursor: "pointer", padding: "2px 4px", color: "#DC2626", fontSize: 16, lineHeight: 1, display: "flex", alignItems: "center", borderRadius: 4 },
+  };
+
+  return (
+    <div style={S.overlay} onClick={onCancel}>
+      <div style={{ ...S.modal, maxWidth: 560, textAlign: "left", padding: "28px 32px" }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+          <div style={{ width: 40, height: 40, borderRadius: 10, background: "#EEF4FF", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            <I d="M4 6h16M4 12h16M4 18h7" size={20} stroke="#3538CD" sw={2} />
+          </div>
+          <div>
+            <div style={{ fontSize: 17, fontWeight: 600, color: "#111827" }}>Edit Summary Cards</div>
+            <div style={{ fontSize: 13, color: "#6B7280", marginTop: 2 }}>Choose metrics, labels, and aggregation type</div>
+          </div>
+        </div>
+
+        <div style={{ maxHeight: 400, overflowY: "auto", marginBottom: 16, paddingRight: 4 }}>
+          {cards.length === 0 && (
+            <div style={{ textAlign: "center", padding: "32px 0", color: "#9CA3AF", fontSize: 13 }}>No cards configured. Add one below.</div>
+          )}
+          {cards.map((card, idx) => (
+            <div key={idx} style={SE.cardRow}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                <button style={SE.moveBtn} onClick={() => moveCard(idx, -1)} disabled={idx === 0} title="Move up">▲</button>
+                <button style={SE.moveBtn} onClick={() => moveCard(idx, 1)} disabled={idx === cards.length - 1} title="Move down">▼</button>
+              </div>
+              <div style={{ flex: 1, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "end" }}>
+                <div style={SE.fieldGroup}>
+                  <span style={SE.miniLabel}>Label</span>
+                  <input style={SE.miniInput} value={card.label} onChange={e => updateCard(idx, "label", e.target.value)} />
+                </div>
+                <div style={SE.fieldGroup}>
+                  <span style={SE.miniLabel}>Metric</span>
+                  <select style={SE.miniSelect} value={card.key} onChange={e => {
+                    const opt = allOptions.find(o => o.key === e.target.value);
+                    updateCard(idx, "key", e.target.value);
+                    if (opt && card.label === (allOptions.find(o => o.key === card.key)?.label || "")) updateCard(idx, "label", opt.label);
+                  }}>
+                    {allOptions.map(o => <option key={o.key} value={o.key}>{o.label}</option>)}
+                  </select>
+                </div>
+                <div style={SE.fieldGroup}>
+                  <span style={SE.miniLabel}>Type</span>
+                  <select style={SE.miniSelect} value={card.agg} onChange={e => updateCard(idx, "agg", e.target.value)}>
+                    <option value="total">Total</option>
+                    <option value="avg">Average</option>
+                  </select>
+                </div>
+                <div style={SE.fieldGroup}>
+                  <span style={SE.miniLabel}>Format</span>
+                  <select style={SE.miniSelect} value={card.format} onChange={e => updateCard(idx, "format", e.target.value)}>
+                    <option value="number">Number</option>
+                    <option value="currency">Currency ($)</option>
+                    <option value="decimal">Decimal</option>
+                  </select>
+                </div>
+              </div>
+              <button style={SE.removeBtn} onClick={() => removeCard(idx)} title="Remove card">×</button>
+            </div>
+          ))}
+        </div>
+
+        {!addOpen ? (
+          <button
+            style={{ ...S.btnLight, width: "100%", justifyContent: "center", marginBottom: 16, padding: "10px 0", borderStyle: "dashed", color: "#6B7280" }}
+            onClick={() => setAddOpen(true)}
+          >
+            + Add Card
+          </button>
+        ) : (
+          <div style={{ display: "flex", gap: 8, marginBottom: 16, alignItems: "center" }}>
+            <select
+              autoFocus
+              style={{ ...SE.miniSelect, flex: 1, padding: "8px 10px", fontSize: 13 }}
+              defaultValue=""
+              onChange={e => { if (e.target.value) addCard(e.target.value); }}
+            >
+              <option value="" disabled>Select a metric…</option>
+              {allOptions.map(o => <option key={o.key} value={o.key}>{o.label}</option>)}
+            </select>
+            <button style={{ ...S.btnGhost, padding: "6px 10px", fontSize: 12, color: "#6B7280" }} onClick={() => setAddOpen(false)}>Cancel</button>
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 10, justifyContent: "space-between" }}>
+          <button style={{ ...S.btnGhost, fontSize: 13, color: "#6B7280" }} onClick={() => setCards(DEFAULT_SUMMARY_CARDS.map(c => ({ ...c })))}>Reset to Default</button>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button style={{ ...S.btnLight, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
+            <button style={{ ...S.btnDark, justifyContent: "center" }} onClick={() => onSave(cards)} disabled={cards.length === 0}>Save</button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
