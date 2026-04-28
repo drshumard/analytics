@@ -1015,8 +1015,11 @@ async function fetchEventsForDateRange(minDate, maxDate) {
             .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
 
         if (error) {
+            // Throw so /api/metrics surfaces a 500 and the dedup cache stays
+            // empty for this date — better than caching a partial result that
+            // makes today's row fall back to the raw counter.
             console.error(`❌ Supabase fetch error (page ${page}):`, error.message, error.code);
-            break;
+            throw new Error(`Events fetch failed (page ${page}): ${error.message}`);
         }
         if (!batch || batch.length === 0) break;
 
@@ -1177,13 +1180,19 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             const deduped = dedupMap[dateStr] || {};
             const hasDedup = Object.keys(deduped).length > 0;
             const ov = row.overrides || {};
-            // For purchase sub-columns: if dedup ran for this date (hasDedup), a missing key
-            // means 0 events — don't fall through to a potentially stale/corrupted raw column.
-            const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar']);
+            // Once dedup has run for a date (hasDedup), it is authoritative for
+            // every event-type field. A missing key means 0 events — never fall
+            // through to the raw daily_metrics column, which can be ahead of
+            // dedup briefly (causing the today-row to flicker high → low) or
+            // contain stale/legacy values from batch upserts.
+            const DEDUP_COLS = new Set([
+                'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
+                'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar',
+            ]);
             const pick = (field) => {
                 if (ov[field] !== undefined) return ov[field];
                 if (deduped[field] !== undefined) return deduped[field];
-                if (hasDedup && PURCHASE_SUB_COLS.has(field)) return 0;
+                if (hasDedup && DEDUP_COLS.has(field)) return 0;
                 return row[field];
             };
             return {

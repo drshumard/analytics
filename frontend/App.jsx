@@ -222,7 +222,10 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState("dash");
   const [viewMode, setViewMode] = useState("list");
-  const [dateFilter, setDateFilter] = useState("30");
+  // Default: Last 7 Days on desktop, Today on mobile.
+  const [dateFilter, setDateFilter] = useState(() =>
+    (typeof window !== 'undefined' && window.innerWidth <= 768) ? "today" : "7"
+  );
   const [dateRange, setDateRange] = useState([null, null]);
   const [toast, setToast] = useState(null);
   const [editCM, setEditCM] = useState(null);
@@ -251,6 +254,11 @@ export default function App() {
   // ─── Column ordering ────────────────────────────────────────────
   const [colOrder, setColOrder] = useState(null);
   const [colEditorOpen, setColEditorOpen] = useState(false);
+  // Row selection: clicking rows scopes the summary cards to those rows.
+  // Set semantics — non-contiguous selections aggregate only the picked days.
+  const [selectedDates, setSelectedDates] = useState(() => new Set());
+  // Anchor for shift-click range selection (last clicked row's date).
+  const selectionAnchorRef = useRef(null);
 
   // Build the ordered list of column descriptors
   const buildColList = useCallback(() => {
@@ -454,7 +462,12 @@ export default function App() {
     return true;
   });
 
-  // displayRows = rows matching BOTH search + date filter (used for table, cards, and totals)
+  // tableRows = rows matching the search box only. The table always shows
+  // the full list so users can pick any day regardless of the card filter.
+  const tableRows = filtered;
+
+  // displayRows = search + date filter. Drives summary cards / totals when
+  // no rows are explicitly selected.
   const displayRows = filtered.filter(m => {
     const d = parseMDate(m.date);
     const today = parseMDate(getLADate()); // LA-pinned "today", not browser-local
@@ -470,9 +483,52 @@ export default function App() {
     return true;
   });
 
-  const totals = displayRows.reduce((a, r) => { MK.forEach(k => { a[k] = (a[k] || 0) + (Number(r[k]) || 0); }); return a; }, {});
+  // When rows are selected, scope cards/totals/averages to that set only.
+  // Otherwise fall back to the date-filtered card view. Selection is sourced
+  // from tableRows (which ignores the date filter), so a selected day is
+  // honored even if it's outside the current card-scope filter.
+  const effectiveRows = selectedDates.size > 0
+    ? tableRows.filter(r => selectedDates.has(r.date))
+    : displayRows;
+  const totals = effectiveRows.reduce((a, r) => { MK.forEach(k => { a[k] = (a[k] || 0) + (Number(r[k]) || 0); }); return a; }, {});
   const averages = {};
-  if (displayRows.length > 0) { MK.forEach(k => { averages[k] = Math.round(((totals[k] || 0) / displayRows.length) * 100) / 100; }); }
+  if (effectiveRows.length > 0) { MK.forEach(k => { averages[k] = Math.round(((totals[k] || 0) / effectiveRows.length) * 100) / 100; }); }
+
+  // Toggle/extend selection. Shift-click extends from the anchor row to the
+  // clicked row across the currently visible rows; plain click toggles.
+  const toggleRowSelection = useCallback((date, shiftKey) => {
+    setSelectedDates(prev => {
+      const next = new Set(prev);
+      if (shiftKey && selectionAnchorRef.current && selectionAnchorRef.current !== date) {
+        const dates = tableRows.map(r => r.date);
+        const a = dates.indexOf(selectionAnchorRef.current);
+        const b = dates.indexOf(date);
+        if (a !== -1 && b !== -1) {
+          const [lo, hi] = a < b ? [a, b] : [b, a];
+          for (let i = lo; i <= hi; i++) next.add(dates[i]);
+        } else if (next.has(date)) next.delete(date); else next.add(date);
+      } else if (next.has(date)) {
+        next.delete(date);
+      } else {
+        next.add(date);
+      }
+      return next;
+    });
+    selectionAnchorRef.current = date;
+  }, [tableRows]);
+
+  const clearSelection = useCallback(() => {
+    setSelectedDates(new Set());
+    selectionAnchorRef.current = null;
+  }, []);
+
+  // Drop the selection when the search changes (selected rows may have
+  // dropped out of the visible table). Date filter changes don't clear it
+  // since the table no longer narrows by date.
+  useEffect(() => {
+    setSelectedDates(new Set());
+    selectionAnchorRef.current = null;
+  }, [search]);
 
   const saveSummaryCards = async (cards) => {
     setSummaryCards(cards);
@@ -493,20 +549,21 @@ export default function App() {
     if (card.key.startsWith("cm:")) {
       const cmId = card.key.slice(3);
       const cm = customs.find(c => String(c.id) === cmId);
-      if (!cm || displayRows.length === 0) return formatSummaryVal(0, card.format);
-      // Evaluate formula for each row and aggregate
-      const vals = displayRows.map(row => {
+      if (!cm || effectiveRows.length === 0) return formatSummaryVal(0, card.format);
+      const vals = effectiveRows.map(row => {
         const ctx = evalAllCustoms(customs, row);
         return ctx[cm.name] ?? 0;
       });
       const sum = vals.reduce((a, v) => a + (Number(v) || 0), 0);
-      const raw = card.agg === "avg" ? sum / displayRows.length : sum;
+      const raw = card.agg === "avg" ? sum / effectiveRows.length : sum;
       return formatSummaryVal(Math.round(raw * 100) / 100, card.format);
     }
     const raw = card.agg === "avg" ? (averages[card.key] || 0) : (totals[card.key] || 0);
     return formatSummaryVal(raw, card.format);
   };
 
+  // % change compares recent half vs older half. With an active selection
+  // it's not meaningful (sample is too small / arbitrary), so we suppress it.
   const half = Math.floor(displayRows.length / 2);
   const recent = displayRows.slice(0, half || 1);
   const older = displayRows.slice(half || 1);
@@ -660,11 +717,36 @@ export default function App() {
               </div>
             </div>
 
+            {selectedDates.size > 0 && (() => {
+              const sorted = [...selectedDates].sort((a, b) => parseMDate(a) - parseMDate(b));
+              // "X – Y" only if the selection is the full contiguous range.
+              // Otherwise enumerate (e.g. "Apr 26 and Apr 28").
+              let contiguous = true;
+              for (let i = 1; i < sorted.length; i++) {
+                if ((parseMDate(sorted[i]) - parseMDate(sorted[i - 1])) / 86400000 !== 1) { contiguous = false; break; }
+              }
+              const labels = sorted.map(fmtDateNice);
+              let span;
+              if (labels.length === 1) span = labels[0];
+              else if (contiguous) span = `${labels[0]} – ${labels[labels.length - 1]}`;
+              else if (labels.length === 2) span = `${labels[0]} and ${labels[1]}`;
+              else if (labels.length <= 4) span = `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
+              else span = `${labels.slice(0, 3).join(", ")} +${labels.length - 3} more`;
+              return (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 14px", marginBottom: 12, background: "#ECFDF5", border: "1px solid #A7F3D0", borderRadius: 10, fontSize: 13, color: "#065F46" }}>
+                  <span style={{ fontWeight: 600 }}>Showing {selectedDates.size} selected row{selectedDates.size === 1 ? "" : "s"}</span>
+                  <span style={{ color: "#10B981" }}>•</span>
+                  <span>{span}</span>
+                  <button onClick={clearSelection} style={{ marginLeft: "auto", background: "transparent", border: "1px solid #A7F3D0", borderRadius: 6, padding: "3px 10px", fontSize: 12, fontWeight: 500, color: "#065F46", cursor: "pointer", fontFamily: "Inter, sans-serif" }}>Clear</button>
+                </div>
+              );
+            })()}
+
             <div className="summary-strip" style={{ ...S.strip, position: "relative" }}>
-              {summaryCards.map((c, i, arr) => {
-                const pct = pctChange(c.key);
+              {summaryCards.map((c, i) => {
+                const pct = selectedDates.size > 0 ? null : pctChange(c.key);
                 return (
-                  <div key={i} style={{ ...S.stripCell, borderRight: i < arr.length - 1 ? "1px solid #E8E8E6" : "none" }}>
+                  <div key={i} style={S.stripCell}>
                     <div style={S.stripLabel}>
                       {c.label}
                       {c.agg === "avg" && <span style={{ fontSize: 10, color: "#9CA3AF", fontWeight: 400, marginLeft: 4 }}>(avg)</span>}
@@ -681,6 +763,12 @@ export default function App() {
                   </div>
                 );
               })}
+              {/* Pad the last row with empty cells (white bg) so the grid lines stay
+                  consistent for any card count. Pad to a multiple of 4 (desktop) so
+                  4-col and 2-col layouts both end on a full row. */}
+              {Array.from({ length: (4 - (summaryCards.length % 4)) % 4 }).map((_, i) => (
+                <div key={`pad-${i}`} className="strip-pad" style={S.stripCell} aria-hidden="true" />
+              ))}
               {isAdmin && (
                 <button
                   onClick={() => setSummaryEditorOpen(true)}
@@ -743,13 +831,23 @@ export default function App() {
                     <th style={{ ...S.th, width: 72 }}>Actions</th>
                   </tr></thead>
                   <tbody>
-                    {displayRows.length === 0 ? (
+                    {tableRows.length === 0 ? (
                       <tr><td colSpan={2 + MK.filter(k => isColVisible(k)).length + customs.length + 1} style={S.emptyTd}>No entries found for this period.</td></tr>
-                    ) : displayRows.map((row) => {
+                    ) : tableRows.map((row) => {
                       const isToday = row.date === getLADate();
+                      const isSelected = selectedDates.has(row.date);
                       const ctx = evalAllCustoms(customs, row);
                       return (
-                        <tr key={row.date} className="trow" style={isToday ? { background: "#F8FDF9" } : {}}>
+                        <tr
+                          key={row.date}
+                          className={`trow${isSelected ? " selected" : ""}`}
+                          style={{
+                            cursor: "pointer",
+                            userSelect: isSelected ? "none" : undefined,
+                            ...(!isSelected && isToday ? { background: "#F8FDF9" } : {}),
+                          }}
+                          onClick={(e) => toggleRowSelection(row.date, e.shiftKey)}
+                        >
                           <td className="sticky-col sticky-col-1" style={S.td}><span style={S.dayPill}>{getLADayShort(row.date)}</span></td>
                           <td className="sticky-col sticky-col-2" style={{ ...S.td, whiteSpace: "nowrap", minWidth: 90 }}><span style={{ color: "#1A1A1A", fontWeight: 500, fontSize: 14 }}>{fmtDateNice(row.date)}</span></td>
                           {orderedCols.filter(c => c.type === "base" ? isColVisible(c.key) : true).map(c => {
@@ -760,7 +858,7 @@ export default function App() {
                             if (c.key === "fb_spend") return <td key={c.key} style={S.tdMoney}>{"$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>;
                             return <td key={c.key} style={S.tdNum}>{(Number(row[c.key]) || 0).toLocaleString()}</td>;
                           })}
-                          <td style={S.td}>
+                          <td style={S.td} onClick={(e) => e.stopPropagation()}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
                               <button className="rowBtn" style={{ ...S.rowAct, borderColor: "#DBEAFE", background: "#EFF6FF" }} title="Recalc spend from Facebook" onClick={() => recalcSpend(row.date)}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={14} stroke="#3B82F6" /></button>
                               {isAdmin && <button className="rowBtn" style={S.rowAct} onClick={() => { setEditRow(row); setView("entry"); }}><I d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" size={14} stroke="#8A8A88" /></button>}
@@ -775,12 +873,22 @@ export default function App() {
               </div>
             ) : (
               <div style={S.boardGrid}>
-                {displayRows.length === 0 ? (
+                {tableRows.length === 0 ? (
                   <div style={{ ...S.emptyTd, gridColumn: "1 / -1", border: "1px dashed #E5E7EB", borderRadius: 12 }}>No entries found for this period.</div>
-                ) : displayRows.map((row) => {
+                ) : tableRows.map((row) => {
                   const boardCtx = evalAllCustoms(customs, row);
+                  const isSelected = selectedDates.has(row.date);
+                  const cardStyle = {
+                    ...S.boardCard,
+                    cursor: "pointer",
+                    ...(isSelected ? { background: "#DCFCE7", borderColor: "#10B981", boxShadow: "0 0 0 2px #A7F3D0" } : {}),
+                  };
                   return (
-                    <div key={row.date} style={S.boardCard}>
+                    <div
+                      key={row.date}
+                      style={cardStyle}
+                      onClick={(e) => toggleRowSelection(row.date, e.shiftKey)}
+                    >
                       <div style={S.boardCardHeader}>
                         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                           <span style={S.dayPill}>{getLADayShort(row.date)}</span>
@@ -797,7 +905,7 @@ export default function App() {
                           return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{(Number(row[c.key]) || 0).toLocaleString()}</span></div>;
                         })}
                       </div>
-                      <div style={S.boardCardActions}>
+                      <div style={S.boardCardActions} onClick={(e) => e.stopPropagation()}>
                         <button style={{ ...S.rowAct, borderColor: "#DBEAFE", background: "#EFF6FF" }} title="Recalc spend from Facebook" onClick={() => recalcSpend(row.date)}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={14} stroke="#3B82F6" /></button>
                         {isAdmin && <button style={S.rowAct} title="Edit row" onClick={() => { setEditRow(row); setView("entry"); }}><I d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" size={14} stroke="#6B7280" /></button>}
                         {isAdmin && <button style={{ ...S.rowAct, borderColor: "#FECACA", background: "#FEF2F2" }} title="Delete row" onClick={() => setDelConfirm(row.date)}><I d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" size={14} stroke="#EF4444" /></button>}
@@ -1686,6 +1794,8 @@ body{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 .trow:hover{background:#F9FAFB!important}
 .trow:hover .rowBtn{opacity:1}
 .trow:nth-child(even){background:#FAFBFC}
+.trow.selected, .trow.selected:hover, .trow.selected:nth-child(even){background:#DCFCE7!important;box-shadow:inset 3px 0 0 #10B981}
+.trow.selected .sticky-col, .trow.selected:hover .sticky-col, .trow.selected:nth-child(even) .sticky-col{background:#DCFCE7!important}
 .rowBtn{opacity:0;transition:opacity 150ms ease}
 
 /* Sticky Day/Date columns */
@@ -1767,20 +1877,20 @@ input:focus{outline:none;border-color:#D1D5DB!important;box-shadow:0 0 0 3px rgb
   }
   .title-row h1 { font-size: 20px !important; }
 
-  /* Summary strip — 2×2 grid */
+  /* Summary strip — 2-column grid on mobile (parent gap handles dividers) */
   .summary-strip {
-    flex-wrap: wrap !important;
+    grid-template-columns: repeat(2, 1fr) !important;
   }
   .summary-strip > div {
-    flex: 1 1 calc(50% - 1px) !important; min-width: calc(50% - 1px) !important;
-    padding: 16px !important;
+    padding: 12px 14px !important;
+    gap: 4px !important;
   }
-  .summary-strip > div:nth-child(1),
-  .summary-strip > div:nth-child(2) {
-    border-bottom: 1px solid #E8E8E6 !important;
+  .summary-strip .strip-val-row > span:first-child {
+    font-size: 19px !important;
   }
-  .summary-strip > div:nth-child(2) { border-right: none !important; }
-  .summary-strip > div:nth-child(4) { border-right: none !important; }
+  .summary-strip > div > div:first-child {
+    font-size: 11px !important;
+  }
 
   /* Stack value + badge vertically on mobile */
   .strip-val-row {
@@ -1888,8 +1998,10 @@ const S = {
   pageSub: { fontSize: 13, color: "#6B7280", fontWeight: 500, marginTop: 4, display: "none" },
   livePill: { display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px", background: "transparent", color: "#6B7280", fontSize: 12, fontWeight: 500, borderRadius: 100 },
   liveDot: { width: 6, height: 6, borderRadius: "50%", background: "#10B981", boxShadow: "0 0 6px rgba(16,185,129,0.4)" },
-  strip: { display: "flex", flexWrap: "wrap", border: "1px solid #E5E7EB", borderRadius: 12, background: "#fff", marginBottom: 24, overflow: "hidden", boxShadow: "0 1px 2px rgba(0,0,0,0.02)" },
-  stripCell: { flex: 1, padding: "24px", display: "flex", flexDirection: "column", gap: 8 },
+  // Grid (not flex) so columns are always uniform and dividers align across rows.
+  // The 1px gap on a colored parent doubles as the divider; cells have white bg.
+  strip: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 1, border: "1px solid #E5E7EB", borderRadius: 12, background: "#E8E8E6", marginBottom: 24, overflow: "hidden", boxShadow: "0 1px 2px rgba(0,0,0,0.02)" },
+  stripCell: { background: "#fff", padding: "24px", display: "flex", flexDirection: "column", gap: 8, minWidth: 0 },
   stripLabel: { fontSize: 13, fontWeight: 500, color: "#6B7280" },
   stripValRow: { display: "flex", alignItems: "baseline", gap: 12 },
   stripVal: { fontSize: 28, fontWeight: 600, color: "#111827", letterSpacing: "-0.02em", lineHeight: 1 },
