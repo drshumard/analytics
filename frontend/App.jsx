@@ -1419,32 +1419,43 @@ function InsightsChat({ flash, isMobile }) {
   const [sidebarOpen, setSidebarOpen] = useState(!isMobile);
   const [historyLoading, setHistoryLoading] = useState(true);
   const chatEndRef = useRef(null);
-  // Cache of full conversation messages (sidebar list only has id/title/updated_at)
+  // Cache of full conversation messages, keyed by id and stamped with the
+  // server's updated_at so we can detect remote edits (other tabs/devices).
+  // Shape: { [id]: { msgs, updatedAt } }
   const msgsCache = useRef({});
 
-  // Load conversation list from Supabase on mount
-  useEffect(() => {
-    (async () => {
-      try {
-        const { data } = await api.getConversations();
-        setHistory(data || []);
-      } catch (e) {
-        console.error('Failed to load conversations:', e.message);
-      } finally {
-        setHistoryLoading(false);
-      }
-    })();
+  const loadHistory = useCallback(async () => {
+    try {
+      const { data } = await api.getConversations();
+      setHistory(data || []);
+    } catch (e) {
+      console.error('Failed to load conversations:', e.message);
+    } finally {
+      setHistoryLoading(false);
+    }
   }, []);
 
-  // When selecting a chat, fetch full messages if not cached
+  // Load conversation list from Supabase on mount
+  useEffect(() => { loadHistory(); }, [loadHistory]);
+
+  // Refresh history when the tab regains focus — picks up edits made in
+  // other tabs/devices so msgsCache (keyed by updated_at) can invalidate.
+  useEffect(() => {
+    const onFocus = () => { loadHistory(); };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [loadHistory]);
+
+  // When selecting a chat, fetch full messages if cache is missing or stale
   useEffect(() => {
     if (!activeId) { setChatMsgs([]); return; }
-    if (msgsCache.current[activeId]) {
-      setChatMsgs(msgsCache.current[activeId]);
+    const remote = history.find(c => c.id === activeId);
+    const cached = msgsCache.current[activeId];
+    if (cached && (!remote || cached.updatedAt === remote.updated_at)) {
+      setChatMsgs(cached.msgs);
       return;
     }
-    // Messages aren't in cache — for newly created chats they will be;
-    // for existing ones loaded from sidebar we need to fetch them
+    // Cache miss or stale (remote updated_at moved). Fetch and re-stamp.
     (async () => {
       try {
         const headers = await getAuthHeaders();
@@ -1452,26 +1463,28 @@ function InsightsChat({ flash, isMobile }) {
         if (res.ok) {
           const body = await res.json();
           const msgs = body.data?.messages || [];
-          msgsCache.current[activeId] = msgs;
+          msgsCache.current[activeId] = { msgs, updatedAt: body.data?.updated_at || remote?.updated_at };
           setChatMsgs(msgs);
         }
       } catch { /* fallback: empty */ }
     })();
-  }, [activeId]);
+  }, [activeId, history]);
 
   // Auto-scroll
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatMsgs, chatLoading]);
 
   const saveChat = async (id, msgs) => {
     const title = msgs.find(m => m.role === "user")?.content?.slice(0, 50) || "New chat";
-    msgsCache.current[id] = msgs;
-    // Optimistic UI update
+    const stamp = new Date().toISOString();
+    // Stamp the cache and the optimistic history row with the same updated_at
+    // so the selection effect sees them as in sync.
+    msgsCache.current[id] = { msgs, updatedAt: stamp };
     setHistory(prev => {
       const existing = prev.find(c => c.id === id);
       if (existing) {
-        return prev.map(c => c.id === id ? { ...c, title, updated_at: new Date().toISOString() } : c);
+        return prev.map(c => c.id === id ? { ...c, title, updated_at: stamp } : c);
       }
-      return [{ id, title, updated_at: new Date().toISOString() }, ...prev];
+      return [{ id, title, updated_at: stamp }, ...prev];
     });
     // Persist to Supabase (fire-and-forget)
     api.saveConversation(id, title, msgs).catch(e => console.error('Save chat error:', e.message));

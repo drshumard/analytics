@@ -54,11 +54,17 @@ const cache = {
     // Stats for monitoring
     hits: 0,
     misses: 0,
+
+    // Bumped on every invalidation. Async readers snapshot this before a
+    // Supabase fetch and skip writing back if it changed — prevents a
+    // mid-flight invalidation from being clobbered by stale data.
+    invalidationEpoch: 0,
 };
 
 function invalidateMetricsCache() {
     cache.metricsResponse = null;
     cache.metricsUpdatedAt = 0;
+    cache.invalidationEpoch++;
     console.log('🗑️  Cache: metrics response invalidated');
 }
 
@@ -71,6 +77,7 @@ function invalidateDedupForDate(isoDate) {
 function invalidateInsightsCache() {
     cache.insightsContext = null;
     cache.insightsUpdatedAt = 0;
+    cache.invalidationEpoch++;
 }
 
 // ─── Express App ─────────────────────────────────────────────────────────────
@@ -104,6 +111,12 @@ app.use((req, res, next) => {
             console.log(`${req.method} ${req.path} → ${res.statusCode} (${ms}ms)`);
         }
     });
+    next();
+});
+
+// API responses must never be cached by browsers, bfcache, or intermediaries.
+app.use('/api', (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
     next();
 });
 
@@ -1056,8 +1069,14 @@ async function getDedupCounts(dates) {
 
         console.log(`📊 Cache MISS: ${uncachedDates.length} uncached date(s) across ${ranges.length} range(s)`);
 
+        // Snapshot the epoch before the fetch. If an invalidation runs while
+        // we're awaiting Supabase, the epoch will change and we must NOT
+        // write the now-stale results back into the cache.
+        const epochAtStart = cache.invalidationEpoch;
+
         // Fetch each range, log, and cache in a single pass
         if (!cache.dedupTimestamps) cache.dedupTimestamps = {};
+        const computedByDate = {};
         for (const [minDate, maxDate] of ranges) {
             const events = await fetchEventsForDateRange(minDate, maxDate);
             const computed = computeDedupFromEvents(events);
@@ -1071,13 +1090,22 @@ async function getDedupCounts(dates) {
                 console.log(`📊 Dedup [${minDate}→${maxDate}]:`, JSON.stringify(dayCounts));
             }
 
-            // Store in cache — only for dates we actually need
+            // Collect computed results so we can return them even if we
+            // skip the cache write below.
             for (const d of uncachedDates) {
                 if (d >= minDate && d <= maxDate) {
-                    cache.dedupCounts[d] = computed[d] || {};
-                    if (d === today) cache.dedupTimestamps[d] = Date.now();
+                    computedByDate[d] = computed[d] || {};
                 }
             }
+        }
+
+        if (cache.invalidationEpoch === epochAtStart) {
+            for (const [d, counts] of Object.entries(computedByDate)) {
+                cache.dedupCounts[d] = counts;
+                if (d === today) cache.dedupTimestamps[d] = Date.now();
+            }
+        } else {
+            console.log(`⚠️  Cache: skipped dedup write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${cache.invalidationEpoch})`);
         }
 
         // Prune dedup cache: drop dates older than 120 days to prevent unbounded growth (#5)
@@ -1087,6 +1115,16 @@ async function getDedupCounts(dates) {
         for (const d of Object.keys(cache.dedupCounts)) {
             if (d < pruneISO) delete cache.dedupCounts[d];
         }
+
+        // Caller gets accurate numbers regardless of whether we wrote them
+        // to the cache. Merge freshly computed values into the result first,
+        // then layer cache reads for dates we didn't refetch.
+        const result = {};
+        for (const d of dates) {
+            if (computedByDate[d]) result[d] = computedByDate[d];
+            else if (cache.dedupCounts[d]) result[d] = cache.dedupCounts[d];
+        }
+        return result;
     } else {
         cache.hits++;
     }
@@ -1113,6 +1151,10 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 return res.json(cache.metricsResponse);
             }
         }
+
+        // Snapshot the epoch before the Supabase fetch + dedup join so we
+        // can detect a mid-flight invalidation and skip the cache write.
+        const epochAtStart = cache.invalidationEpoch;
 
         const { data, error, count } = await supabase
             .from('daily_metrics')
@@ -1174,9 +1216,16 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         const response = { data: formatted, total: count };
 
         // ── Store in response cache (only for default pagination) ────────
+        // Skip the write if an invalidation ran mid-flight — the response
+        // we just built reflects pre-invalidation Supabase state and would
+        // mask the new data for up to metricsTTL.
         if (Number(limit) === 90 && Number(offset) === 0) {
-            cache.metricsResponse = response;
-            cache.metricsUpdatedAt = now;
+            if (cache.invalidationEpoch === epochAtStart) {
+                cache.metricsResponse = response;
+                cache.metricsUpdatedAt = now;
+            } else {
+                console.log(`⚠️  Cache: skipped metricsResponse write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${cache.invalidationEpoch})`);
+            }
         }
 
         res.json(response);
@@ -1437,6 +1486,8 @@ if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
         console.log('🔄 FB sync cron triggered');
         try {
             await syncFacebookSpend();
+            invalidateMetricsCache();
+            invalidateInsightsCache();
         } catch (err) {
             console.error('❌ FB sync cron failed:', err.message);
         }
@@ -1457,6 +1508,8 @@ if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
             console.log(`🌙 Daily 4 AM cron: fetching final ad insights for ${yesterdayISO}`);
             const insights = await fetchFacebookInsights(yesterdayISO);
             await writeInsightsToSupabase(yesterdayISO, insights);
+            invalidateMetricsCache();
+            invalidateInsightsCache();
             console.log(`✅ Daily 4 AM cron: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks written for ${yesterdayISO}`);
         } catch (err) {
             console.error('❌ Daily 4 AM ad-spend cron failed:', err.message);
@@ -1475,6 +1528,8 @@ app.post('/api/fb-sync', webhookLimiter, authenticateWebhook, async (req, res) =
         if (!result) {
             return res.status(400).json({ error: 'FB sync not configured — check FB_ACCESS_TOKEN and FB_AD_ACCOUNT_ID' });
         }
+        invalidateMetricsCache();
+        invalidateInsightsCache();
         res.json({ success: true, ...result });
     } catch (err) {
         res.status(500).json({ error: 'FB sync failed', detail: err.message });
@@ -1652,6 +1707,12 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
             console.log('📦 Cache HIT: insights context');
         } else {
             console.log('📊 Cache MISS: fetching insights context from Supabase');
+
+            // Snapshot the epoch before the async fetches. If an invalidation
+            // runs while we're waiting on Supabase, skip the cache write so
+            // the next request rebuilds from fresh state.
+            const epochAtStart = cache.invalidationEpoch;
+
             const [metricsRes, eventsRes] = await Promise.all([
                 supabase.from('daily_metrics').select('*').order('date', { ascending: false }).limit(90),
                 supabase.from('events').select('event_type, name, email, event_time').order('event_time', { ascending: false }).limit(500),
@@ -1719,9 +1780,14 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
                 dailyEventCounts[date][type] = count;
             }
 
-            // Store in cache
-            cache.insightsContext = { metricsData, dailyEventCounts, recentEvents };
-            cache.insightsUpdatedAt = now;
+            // Store in cache only if no invalidation occurred mid-fetch.
+            // The current request still uses the freshly built context.
+            if (cache.invalidationEpoch === epochAtStart) {
+                cache.insightsContext = { metricsData, dailyEventCounts, recentEvents };
+                cache.insightsUpdatedAt = now;
+            } else {
+                console.log(`⚠️  Cache: skipped insightsContext write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${cache.invalidationEpoch})`);
+            }
         }
 
         const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
