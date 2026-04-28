@@ -1140,6 +1140,67 @@ async function getDedupCounts(dates) {
     return result;
 }
 
+// ─── Day Finalization ─────────────────────────────────────────────────────────
+// Compute deduped event counts for a date and write them into the canonical
+// columns of daily_metrics, then mark the row as finalized. After this runs,
+// /api/metrics reads the row directly without consulting the events table.
+//
+// Safety: a field is only overwritten when dedup found events for it. Legacy
+// raw values are preserved when dedup says zero (e.g. days that pre-date the
+// events table). The overrides JSONB column is never touched.
+async function finalizeDailyMetricsForDate(isoDate) {
+    // 60-day lookback so we capture late-arriving events whose
+    // webinar_datetime_utc resolves to isoDate (people register early).
+    const target = new Date(isoDate + 'T12:00:00Z');
+    const fromDate = new Date(target);
+    fromDate.setUTCDate(fromDate.getUTCDate() - 60);
+    const toDate = new Date(target);
+    toDate.setUTCDate(toDate.getUTCDate() + 1);
+    const fromISO = fromDate.toISOString().slice(0, 10);
+    const toISO = toDate.toISOString().slice(0, 10);
+
+    const events = await fetchEventsForDateRange(fromISO, toISO);
+    const dedupMap = computeDedupFromEvents(events);
+    const counts = dedupMap[isoDate] || {};
+
+    const FIELDS = [
+        'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
+        'purchases_fb', 'purchases_native', 'purchases_youtube',
+        'purchases_aibot', 'purchases_postwebinar',
+    ];
+
+    const updates = { finalized_at: new Date().toISOString() };
+    const written = {};
+    for (const f of FIELDS) {
+        const v = Number(counts[f]) || 0;
+        if (v > 0) {
+            updates[f] = v;
+            written[f] = v;
+        }
+    }
+
+    // Ensure the row exists. Create with day_of_week if not.
+    const { data: existing } = await supabase
+        .from('daily_metrics').select('date').eq('date', isoDate).maybeSingle();
+    if (!existing) {
+        const dayOfWeek = new Date(isoDate + 'T12:00:00Z').toLocaleDateString('en-US', {
+            weekday: 'long', timeZone: 'America/Los_Angeles',
+        });
+        await supabase.from('daily_metrics')
+            .upsert({ date: isoDate, day_of_week: dayOfWeek }, { onConflict: 'date' });
+    }
+
+    const { error } = await supabase.from('daily_metrics')
+        .update(updates).eq('date', isoDate);
+    if (error) throw error;
+
+    invalidateMetricsCache();
+    invalidateInsightsCache();
+    delete cache.dedupCounts[isoDate];
+
+    return { date: isoDate, written };
+}
+
 // GET /api/metrics — Fetch all daily metrics (with caching)
 app.get('/api/metrics', dashboardLimiter, async (req, res) => {
     try {
@@ -1168,8 +1229,14 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
 
         if (error) throw error;
 
-        // ── Dedup counts: uses per-day cache ──────────────────────────────
-        const dates = (data || []).map(r => String(r.date).substring(0, 10));
+        // ── Dedup counts: only for non-finalized rows ─────────────────────
+        // Finalized rows already have dedup-derived values written into
+        // their canonical columns (4:05 AM cron / backfill), so we skip the
+        // events-table query for them. Today and any failed-finalization day
+        // still go through dedup.
+        const dates = (data || [])
+            .filter(r => !r.finalized_at)
+            .map(r => String(r.date).substring(0, 10));
         const dedupMap = await getDedupCounts(dates);
 
         // Convert to frontend format (MM/DD/YYYY)
@@ -1455,6 +1522,48 @@ app.post('/api/cache/clear', requireAuth, async (req, res) => {
     res.json({ success: true, message: `Cache cleared (${daysBefore} days flushed)` });
 });
 
+// POST /api/admin/finalize-past-days — One-shot backfill.
+// Walks every daily_metrics row with date < today and finalized_at IS NULL,
+// runs finalizeDailyMetricsForDate on each, and reports the result. Safe to
+// re-run: rows already finalized are skipped. The 4:05 AM cron handles
+// each new yesterday going forward, so this only needs to run once.
+//
+// Optional body: { force: true } — re-finalize rows even if finalized_at is set.
+app.post('/api/admin/finalize-past-days', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const { force = false } = req.body || {};
+        const todayISO = dateToISO(getLADate());
+
+        let q = supabase.from('daily_metrics')
+            .select('date, finalized_at')
+            .lt('date', todayISO)
+            .order('date', { ascending: true });
+        if (!force) q = q.is('finalized_at', null);
+
+        const { data: rows, error } = await q;
+        if (error) throw error;
+
+        const results = [];
+        for (const row of rows || []) {
+            const isoDate = String(row.date).substring(0, 10);
+            try {
+                const r = await finalizeDailyMetricsForDate(isoDate);
+                results.push({ date: isoDate, ok: true, written: r.written });
+            } catch (err) {
+                console.error(`❌ Finalize ${isoDate} failed:`, err.message);
+                results.push({ date: isoDate, ok: false, error: err.message });
+            }
+        }
+
+        const okCount = results.filter(r => r.ok).length;
+        console.log(`🧊 Backfill: finalized ${okCount}/${results.length} past days (force=${force}) by ${req.user.email}`);
+        res.json({ total: results.length, finalized: okCount, results });
+    } catch (err) {
+        console.error('❌ POST /api/admin/finalize-past-days error:', err.message);
+        res.status(500).json({ error: 'Backfill failed', detail: err.message });
+    }
+});
+
 // =============================================================================
 // HEALTH CHECK
 // =============================================================================
@@ -1502,18 +1611,19 @@ if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
         }
     }, { timezone: 'America/Los_Angeles' });
 
+    // Helper: yesterday in LA as YYYY-MM-DD.
+    const computeYesterdayLA = () => {
+        const now = new Date();
+        const y = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+        y.setDate(y.getDate() - 1);
+        return `${y.getFullYear()}-${String(y.getMonth() + 1).padStart(2, '0')}-${String(y.getDate()).padStart(2, '0')}`;
+    };
+
     // Cron: daily at 4:00 AM PST — fetch *yesterday's* final ad spend
     // By 4 AM the previous day's data is fully settled in Facebook's reporting
     cron.schedule('0 4 * * *', async () => {
         try {
-            const now = new Date();
-            const yesterdayLA = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-            yesterdayLA.setDate(yesterdayLA.getDate() - 1);
-            const y = yesterdayLA.getFullYear();
-            const m = String(yesterdayLA.getMonth() + 1).padStart(2, '0');
-            const d = String(yesterdayLA.getDate()).padStart(2, '0');
-            const yesterdayISO = `${y}-${m}-${d}`;
-
+            const yesterdayISO = computeYesterdayLA();
             console.log(`🌙 Daily 4 AM cron: fetching final ad insights for ${yesterdayISO}`);
             const insights = await fetchFacebookInsights(yesterdayISO);
             await writeInsightsToSupabase(yesterdayISO, insights);
@@ -1522,6 +1632,21 @@ if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
             console.log(`✅ Daily 4 AM cron: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks written for ${yesterdayISO}`);
         } catch (err) {
             console.error('❌ Daily 4 AM ad-spend cron failed:', err.message);
+        }
+    }, { timezone: 'America/Los_Angeles' });
+
+    // Cron: daily at 4:05 AM PST — finalize yesterday's deduped event counts
+    // into the canonical daily_metrics columns. Runs after the 4:00 AM FB
+    // sync so spend/link clicks are settled. After finalization, /api/metrics
+    // reads yesterday's row directly and skips the dedup engine.
+    cron.schedule('5 4 * * *', async () => {
+        try {
+            const yesterdayISO = computeYesterdayLA();
+            console.log(`🧊 Daily 4:05 AM cron: finalizing daily_metrics for ${yesterdayISO}`);
+            const result = await finalizeDailyMetricsForDate(yesterdayISO);
+            console.log(`✅ Finalized ${yesterdayISO}: ${JSON.stringify(result.written)}`);
+        } catch (err) {
+            console.error('❌ Daily 4:05 AM finalize cron failed:', err.message);
         }
     }, { timezone: 'America/Los_Angeles' });
 
@@ -1727,9 +1852,12 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
                 supabase.from('events').select('event_type, name, email, event_time').order('event_time', { ascending: false }).limit(500),
             ]);
 
-            // Build dedup-aware metrics (same priority chain as GET /api/metrics)
+            // Build dedup-aware metrics (same priority chain as GET /api/metrics).
+            // Skip dedup for finalized rows — their canonical columns are authoritative.
             const rawRows = metricsRes.data || [];
-            const dates = rawRows.map(r => String(r.date).substring(0, 10));
+            const dates = rawRows
+                .filter(r => !r.finalized_at)
+                .map(r => String(r.date).substring(0, 10));
             const dedupMap = await getDedupCounts(dates);
 
             metricsData = rawRows.map(r => {

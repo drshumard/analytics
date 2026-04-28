@@ -115,6 +115,12 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Cache clear failed: ${res.status}`); }
     return res.json();
   },
+  async finalizePastDays() {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/admin/finalize-past-days`, { method: "POST", headers, body: JSON.stringify({}) });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Finalize failed: ${res.status}`); }
+    return res.json();
+  },
 };
 
 function getLocalKey() {
@@ -417,6 +423,26 @@ export default function App() {
     }
   }, [loadData, flash]);
 
+  const [finalizing, setFinalizing] = useState(false);
+  const finalizePastDays = useCallback(async () => {
+    if (finalizing) return;
+    if (!window.confirm("Finalize all past days? This freezes their values from the events table. Safe to run multiple times — already-finalized days are skipped.")) return;
+    setFinalizing(true);
+    flash("Finalizing past days…", "ok");
+    try {
+      const body = await api.finalizePastDays();
+      await loadData();
+      const msg = body.total === 0
+        ? "All past days are already finalized."
+        : `Finalized ${body.finalized}/${body.total} past day${body.total === 1 ? "" : "s"}.`;
+      flash(msg, "ok");
+    } catch (e) {
+      flash(e.message || "Finalize failed", "err");
+    } finally {
+      setFinalizing(false);
+    }
+  }, [finalizing, loadData, flash]);
+
   const recalcSpend = useCallback(async (dateRaw) => {
     const iso = dateRaw.includes('/') ? dateRaw.replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$1-$2') : dateRaw;
     flash(`Recalculating spend for ${iso}…`, "ok");
@@ -648,6 +674,7 @@ export default function App() {
           <div className="nav-buttons-desktop">
             <button style={S.btnGhost} onClick={refreshWebhook} title="Refresh Spend Data"><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={15} stroke="#8A8A88" /></button>
             <button style={S.btnLight} onClick={clearCache}>Clear Cache</button>
+            {isAdmin && <button style={{ ...S.btnLight, opacity: finalizing ? 0.6 : 1 }} disabled={finalizing} onClick={finalizePastDays} title="Freeze deduped values for all past days into the canonical columns">{finalizing ? "Finalizing…" : "Finalize Past Days"}</button>}
             {view === "dash" && (
               <>
                 <button style={S.btnLight} onClick={() => setView("insights")}>Insights</button>
@@ -676,6 +703,7 @@ export default function App() {
               <button className="mobile-nav-item" onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}><I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" size={16} stroke="#6B7280" /> Activity Log</button>
               {isAdmin && <button className="mobile-nav-item" onClick={() => setView("query")}><I d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" size={16} stroke="#6B7280" /> Query Data</button>}
               {isAdmin && <button className="mobile-nav-item" onClick={() => { setEditCM(null); setView("custom-list"); }}><I d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" size={16} stroke="#6B7280" /> Manage Metrics</button>}
+              {isAdmin && <button className="mobile-nav-item" disabled={finalizing} onClick={finalizePastDays}><I d="M12 4v16m8-8H4" size={16} stroke="#6B7280" /> {finalizing ? "Finalizing…" : "Finalize Past Days"}</button>}
               {isAdmin && <button className="mobile-nav-item mobile-nav-primary" onClick={() => { setEditRow(null); setView("entry"); }}><I d="M12 4v16m8-8H4" size={16} stroke="#fff" /> New Entry</button>}
             </>
           )}
