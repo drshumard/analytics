@@ -50,8 +50,9 @@ const api = {
     if (!res.ok) throw new Error(`Failed to fetch funnels: ${res.status}`);
     return res.json();
   },
-  async getMetrics(limit = 90, offset = 0) {
-    const res = await fetch(`${API_BASE}/api/metrics?limit=${limit}&offset=${offset}`, { headers: getFunnelHeaders() });
+  async getMetrics(limit = 90, offset = 0, variant = "all") {
+    const url = `${API_BASE}/api/metrics?limit=${limit}&offset=${offset}${variant && variant !== "all" ? `&variant=${encodeURIComponent(variant)}` : ""}`;
+    const res = await fetch(url, { headers: getFunnelHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch metrics: ${res.status}`);
     return res.json();
   },
@@ -161,8 +162,8 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "fb_link_clicks", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "purchases_cpa", "total_purchases", "attended"];
-const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", purchases_cpa: "CPA Traffic Funnel", total_purchases: "Total Purchases" };
+const MK = ["fb_spend", "fb_link_clicks", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "purchases_cpa", "stayed_45", "stayed_60", "stayed_80", "total_purchases", "attended"];
+const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", purchases_cpa: "CPA Traffic Funnel", stayed_45: "45 min", stayed_60: "60 min", stayed_80: "80 min", total_purchases: "Total Purchases" };
 const DEFAULT_HIDDEN = [];
 
 // Summary card defaults and metric options for the configurable summary strip
@@ -188,6 +189,9 @@ const SUMMARY_METRIC_OPTIONS = [
   { key: "purchases_aibot", label: "AI Chat Bot", defaultFormat: "number" },
   { key: "purchases_postwebinar", label: "Post Webinar", defaultFormat: "number" },
   { key: "purchases_cpa", label: "CPA Traffic Funnel", defaultFormat: "number" },
+  { key: "stayed_45", label: "45 min", defaultFormat: "number" },
+  { key: "stayed_60", label: "60 min", defaultFormat: "number" },
+  { key: "stayed_80", label: "80 min", defaultFormat: "number" },
   { key: "total_purchases", label: "Total Purchases (alt)", defaultFormat: "number" },
 ];
 const evalFormula = (f, row, ctx = {}) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(`\\b${k}\\b`, "gi"), String(Number(row[k]) || 0)); for (const [k, v] of Object.entries(ctx)) e = e.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi"), String(Number(v) || 0)); if (/[^0-9+\-*/().%\s]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
@@ -249,6 +253,7 @@ export default function App() {
   const [userRole, setUserRole] = useState(null);
   const [activeFunnel, setActiveFunnelState] = useState(() => getActiveFunnel());
   const [allowedFunnels, setAllowedFunnels] = useState([activeFunnel]);
+  const [variantFilter, setVariantFilter] = useState("all"); // 'all' | 'A' | 'B' | 'undetected' — split-test toggle (native only)
   const [authLoading, setAuthLoading] = useState(true);
   const [authEmail, setAuthEmail] = useState("");
   const [authPass, setAuthPass] = useState("");
@@ -281,8 +286,6 @@ export default function App() {
   const activeLens = (() => {
     const found = lenses.find(l => l.id === activeLensId);
     if (!found) return lenses[0] || { id: "default-all", name: "All Metrics", metrics: MK };
-    // "All Metrics" lens always uses the current full MK list
-    if (found.id === "default-all") return { ...found, metrics: MK };
     return found;
   })();
   const isColVisible = (col) => activeLens.metrics.includes(col);
@@ -368,7 +371,7 @@ export default function App() {
 
   const loadData = useCallback(async () => {
     try {
-      const [mRes, cRes] = await Promise.all([api.getMetrics(), api.getCustomMetrics()]);
+      const [mRes, cRes] = await Promise.all([api.getMetrics(90, 0, variantFilter), api.getCustomMetrics()]);
       setMetrics(mRes.data || []);
       setCustoms(cRes.data || []);
     } catch (e) {
@@ -377,7 +380,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [flash]);
+  }, [flash, variantFilter]);
 
   // ─── Auth ───────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -396,23 +399,44 @@ export default function App() {
 
   const fetchRole = async (token) => {
     try {
-      const res = await fetch(`${API_BASE}/api/me`, {
-        headers: { Authorization: `Bearer ${token}`, "X-Funnel": getActiveFunnel() },
-      });
-      const data = await res.json();
-      setUserRole(data.role || "viewer");
-      if (data.preferences?.default_lens_id) setActiveLensId(data.preferences.default_lens_id);
-      if (data.preferences?.col_order) setColOrder(data.preferences.col_order);
-      else if (data.default_col_order) setColOrder(data.default_col_order);
-      if (data.preferences?.summary_cards) setSummaryCards(data.preferences.summary_cards);
-      if (Array.isArray(data.allowed_funnels) && data.allowed_funnels.length > 0) {
-        setAllowedFunnels(data.allowed_funnels);
-        // If the persisted active funnel isn't in the allowed list, snap to the first allowed.
-        if (!data.allowed_funnels.includes(getActiveFunnel())) {
-          const first = data.allowed_funnels[0];
-          setActiveFunnelLS(first);
-          setActiveFunnelState(first);
+      // ── Step 1: Discover allowed funnels ────────────────────────────
+      // /api/me/funnels does NOT enforce funnel access (it's the bootstrap
+      // endpoint). We must hit this FIRST so we know which funnel to send
+      // on subsequent authenticated requests — otherwise a stale localStorage
+      // funnel value can lock the user out of their own dashboard.
+      let allowed = ["analytics"];
+      try {
+        const fr = await fetch(`${API_BASE}/api/me/funnels`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (fr.ok) {
+          const fd = await fr.json();
+          if (Array.isArray(fd.funnels) && fd.funnels.length > 0) allowed = fd.funnels;
         }
+      } catch { /* fall back to analytics */ }
+      setAllowedFunnels(allowed);
+
+      // Snap activeFunnel to a valid one before any other authenticated call
+      let active = getActiveFunnel();
+      if (!allowed.includes(active)) {
+        active = allowed[0];
+        setActiveFunnelLS(active);
+        setActiveFunnelState(active);
+      }
+
+      // ── Step 2: Now safely call /api/me with a valid funnel ─────────
+      const res = await fetch(`${API_BASE}/api/me`, {
+        headers: { Authorization: `Bearer ${token}`, "X-Funnel": active },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setUserRole(data.role || "viewer");
+        if (data.preferences?.default_lens_id) setActiveLensId(data.preferences.default_lens_id);
+        if (data.preferences?.col_order) setColOrder(data.preferences.col_order);
+        else if (data.default_col_order) setColOrder(data.default_col_order);
+        if (data.preferences?.summary_cards) setSummaryCards(data.preferences.summary_cards);
+      } else {
+        setUserRole("viewer");
       }
     } catch { setUserRole("viewer"); }
     setAuthLoading(false);
@@ -449,6 +473,7 @@ export default function App() {
   const funnelMountedRef = useRef(false);
   useEffect(() => {
     if (!funnelMountedRef.current) { funnelMountedRef.current = true; return; }
+    setVariantFilter("all"); // variant toggle is per-funnel; reset on switch
     if (session?.access_token) fetchRole(session.access_token);
     loadData();
     fetchLenses();
@@ -918,6 +943,19 @@ export default function App() {
                   <div style={viewMode === "list" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("list")}><I d="M4 6h16M4 12h16M4 18h16" size={14} /> List</div>
                   <div style={viewMode === "board" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("board")}><I d="M4 4h4v16H4zM10 4h4v16h-4zM16 4h4v16h-4z" size={14} /> Board</div>
                 </div>
+                {activeFunnel === "native" && (
+                  <div className="variant-toggle" style={S.listBoardToggle} title="Split test variant filter">
+                    {["all", "A", "B", "undetected"].map(v => (
+                      <div
+                        key={v}
+                        style={variantFilter === v ? S.listToggleActive : S.listToggleInactive}
+                        onClick={() => setVariantFilter(v)}
+                      >
+                        {v === "all" ? "All" : v === "undetected" ? "Undetected" : v}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <button style={S.btnLight} onClick={() => setColEditorOpen(true)}><I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" size={14} stroke="#6B7280" /> Edit Columns</button>
                 <div style={{ position: "relative" }} ref={lensMenuRef}>
                   <button style={S.btnLight} onClick={() => setLensMenuOpen(p => !p)}><I d="M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" size={14} stroke="#6B7280" /> {activeLens.name} ▾</button>
@@ -1138,7 +1176,7 @@ export default function App() {
       {delConfirm && <Modal title="Delete Entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
       {delCM && <Modal title="Delete Custom Metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
       {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
-      {colEditorOpen && <ColumnEditor columns={orderedCols} isAdmin={isAdmin} onSave={(keys) => { saveColOrder(keys); setColEditorOpen(false); }} onCancel={() => setColEditorOpen(false)} />}
+      {colEditorOpen && <ColumnEditor columns={orderedCols.filter(c => c.type !== "base" || isColVisible(c.key))} isAdmin={isAdmin} onSave={(keys) => { saveColOrder(keys); setColEditorOpen(false); }} onCancel={() => setColEditorOpen(false)} />}
       {summaryEditorOpen && <SummaryEditor cards={summaryCards} customs={customs} onSave={(cards) => { saveSummaryCards(cards); setSummaryEditorOpen(false); flash("Summary cards updated"); }} onCancel={() => setSummaryEditorOpen(false)} />}
       {toast && (<div className="fi" style={{ ...S.toast, borderLeft: `3px solid ${toast.type === "ok" ? "#12864A" : "#D92D20"}` }}><I d={toast.type === "ok" ? "M20 6L9 17l-5-5" : "M12 2a10 10 0 100 20 10 10 0 000-20zM12 8v4M12 16h.01"} size={16} stroke={toast.type === "ok" ? "#12864A" : "#D92D20"} sw={2.2} />{toast.msg}</div>)}
     </div>
@@ -1336,7 +1374,14 @@ function ColumnEditor({ columns, onSave, onCancel, isAdmin }) {
     setOverIdx(null);
   };
 
-  const reset = () => setItems(MK.filter(k => COL_LABELS[k]).map(k => ({ key: k, label: COL_LABELS[k], type: "base" })).concat(columns.filter(c => c.type === "custom")));
+  // Reset = natural MK order, filtered to whatever base columns the current
+  // lens shows (so "Reset" doesn't bring hidden columns back).
+  const visibleBaseKeys = new Set(columns.filter(c => c.type === "base").map(c => c.key));
+  const reset = () => setItems(
+    MK.filter(k => COL_LABELS[k] && visibleBaseKeys.has(k))
+      .map(k => ({ key: k, label: COL_LABELS[k], type: "base" }))
+      .concat(columns.filter(c => c.type === "custom"))
+  );
   const CE = {
     list: { display: "flex", flexDirection: "column", gap: 2, maxHeight: 400, overflowY: "auto", marginBottom: 20 },
     item: (isDragging, isOver) => ({ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: isDragging ? "#EEF2FF" : isOver ? "#F0FDF4" : "#F9FAFB", border: `1px solid ${isDragging ? "#818CF8" : isOver ? "#86EFAC" : "#E5E7EB"}`, borderRadius: 8, cursor: "grab", transition: "all 150ms ease", opacity: isDragging ? 0.6 : 1, transform: isDragging ? "scale(0.98)" : "scale(1)" }),
@@ -1425,12 +1470,12 @@ function Modal({ title, msg, onCancel, onConfirm }) {
 function EntryForm({ initial, onSubmit, onCancel, isMobile }) {
   const today = getLADate();
   const defaults = initial
-    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, registrations: initial.registrations ?? 0, replays: initial.replays ?? 0, viewedcta: initial.viewedcta ?? 0, clickedcta: initial.clickedcta ?? 0, purchases_fb: initial.purchases_fb ?? 0, purchases_native: initial.purchases_native ?? 0, purchases_youtube: initial.purchases_youtube ?? 0, purchases_aibot: initial.purchases_aibot ?? 0, purchases_postwebinar: initial.purchases_postwebinar ?? 0, purchases_cpa: initial.purchases_cpa ?? 0, attended: initial.attended ?? 0 }
-    : { fb_spend: "", fb_link_clicks: "", registrations: "", replays: "", viewedcta: "", clickedcta: "", purchases_fb: "", purchases_native: "", purchases_youtube: "", purchases_aibot: "", purchases_postwebinar: "", purchases_cpa: "", attended: "" };
+    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, registrations: initial.registrations ?? 0, replays: initial.replays ?? 0, viewedcta: initial.viewedcta ?? 0, clickedcta: initial.clickedcta ?? 0, purchases_fb: initial.purchases_fb ?? 0, purchases_native: initial.purchases_native ?? 0, purchases_youtube: initial.purchases_youtube ?? 0, purchases_aibot: initial.purchases_aibot ?? 0, purchases_postwebinar: initial.purchases_postwebinar ?? 0, purchases_cpa: initial.purchases_cpa ?? 0, stayed_45: initial.stayed_45 ?? 0, stayed_60: initial.stayed_60 ?? 0, stayed_80: initial.stayed_80 ?? 0, attended: initial.attended ?? 0 }
+    : { fb_spend: "", fb_link_clicks: "", registrations: "", replays: "", viewedcta: "", clickedcta: "", purchases_fb: "", purchases_native: "", purchases_youtube: "", purchases_aibot: "", purchases_postwebinar: "", purchases_cpa: "", stayed_45: "", stayed_60: "", stayed_80: "", attended: "" };
   const [f, setF] = useState({ date: initial?.date || today, ...defaults });
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
-  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases_fb: parseInt(f.purchases_fb) || 0, purchases_native: parseInt(f.purchases_native) || 0, purchases_youtube: parseInt(f.purchases_youtube) || 0, purchases_aibot: parseInt(f.purchases_aibot) || 0, purchases_postwebinar: parseInt(f.purchases_postwebinar) || 0, purchases_cpa: parseInt(f.purchases_cpa) || 0, attended: parseInt(f.attended) || 0 });
-  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Total Reg. Page Visited", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases_fb", l: "FB Purchases", ph: "0" }, { k: "purchases_native", l: "Native Ads", ph: "0" }, { k: "purchases_youtube", l: "Youtube", ph: "0" }, { k: "purchases_aibot", l: "AI Chat Bot", ph: "0" }, { k: "purchases_postwebinar", l: "Post Webinar", ph: "0" }, { k: "purchases_cpa", l: "CPA Traffic Funnel", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
+  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases_fb: parseInt(f.purchases_fb) || 0, purchases_native: parseInt(f.purchases_native) || 0, purchases_youtube: parseInt(f.purchases_youtube) || 0, purchases_aibot: parseInt(f.purchases_aibot) || 0, purchases_postwebinar: parseInt(f.purchases_postwebinar) || 0, purchases_cpa: parseInt(f.purchases_cpa) || 0, stayed_45: parseInt(f.stayed_45) || 0, stayed_60: parseInt(f.stayed_60) || 0, stayed_80: parseInt(f.stayed_80) || 0, attended: parseInt(f.attended) || 0 });
+  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Total Reg. Page Visited", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases_fb", l: "FB Purchases", ph: "0" }, { k: "purchases_native", l: "Native Ads", ph: "0" }, { k: "purchases_youtube", l: "Youtube", ph: "0" }, { k: "purchases_aibot", l: "AI Chat Bot", ph: "0" }, { k: "purchases_postwebinar", l: "Post Webinar", ph: "0" }, { k: "purchases_cpa", l: "CPA Traffic Funnel", ph: "0" }, { k: "stayed_45", l: "45 min", ph: "0" }, { k: "stayed_60", l: "60 min", ph: "0" }, { k: "stayed_80", l: "80 min", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
   return (
     <div className="fi form-container" style={S.fc}>
       <div style={S.fh}><div style={{ ...S.formBadge, background: initial ? "#EFF8FF" : "#ECFDF3", color: initial ? "#175CD3" : "#12864A" }}>{initial ? "EDIT ENTRY" : "NEW ENTRY"}</div><h2 style={S.ft}>{initial ? `Update ${fmtDateNice(initial.date)}` : "Add Daily Metrics"}</h2><p style={S.fs}>Enter metrics for the day. Fields default to 0 if empty.</p></div>

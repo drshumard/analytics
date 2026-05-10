@@ -489,7 +489,7 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
         const { field, count = 1, name, email, phone, execution_id, ...rest } = req.body;
         // Purchase source columns are NOT in validFields — purchases must always go through
         // field:'purchases' with a 'source' param so source routing and Post Webinar detection run.
-        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended'];
+        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'stayeduntil'];
 
         // ── Purchase source mapping ──────────────────────────────────────
         const PURCHASE_SOURCE_MAP = {
@@ -499,6 +499,10 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             'AI Bot':      'purchases_aibot',
             'CPA Traffic': 'purchases_cpa',
         };
+
+        // ── Webinar engagement milestone mapping ─────────────────────────
+        // field='stayeduntil' + body.stayeduntil ∈ {45,60,80} → stayed_NN column
+        const STAYED_MAP = { 45: 'stayed_45', 60: 'stayed_60', 80: 'stayed_80' };
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -621,6 +625,17 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             console.log(`🛒 Purchase source: "${rawSource}" → ${sourceColumn}`);
         }
 
+        // ── Engagement milestone routing ─────────────────────────────
+        if (field === 'stayeduntil') {
+            const minute = Number(rest.stayeduntil);
+            const col = STAYED_MAP[minute];
+            if (!col) {
+                return res.status(400).json({ error: 'stayeduntil must be 45, 60, or 80' });
+            }
+            incrementField = col;
+            console.log(`⏱️  Stayeduntil: ${minute}min → ${col}`);
+        }
+
         // ── Step 1: Record the event FIRST (source of truth for dedup) ──
         // This must land before the counter increment so retries are safe:
         //   - Event fails → counter untouched → retry is clean
@@ -698,7 +713,7 @@ app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, re
     try {
         const supabase = clientFor(req.funnel);
         const { field, value, date: dateInput } = req.body;
-        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa', 'attended'];
+        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa', 'stayed_45', 'stayed_60', 'stayed_80', 'attended'];
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -1059,7 +1074,10 @@ app.delete('/api/lenses/:id', dashboardLimiter, requireAuth, async (req, res) =>
 // Computes deduplicated event counts per day. Past days are cached forever
 // (their counts can't change). Today's counts are recomputed when invalidated
 // by a webhook. This eliminates ~95% of Supabase events-table egress.
-const EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', 'purchases'];
+const EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'stayeduntil'];
+
+// stayeduntil events use metadata.stayeduntil (45|60|80) as the sub-key
+const STAYED_DEDUP_MAP = { 45: 'stayed_45', 60: 'stayed_60', 80: 'stayed_80' };
 
 // Map purchase event metadata.source to the dedup sub-key
 const PURCHASE_DEDUP_MAP = {
@@ -1071,13 +1089,53 @@ const PURCHASE_DEDUP_MAP = {
     'CPA Traffic':   'purchases_cpa',
 };
 
+// Allowed variant buckets. 'all' is computed as the sum of the others.
+const VARIANT_BUCKETS = ['A', 'B', 'undetected'];
+
+// Returns: { 'YYYY-MM-DD': { event_type: { all, A, B, undetected } } }
+//
+// Variant attribution rules:
+//   - Registration events use their own metadata.variant if present
+//   - All other events (attended, viewedcta, ..., purchases) inherit the
+//     variant from the user's FIRST registration (by event_time), looked up
+//     via lowercased email
+//   - Events with no email or no matching registration → 'undetected'
+//
+// 'all' = A + B + undetected. This holds because first-registration-wins
+// guarantees each user is bucketed into exactly one variant.
 function computeDedupFromEvents(events) {
-    const sets = {}; // key: "YYYY-MM-DD|event_type" → Set of user keys
+    // ── Pass 1: build email → variant map from registrations (first wins) ──
+    const sortedRegs = events
+        .filter(ev => ev.event_type === 'registrations' && ev.email)
+        .sort((a, b) => new Date(a.event_time) - new Date(b.event_time));
+    const emailToVariant = {};
+    for (const ev of sortedRegs) {
+        const raw = ev.metadata?.variant;
+        if (raw === undefined || raw === null || raw === '') continue;
+        const v = String(raw).trim().toUpperCase();
+        if (v !== 'A' && v !== 'B') continue; // ignore unrecognized variants
+        const k = ev.email.toLowerCase();
+        if (!(k in emailToVariant)) emailToVariant[k] = v;
+    }
+
+    const variantOf = (ev) => {
+        if (ev.event_type === 'registrations') {
+            const raw = ev.metadata?.variant;
+            if (raw !== undefined && raw !== null && raw !== '') {
+                const v = String(raw).trim().toUpperCase();
+                if (v === 'A' || v === 'B') return v;
+            }
+        }
+        const k = (ev.email || '').toLowerCase();
+        if (k && emailToVariant[k]) return emailToVariant[k];
+        return 'undetected';
+    };
+
+    // ── Pass 2: bucket events into (date, event_type, variant) sets ──
+    const sets = {}; // key: "YYYY-MM-DD|event_type|variant" → Set of user keys
     for (const ev of events) {
         let d;
         if (ev.metadata?.webinar_datetime_utc) {
-            // Use webinar date for any event type that includes it (registrations, attended, replays, etc.)
-            // Falls through to event_time for old data that doesn't have this field
             const cleaned = ev.metadata.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
             const parsed = new Date(cleaned + ' UTC');
             d = !isNaN(parsed.getTime())
@@ -1087,26 +1145,39 @@ function computeDedupFromEvents(events) {
             d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
         }
 
-        // For purchases, break down by source into sub-keys (purchases_fb, purchases_native, etc.)
         let eventKey = ev.event_type;
         if (ev.event_type === 'purchases') {
             const src = ev.metadata?.source || 'Paid Ads';
-            // Map event source to sub-key; unrecognized sources default to purchases_fb
-            // for backward compat with old events that have no metadata.source
             eventKey = PURCHASE_DEDUP_MAP[src] || 'purchases_fb';
+        } else if (ev.event_type === 'stayeduntil') {
+            const minute = Number(ev.metadata?.stayeduntil);
+            eventKey = STAYED_DEDUP_MAP[minute];
+            if (!eventKey) continue; // skip events with invalid milestone
         }
 
-        const k = `${d}|${eventKey}`;
-        if (!sets[k]) sets[k] = new Set();
         const userKey = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
-        if (userKey) sets[k].add(userKey);
+        if (!userKey) continue;
+
+        const variant = variantOf(ev);
+        const k = `${d}|${eventKey}|${variant}`;
+        if (!sets[k]) sets[k] = new Set();
+        sets[k].add(userKey);
     }
+
+    // ── Pass 3: build result with per-variant breakdown + 'all' total ──
     const result = {};
     for (const [k, userSet] of Object.entries(sets)) {
         if (userSet.size === 0) continue;
-        const [d, type] = k.split('|');
+        const [d, type, variant] = k.split('|');
         if (!result[d]) result[d] = {};
-        result[d][type] = userSet.size;
+        if (!result[d][type]) result[d][type] = { all: 0, A: 0, B: 0, undetected: 0 };
+        result[d][type][variant] = (result[d][type][variant] || 0) + userSet.size;
+    }
+    for (const d of Object.keys(result)) {
+        for (const type of Object.keys(result[d])) {
+            const b = result[d][type];
+            b.all = (b.A || 0) + (b.B || 0) + (b.undetected || 0);
+        }
     }
     return result;
 }
@@ -1291,12 +1362,14 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
         'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
         'purchases_fb', 'purchases_native', 'purchases_youtube',
         'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa',
+        'stayed_45', 'stayed_60', 'stayed_80',
     ];
 
     const updates = { finalized_at: new Date().toISOString() };
     const written = {};
     for (const f of FIELDS) {
-        const v = Number(counts[f]) || 0;
+        // counts[f] is the per-variant breakdown; canonical columns store the total
+        const v = Number(counts[f]?.all) || 0;
         if (v > 0) {
             updates[f] = v;
             written[f] = v;
@@ -1331,11 +1404,13 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         const funnel = resolveFunnel(req, 'analytics');
         const supabase = clientFor(funnel);
         const bucket = getCacheBucket(funnel);
-        const { limit = 90, offset = 0 } = req.query;
+        const { limit = 90, offset = 0, variant: variantRaw = 'all' } = req.query;
+        const ALLOWED_VARIANTS = ['all', 'A', 'B', 'undetected'];
+        const variant = ALLOWED_VARIANTS.includes(String(variantRaw)) ? String(variantRaw) : 'all';
 
-        // ── Response cache: serve cached response if fresh ────────────────
+        // ── Response cache: only used for variant='all' (default view) ────
         const now = Date.now();
-        if (bucket.metricsResponse && (now - bucket.metricsUpdatedAt) < cache.metricsTTL) {
+        if (variant === 'all' && bucket.metricsResponse && (now - bucket.metricsUpdatedAt) < cache.metricsTTL) {
             // Only serve cache if request params match (default pagination)
             if (Number(limit) === 90 && Number(offset) === 0) {
                 cache.hits++;
@@ -1356,13 +1431,12 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
 
         if (error) throw error;
 
-        // ── Dedup counts: only for non-finalized rows ─────────────────────
-        // Finalized rows already have dedup-derived values written into
-        // their canonical columns (4:05 AM cron / backfill), so we skip the
-        // events-table query for them. Today and any failed-finalization day
-        // still go through dedup.
+        // ── Dedup counts ──────────────────────────────────────────────────
+        // For variant='all', skip dedup on finalized rows (canonical columns
+        // hold the total). For variant filtering, ALWAYS run dedup since the
+        // canonical columns don't carry per-variant breakdowns.
         const dates = (data || [])
-            .filter(r => !r.finalized_at)
+            .filter(r => variant !== 'all' || !r.finalized_at)
             .map(r => String(r.date).substring(0, 10));
         const dedupMap = await getDedupCounts(funnel, dates);
 
@@ -1382,11 +1456,18 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             const DEDUP_COLS = new Set([
                 'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
                 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa',
+                'stayed_45', 'stayed_60', 'stayed_80',
             ]);
             const pick = (field) => {
-                if (ov[field] !== undefined) return ov[field];
-                if (deduped[field] !== undefined) return deduped[field];
+                // Overrides (admin manual edits) win — but only apply to the
+                // 'all' view since they're variant-blind totals.
+                if (variant === 'all' && ov[field] !== undefined) return ov[field];
+                const dd = deduped[field];
+                if (dd !== undefined) return dd[variant] ?? 0;
                 if (hasDedup && DEDUP_COLS.has(field)) return 0;
+                // For variant filtering, canonical row values are totals across
+                // all variants — not meaningful for a single-variant view.
+                if (variant !== 'all' && DEDUP_COLS.has(field)) return 0;
                 return row[field];
             };
             return {
@@ -1404,6 +1485,9 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 purchases_aibot: pick('purchases_aibot'),
                 purchases_postwebinar: pick('purchases_postwebinar'),
                 purchases_cpa: pick('purchases_cpa'),
+                stayed_45: pick('stayed_45'),
+                stayed_60: pick('stayed_60'),
+                stayed_80: pick('stayed_80'),
                 total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
                                  (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
                                  (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0),
@@ -1423,7 +1507,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         // Skip the write if an invalidation ran mid-flight — the response
         // we just built reflects pre-invalidation Supabase state and would
         // mask the new data for up to metricsTTL.
-        if (Number(limit) === 90 && Number(offset) === 0) {
+        if (variant === 'all' && Number(limit) === 90 && Number(offset) === 0) {
             if (bucket.invalidationEpoch === epochAtStart) {
                 bucket.metricsResponse = response;
                 bucket.metricsUpdatedAt = now;
@@ -1453,7 +1537,7 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
 
         // Only write to overrides — raw columns stay as the automated data source.
         // This prevents overrides from drifting separately from raw columns (#6).
-        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa'];
+        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa', 'stayed_45', 'stayed_60', 'stayed_80'];
         const newOverrides = {};
         for (const f of OVERRIDE_FIELDS) {
             if (body[f] !== undefined) {
@@ -2044,10 +2128,12 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
                 const deduped = dedupMap[dateStr] || {};
                 const hasDedup = Object.keys(deduped).length > 0;
                 const ov = r.overrides || {};
-                const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa']);
+                const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa', 'stayed_45', 'stayed_60', 'stayed_80']);
                 const pick = (field) => {
                     if (ov[field] !== undefined) return ov[field];
-                    if (deduped[field] !== undefined) return deduped[field];
+                    const dd = deduped[field];
+                    // AI insights use variant-blind totals (.all)
+                    if (dd !== undefined) return dd.all ?? 0;
                     if (hasDedup && PURCHASE_SUB_COLS.has(field)) return 0;
                     return r[field];
                 };
@@ -2067,6 +2153,9 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
                     purchases_aibot: pick('purchases_aibot') || 0,
                     purchases_postwebinar: pick('purchases_postwebinar') || 0,
                     purchases_cpa: pick('purchases_cpa') || 0,
+                    stayed_45: pick('stayed_45') || 0,
+                    stayed_60: pick('stayed_60') || 0,
+                    stayed_80: pick('stayed_80') || 0,
                     total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
                                      (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
                                      (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0),
