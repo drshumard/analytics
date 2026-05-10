@@ -18,19 +18,40 @@ const supabase = createClient(
 // ─── API Client ──────────────────────────────────────────────────────────────
 const API_BASE = window.location.origin;
 
+// Active funnel (persisted to localStorage). Reads sync; writes go through
+// setActiveFunnel so React state can re-render. Default 'analytics' preserves
+// behavior for users with no native access.
+const FUNNEL_LS_KEY = "dr-shumard-active-funnel";
+const getActiveFunnel = () => {
+  try { return localStorage.getItem(FUNNEL_LS_KEY) || "analytics"; }
+  catch { return "analytics"; }
+};
+const setActiveFunnelLS = (f) => {
+  try { localStorage.setItem(FUNNEL_LS_KEY, f); } catch {}
+};
+
 const getAuthHeaders = async () => {
   const { data: { session } } = await supabase.auth.getSession();
-  const headers = { "Content-Type": "application/json" };
+  const headers = { "Content-Type": "application/json", "X-Funnel": getActiveFunnel() };
   if (session?.access_token) headers["Authorization"] = `Bearer ${session.access_token}`;
   return headers;
 };
+
+// For unauthenticated GETs that still need funnel scoping (metrics, events, etc.)
+const getFunnelHeaders = () => ({ "X-Funnel": getActiveFunnel() });
 
 // Parse MM/DD/YYYY → Date at midnight (component-based, no browser TZ dependency)
 const parseMDate = (d) => { const [m, dy, y] = d.split('/').map(Number); return new Date(y, m - 1, dy); };
 
 const api = {
+  async getMyFunnels() {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/me/funnels`, { headers });
+    if (!res.ok) throw new Error(`Failed to fetch funnels: ${res.status}`);
+    return res.json();
+  },
   async getMetrics(limit = 90, offset = 0) {
-    const res = await fetch(`${API_BASE}/api/metrics?limit=${limit}&offset=${offset}`);
+    const res = await fetch(`${API_BASE}/api/metrics?limit=${limit}&offset=${offset}`, { headers: getFunnelHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch metrics: ${res.status}`);
     return res.json();
   },
@@ -61,7 +82,7 @@ const api = {
     return res.json();
   },
   async getCustomMetrics() {
-    const res = await fetch(`${API_BASE}/api/custom-metrics`);
+    const res = await fetch(`${API_BASE}/api/custom-metrics`, { headers: getFunnelHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch custom metrics: ${res.status}`);
     return res.json();
   },
@@ -81,7 +102,7 @@ const api = {
   },
   async getEvents(limit = 100, type = "") {
     const url = `${API_BASE}/api/events?limit=${limit}${type ? `&type=${type}` : ""}`;
-    const res = await fetch(url);
+    const res = await fetch(url, { headers: getFunnelHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch events: ${res.status}`);
     return res.json();
   },
@@ -121,6 +142,12 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Finalize failed: ${res.status}`); }
     return res.json();
   },
+  async finalizeDate(date) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/admin/finalize-date`, { method: "POST", headers, body: JSON.stringify({ date }) });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Finalize failed: ${res.status}`); }
+    return res.json();
+  },
 };
 
 function getLocalKey() {
@@ -134,8 +161,8 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "fb_link_clicks", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "total_purchases", "attended"];
-const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", registrations: "Registrations", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", total_purchases: "Total Purchases" };
+const MK = ["fb_spend", "fb_link_clicks", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "purchases_cpa", "total_purchases", "attended"];
+const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", purchases_cpa: "CPA Traffic Funnel", total_purchases: "Total Purchases" };
 const DEFAULT_HIDDEN = [];
 
 // Summary card defaults and metric options for the configurable summary strip
@@ -160,6 +187,7 @@ const SUMMARY_METRIC_OPTIONS = [
   { key: "purchases_youtube", label: "Youtube", defaultFormat: "number" },
   { key: "purchases_aibot", label: "AI Chat Bot", defaultFormat: "number" },
   { key: "purchases_postwebinar", label: "Post Webinar", defaultFormat: "number" },
+  { key: "purchases_cpa", label: "CPA Traffic Funnel", defaultFormat: "number" },
   { key: "total_purchases", label: "Total Purchases (alt)", defaultFormat: "number" },
 ];
 const evalFormula = (f, row, ctx = {}) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(`\\b${k}\\b`, "gi"), String(Number(row[k]) || 0)); for (const [k, v] of Object.entries(ctx)) e = e.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi"), String(Number(v) || 0)); if (/[^0-9+\-*/().%\s]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
@@ -219,6 +247,8 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [session, setSession] = useState(null);
   const [userRole, setUserRole] = useState(null);
+  const [activeFunnel, setActiveFunnelState] = useState(() => getActiveFunnel());
+  const [allowedFunnels, setAllowedFunnels] = useState([activeFunnel]);
   const [authLoading, setAuthLoading] = useState(true);
   const [authEmail, setAuthEmail] = useState("");
   const [authPass, setAuthPass] = useState("");
@@ -366,16 +396,35 @@ export default function App() {
 
   const fetchRole = async (token) => {
     try {
-      const res = await fetch(`${API_BASE}/api/me`, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await fetch(`${API_BASE}/api/me`, {
+        headers: { Authorization: `Bearer ${token}`, "X-Funnel": getActiveFunnel() },
+      });
       const data = await res.json();
       setUserRole(data.role || "viewer");
       if (data.preferences?.default_lens_id) setActiveLensId(data.preferences.default_lens_id);
       if (data.preferences?.col_order) setColOrder(data.preferences.col_order);
       else if (data.default_col_order) setColOrder(data.default_col_order);
       if (data.preferences?.summary_cards) setSummaryCards(data.preferences.summary_cards);
+      if (Array.isArray(data.allowed_funnels) && data.allowed_funnels.length > 0) {
+        setAllowedFunnels(data.allowed_funnels);
+        // If the persisted active funnel isn't in the allowed list, snap to the first allowed.
+        if (!data.allowed_funnels.includes(getActiveFunnel())) {
+          const first = data.allowed_funnels[0];
+          setActiveFunnelLS(first);
+          setActiveFunnelState(first);
+        }
+      }
     } catch { setUserRole("viewer"); }
     setAuthLoading(false);
   };
+
+  // Switch the active funnel: persist, update state, and refetch everything.
+  const switchFunnel = useCallback((f) => {
+    if (f === activeFunnel) return;
+    if (!allowedFunnels.includes(f)) return;
+    setActiveFunnelLS(f);
+    setActiveFunnelState(f);
+  }, [activeFunnel, allowedFunnels]);
 
   const isAdmin = userRole === "admin";
 
@@ -394,6 +443,17 @@ export default function App() {
 
   useEffect(() => { loadData(); fetchLenses(); }, [loadData]);
   useEffect(() => { const i = setInterval(loadData, 30000); return () => clearInterval(i); }, [loadData]);
+
+  // When the active funnel changes (post-mount), refetch role + data + lenses.
+  // The initial fetches above already run on mount with the persisted funnel.
+  const funnelMountedRef = useRef(false);
+  useEffect(() => {
+    if (!funnelMountedRef.current) { funnelMountedRef.current = true; return; }
+    if (session?.access_token) fetchRole(session.access_token);
+    loadData();
+    fetchLenses();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeFunnel]);
 
   const refreshWebhook = useCallback(async () => {
     flash("Refreshing spend data…", "ok");
@@ -442,6 +502,20 @@ export default function App() {
       setFinalizing(false);
     }
   }, [finalizing, loadData, flash]);
+
+  const finalizeDay = useCallback(async (dateRaw) => {
+    const iso = dateRaw.includes('/') ? dateRaw.replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$1-$2') : dateRaw;
+    if (!window.confirm(`Refinalize ${iso}? Recomputes deduped values from events and overwrites the canonical columns.`)) return;
+    flash(`Finalizing ${iso}…`, "ok");
+    try {
+      const body = await api.finalizeDate(iso);
+      await loadData();
+      const fields = body.written ? Object.keys(body.written).length : 0;
+      flash(fields > 0 ? `Finalized ${iso} (${fields} field${fields === 1 ? "" : "s"} updated)` : `Finalized ${iso} (no events found)`, "ok");
+    } catch (e) {
+      flash(e.message || "Finalize failed", "err");
+    }
+  }, [flash, loadData]);
 
   const recalcSpend = useCallback(async (dateRaw) => {
     const iso = dateRaw.includes('/') ? dateRaw.replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$1-$2') : dateRaw;
@@ -688,6 +762,18 @@ export default function App() {
             ) : (
               <button style={S.btnLight} onClick={() => { setView("dash"); setEditRow(null); setEditCM(null); }}>← Back</button>
             )}
+            {allowedFunnels.length > 1 && (
+              <select
+                value={activeFunnel}
+                onChange={(e) => switchFunnel(e.target.value)}
+                title="Switch funnel"
+                style={{ ...S.btnLight, paddingRight: 30, appearance: "none", WebkitAppearance: "none", MozAppearance: "none", backgroundImage: "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236B7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 10px center", lineHeight: "1.2" }}
+              >
+                {allowedFunnels.map(f => (
+                  <option key={f} value={f}>{f === "analytics" ? "Main" : f === "native" ? "Native" : f}</option>
+                ))}
+              </select>
+            )}
             <button style={S.btnGhost} onClick={handleLogout} title="Sign out"><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={15} stroke="#8A8A88" /></button>
           </div>
         </div>
@@ -709,6 +795,23 @@ export default function App() {
           )}
           {view !== "dash" && (
             <button className="mobile-nav-item" onClick={() => { setView("dash"); setEditRow(null); setEditCM(null); }}><I d="M10 19l-7-7m0 0l7-7m-7 7h18" size={16} stroke="#6B7280" /> Back to Dashboard</button>
+          )}
+          {allowedFunnels.length > 1 && (
+            <>
+              <div className="mobile-nav-divider" />
+              <div style={{ padding: "8px 16px" }}>
+                <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", color: "#6B7280", marginBottom: 6 }}>Funnel</div>
+                <select
+                  value={activeFunnel}
+                  onChange={(e) => { switchFunnel(e.target.value); setMobileMenuOpen(false); }}
+                  style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #D1D5DB", background: "#fff", fontSize: 14, fontWeight: 500, color: "#374151" }}
+                >
+                  {allowedFunnels.map(f => (
+                    <option key={f} value={f}>{f === "analytics" ? "Main" : f === "native" ? "Native" : f}</option>
+                  ))}
+                </select>
+              </div>
+            </>
           )}
           <div className="mobile-nav-divider" />
           <button className="mobile-nav-item mobile-nav-danger" onClick={handleLogout}><I d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" size={16} stroke="#DC2626" /> Sign Out</button>
@@ -887,6 +990,7 @@ export default function App() {
                           <td style={S.td} onClick={(e) => e.stopPropagation()}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
                               <button className="rowBtn" style={{ ...S.rowAct, borderColor: "#DBEAFE", background: "#EFF6FF" }} title="Recalc spend from Facebook" onClick={() => recalcSpend(row.date)}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={14} stroke="#3B82F6" /></button>
+                              {isAdmin && <button className="rowBtn" style={{ ...S.rowAct, borderColor: "#D1FAE5", background: "#ECFDF5" }} title="Refinalize this day (recompute deduped values from events)" onClick={() => finalizeDay(row.date)}><I d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" size={14} stroke="#10B981" /></button>}
                               {isAdmin && <button className="rowBtn" style={S.rowAct} onClick={() => { setEditRow(row); setView("entry"); }}><I d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" size={14} stroke="#8A8A88" /></button>}
                               {isAdmin && <button className="rowBtn" style={{ ...S.rowAct, borderColor: "#FEE2E2", background: "#FEF2F2" }} onClick={() => setDelConfirm(row.date)}><I d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" size={14} stroke="#EF4444" /></button>}
                             </div>
@@ -933,6 +1037,7 @@ export default function App() {
                       </div>
                       <div style={S.boardCardActions} onClick={(e) => e.stopPropagation()}>
                         <button style={{ ...S.rowAct, borderColor: "#DBEAFE", background: "#EFF6FF" }} title="Recalc spend from Facebook" onClick={() => recalcSpend(row.date)}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={14} stroke="#3B82F6" /></button>
+                        {isAdmin && <button style={{ ...S.rowAct, borderColor: "#D1FAE5", background: "#ECFDF5" }} title="Refinalize this day (recompute deduped values from events)" onClick={() => finalizeDay(row.date)}><I d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" size={14} stroke="#10B981" /></button>}
                         {isAdmin && <button style={S.rowAct} title="Edit row" onClick={() => { setEditRow(row); setView("entry"); }}><I d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" size={14} stroke="#6B7280" /></button>}
                         {isAdmin && <button style={{ ...S.rowAct, borderColor: "#FECACA", background: "#FEF2F2" }} title="Delete row" onClick={() => setDelConfirm(row.date)}><I d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" size={14} stroke="#EF4444" /></button>}
                       </div>
@@ -1320,12 +1425,12 @@ function Modal({ title, msg, onCancel, onConfirm }) {
 function EntryForm({ initial, onSubmit, onCancel, isMobile }) {
   const today = getLADate();
   const defaults = initial
-    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, registrations: initial.registrations ?? 0, replays: initial.replays ?? 0, viewedcta: initial.viewedcta ?? 0, clickedcta: initial.clickedcta ?? 0, purchases_fb: initial.purchases_fb ?? 0, purchases_native: initial.purchases_native ?? 0, purchases_youtube: initial.purchases_youtube ?? 0, purchases_aibot: initial.purchases_aibot ?? 0, purchases_postwebinar: initial.purchases_postwebinar ?? 0, attended: initial.attended ?? 0 }
-    : { fb_spend: "", fb_link_clicks: "", registrations: "", replays: "", viewedcta: "", clickedcta: "", purchases_fb: "", purchases_native: "", purchases_youtube: "", purchases_aibot: "", purchases_postwebinar: "", attended: "" };
+    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, registrations: initial.registrations ?? 0, replays: initial.replays ?? 0, viewedcta: initial.viewedcta ?? 0, clickedcta: initial.clickedcta ?? 0, purchases_fb: initial.purchases_fb ?? 0, purchases_native: initial.purchases_native ?? 0, purchases_youtube: initial.purchases_youtube ?? 0, purchases_aibot: initial.purchases_aibot ?? 0, purchases_postwebinar: initial.purchases_postwebinar ?? 0, purchases_cpa: initial.purchases_cpa ?? 0, attended: initial.attended ?? 0 }
+    : { fb_spend: "", fb_link_clicks: "", registrations: "", replays: "", viewedcta: "", clickedcta: "", purchases_fb: "", purchases_native: "", purchases_youtube: "", purchases_aibot: "", purchases_postwebinar: "", purchases_cpa: "", attended: "" };
   const [f, setF] = useState({ date: initial?.date || today, ...defaults });
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
-  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases_fb: parseInt(f.purchases_fb) || 0, purchases_native: parseInt(f.purchases_native) || 0, purchases_youtube: parseInt(f.purchases_youtube) || 0, purchases_aibot: parseInt(f.purchases_aibot) || 0, purchases_postwebinar: parseInt(f.purchases_postwebinar) || 0, attended: parseInt(f.attended) || 0 });
-  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Total Reg. Page Visited", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases_fb", l: "FB Purchases", ph: "0" }, { k: "purchases_native", l: "Native Ads", ph: "0" }, { k: "purchases_youtube", l: "Youtube", ph: "0" }, { k: "purchases_aibot", l: "AI Chat Bot", ph: "0" }, { k: "purchases_postwebinar", l: "Post Webinar", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
+  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases_fb: parseInt(f.purchases_fb) || 0, purchases_native: parseInt(f.purchases_native) || 0, purchases_youtube: parseInt(f.purchases_youtube) || 0, purchases_aibot: parseInt(f.purchases_aibot) || 0, purchases_postwebinar: parseInt(f.purchases_postwebinar) || 0, purchases_cpa: parseInt(f.purchases_cpa) || 0, attended: parseInt(f.attended) || 0 });
+  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Total Reg. Page Visited", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases_fb", l: "FB Purchases", ph: "0" }, { k: "purchases_native", l: "Native Ads", ph: "0" }, { k: "purchases_youtube", l: "Youtube", ph: "0" }, { k: "purchases_aibot", l: "AI Chat Bot", ph: "0" }, { k: "purchases_postwebinar", l: "Post Webinar", ph: "0" }, { k: "purchases_cpa", l: "CPA Traffic Funnel", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
   return (
     <div className="fi form-container" style={S.fc}>
       <div style={S.fh}><div style={{ ...S.formBadge, background: initial ? "#EFF8FF" : "#ECFDF3", color: initial ? "#175CD3" : "#12864A" }}>{initial ? "EDIT ENTRY" : "NEW ENTRY"}</div><h2 style={S.ft}>{initial ? `Update ${fmtDateNice(initial.date)}` : "Add Daily Metrics"}</h2><p style={S.fs}>Enter metrics for the day. Fields default to 0 if empty.</p></div>
@@ -2040,7 +2145,7 @@ const S = {
   searchInput: { border: "none", outline: "none", background: "transparent", fontFamily: fn, fontSize: 13, color: "#111827", width: "100%", fontWeight: 400 },
   tableWrap: { background: "#fff", border: "1px solid #E5E7EB", overflowX: "auto", boxShadow: "0 1px 3px rgba(0,0,0,0.04)", marginLeft: "calc(-1 * (100vw - 100%) / 2)", marginRight: "calc(-1 * (100vw - 100%) / 2)", width: "100vw", maxWidth: "100vw", borderRadius: 0, borderLeft: "none", borderRight: "none" },
   table: { width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 900 },
-  th: { padding: "10px 12px", textAlign: "center", fontSize: 11, fontWeight: 600, color: "#6B7280", textTransform: "uppercase", borderBottom: "2px solid #E5E7EB", background: "#FAFAFA", letterSpacing: "0.05em", whiteSpace: "normal", maxWidth: 90, lineHeight: 1.35 },
+  th: { padding: "10px 16px", textAlign: "center", verticalAlign: "middle", fontSize: 11, fontWeight: 600, color: "#6B7280", textTransform: "uppercase", borderBottom: "2px solid #E5E7EB", background: "#FAFAFA", whiteSpace: "normal", lineHeight: 1.35 },
   td: { padding: "10px 16px", borderBottom: "1px solid #F3F4F6", verticalAlign: "middle", textAlign: "center" },
   tdNum: { padding: "10px 16px", borderBottom: "1px solid #F3F4F6", fontWeight: 500, fontVariantNumeric: "tabular-nums", color: "#111827", fontSize: 13, textAlign: "center" },
   tdMoney: { padding: "10px 16px", borderBottom: "1px solid #F3F4F6", fontWeight: 500, fontVariantNumeric: "tabular-nums", color: "#111827", fontSize: 13, textAlign: "center" },

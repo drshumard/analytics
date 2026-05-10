@@ -13,7 +13,11 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const FB_API_VERSION = process.env.FB_API_VERSION || 'v23.0';
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+// Pinned to the analytics funnel (schema 'public'). The native funnel uses
+// Taboola, not Facebook, so this sync is intentionally analytics-only.
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+    db: { schema: 'public' },
+});
 
 // ─── Get today's date in LA timezone ─────────────────────────────────────────
 function getTodayLA() {

@@ -31,53 +31,94 @@ if (!API_KEY) {
     process.exit(1);
 }
 
-// ─── Supabase Client ─────────────────────────────────────────────────────────
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+// ─── Supabase Clients ────────────────────────────────────────────────────────
+// Multi-tenant: the `analytics` funnel lives in schema `public`, the `native`
+// funnel in schema `native`. Each request resolves to one funnel and gets a
+// schema-scoped client via clientFor(req.funnel).
+//
+// supabasePublic is used for cross-funnel concerns: auth.getUser, the shared
+// api_keys table, and user_funnel_access. It always targets `public`.
+const FUNNEL_TO_SCHEMA = { analytics: 'public', native: 'native' };
+const ALLOWED_FUNNELS = Object.keys(FUNNEL_TO_SCHEMA);
+
+const supabasePublic = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+const _funnelClients = new Map();
+function clientFor(funnel) {
+    const schema = FUNNEL_TO_SCHEMA[funnel];
+    if (!schema) throw new Error(`Unknown funnel: ${funnel}`);
+    if (!_funnelClients.has(funnel)) {
+        _funnelClients.set(funnel, createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+            db: { schema },
+        }));
+    }
+    return _funnelClients.get(funnel);
+}
+
+// Resolve funnel for unauthenticated routes (defaults to analytics — preserves
+// pre-multitenant behavior). Authenticated routes use requireAuth which
+// validates against user_funnel_access.
+function resolveFunnel(req, fallback = 'analytics') {
+    const f = req.headers['x-funnel'] || fallback;
+    return ALLOWED_FUNNELS.includes(f) ? f : fallback;
+}
 
 // ─── In-Memory Cache (reduces Supabase egress by ~98%) ───────────────────────
-// Past days' dedup counts never change — cache them forever.
-// Today's data is invalidated when webhooks write new events.
+// Funnel-keyed: each funnel has its own cache bucket so a write to one funnel
+// can't invalidate another's cached state. Past days' dedup counts never
+// change — cache them forever. Today's data is invalidated when webhooks
+// write new events.
 const cache = {
-    // Deduplicated event counts per day: { "2026-04-09": { registrations: 5, ... } }
-    dedupCounts: {},
-
-    // Full formatted GET /api/metrics response
-    metricsResponse: null,
-    metricsUpdatedAt: 0,
-    metricsTTL: 60_000, // 60 seconds
-
-    // AI insights context (metrics + event summaries)
-    insightsContext: null,
-    insightsUpdatedAt: 0,
+    byFunnel: {}, // funnel → { dedupCounts, dedupTimestamps, metricsResponse, ... }
+    metricsTTL: 60_000,   // 60 seconds
     insightsTTL: 300_000, // 5 minutes
 
-    // Stats for monitoring
+    // Global hit/miss stats — aggregated across funnels for /api/health
     hits: 0,
     misses: 0,
-
-    // Bumped on every invalidation. Async readers snapshot this before a
-    // Supabase fetch and skip writing back if it changed — prevents a
-    // mid-flight invalidation from being clobbered by stale data.
-    invalidationEpoch: 0,
 };
 
-function invalidateMetricsCache() {
-    cache.metricsResponse = null;
-    cache.metricsUpdatedAt = 0;
-    cache.invalidationEpoch++;
-    console.log('🗑️  Cache: metrics response invalidated');
+function getCacheBucket(funnel) {
+    if (!cache.byFunnel[funnel]) {
+        cache.byFunnel[funnel] = {
+            // Deduplicated event counts per day: { "2026-04-09": { registrations: 5, ... } }
+            dedupCounts: {},
+            dedupTimestamps: {},
+            // Full formatted GET /api/metrics response
+            metricsResponse: null,
+            metricsUpdatedAt: 0,
+            // AI insights context (metrics + event summaries)
+            insightsContext: null,
+            insightsUpdatedAt: 0,
+            // Bumped on every invalidation. Async readers snapshot this before a
+            // Supabase fetch and skip writing back if it changed — prevents a
+            // mid-flight invalidation from being clobbered by stale data.
+            invalidationEpoch: 0,
+        };
+    }
+    return cache.byFunnel[funnel];
 }
 
-function invalidateDedupForDate(isoDate) {
-    delete cache.dedupCounts[isoDate];
-    invalidateMetricsCache();
-    console.log(`🗑️  Cache: dedup invalidated for ${isoDate}`);
+function invalidateMetricsCache(funnel) {
+    const b = getCacheBucket(funnel);
+    b.metricsResponse = null;
+    b.metricsUpdatedAt = 0;
+    b.invalidationEpoch++;
+    console.log(`🗑️  Cache[${funnel}]: metrics response invalidated`);
 }
 
-function invalidateInsightsCache() {
-    cache.insightsContext = null;
-    cache.insightsUpdatedAt = 0;
-    cache.invalidationEpoch++;
+function invalidateDedupForDate(funnel, isoDate) {
+    const b = getCacheBucket(funnel);
+    delete b.dedupCounts[isoDate];
+    invalidateMetricsCache(funnel);
+    console.log(`🗑️  Cache[${funnel}]: dedup invalidated for ${isoDate}`);
+}
+
+function invalidateInsightsCache(funnel) {
+    const b = getCacheBucket(funnel);
+    b.insightsContext = null;
+    b.insightsUpdatedAt = 0;
+    b.invalidationEpoch++;
 }
 
 // ─── Express App ─────────────────────────────────────────────────────────────
@@ -96,7 +137,7 @@ const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').filter(Boolean);
 app.use(cors({
     origin: corsOrigins.length > 0 ? corsOrigins : true,
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Funnel'],
 }));
 
 // Body parsing
@@ -134,48 +175,84 @@ const dashboardLimiter = rateLimit({
 });
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
-// Unified webhook auth: checks env API_KEY first (fast, no DB), then api_keys table
+// Constant-time comparison helper — accepts buffers of differing lengths.
+function constantTimeEq(a, b) {
+    const aBuf = Buffer.from(String(a));
+    const bBuf = Buffer.from(String(b));
+    if (aBuf.length !== bBuf.length) return false;
+    return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+// Unified webhook auth: checks env API_KEY (analytics) and NATIVE_API_KEY first
+// (fast, no DB), then the public.api_keys table. Sets req.funnel from the matched
+// key so the handler writes to the correct schema.
 async function authenticateWebhook(req, res, next) {
     const key = req.headers['x-api-key'] || req.query.api_key || req.body?.api_key;
     if (!key) {
         return res.status(401).json({ error: 'Missing API key. Send X-API-Key header.' });
     }
-    // Fast path: check against env API_KEY
-    const keyBuf = Buffer.from(key);
-    const apiBuf = Buffer.from(API_KEY);
-    if (keyBuf.length === apiBuf.length && crypto.timingSafeEqual(keyBuf, apiBuf)) {
+    // Fast path: env keys, one per funnel
+    if (constantTimeEq(key, API_KEY)) { req.funnel = 'analytics'; return next(); }
+    if (process.env.NATIVE_API_KEY && constantTimeEq(key, process.env.NATIVE_API_KEY)) {
+        req.funnel = 'native';
         return next();
     }
-    // Slow path: check api_keys table (supports multiple keys with revocation)
+    // Slow path: check public.api_keys table (single source of truth across funnels)
     try {
         const hash = crypto.createHash('sha256').update(key).digest('hex');
-        const { data: dbKey } = await supabase.from('api_keys').select('id, is_active').eq('key_hash', hash).single();
-        if (dbKey && dbKey.is_active) {
-            await supabase.from('api_keys').update({ last_used_at: new Date().toISOString() }).eq('id', dbKey.id);
+        const { data: dbKey } = await supabasePublic
+            .from('api_keys')
+            .select('id, is_active, funnel')
+            .eq('key_hash', hash)
+            .single();
+        if (dbKey && dbKey.is_active && ALLOWED_FUNNELS.includes(dbKey.funnel)) {
+            await supabasePublic.from('api_keys').update({ last_used_at: new Date().toISOString() }).eq('id', dbKey.id);
+            req.funnel = dbKey.funnel;
             return next();
         }
     } catch { /* DB key lookup failed, fall through */ }
     return res.status(403).json({ error: 'Invalid API key' });
 }
 
-// Supabase JWT auth — verifies the user is logged in
+// Supabase JWT auth — verifies the user is logged in, then resolves req.funnel
+// from the X-Funnel header (defaulting to analytics) and validates the user
+// has access to that funnel via public.user_funnel_access.
 async function requireAuth(req, res, next) {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) {
         return res.status(401).json({ error: 'Authentication required' });
     }
     const token = auth.replace('Bearer ', '');
-    const { data: { user }, error } = await supabase.auth.getUser(token);
+    const { data: { user }, error } = await supabasePublic.auth.getUser(token);
     if (error || !user) {
         return res.status(401).json({ error: 'Invalid or expired session' });
     }
     req.user = user;
+
+    const requested = resolveFunnel(req, 'analytics');
+    // Check access in user_funnel_access. If the table is empty or has no row
+    // for this user, fall back to analytics-only (preserves single-funnel
+    // behavior pre-migration).
+    const { data: accessRows } = await supabasePublic
+        .from('user_funnel_access')
+        .select('funnel')
+        .eq('user_id', user.id);
+    const allowed = (accessRows || []).map(r => r.funnel);
+    const effectiveAllowed = allowed.length > 0 ? allowed : ['analytics'];
+    if (!effectiveAllowed.includes(requested)) {
+        return res.status(403).json({ error: `No access to funnel '${requested}'` });
+    }
+    req.funnel = requested;
+    req.allowedFunnels = effectiveAllowed;
     next();
 }
 
-// Requires admin role — must be used after requireAuth
+// Requires admin role within req.funnel's schema. Must run after requireAuth.
+// Missing user_roles row in the funnel's schema → not admin (correct: viewer
+// of a funnel is the default for users who have access but no explicit role).
 async function requireAdmin(req, res, next) {
-    const { data } = await supabase
+    const sb = clientFor(req.funnel);
+    const { data } = await sb
         .from('user_roles')
         .select('role')
         .eq('user_id', req.user.id)
@@ -241,9 +318,9 @@ function dateToISO(mmddyyyy) {
 }
 
 // ─── Webhook Log ─────────────────────────────────────────────────────────────
-async function logWebhook(source, payload, status, errorMessage = null) {
+async function logWebhook(funnel, source, payload, status, errorMessage = null) {
     try {
-        await supabase.from('webhook_log').insert({
+        await clientFor(funnel).from('webhook_log').insert({
             source,
             payload,
             status,
@@ -266,15 +343,18 @@ app.post('/api/metrics', webhookLimiter, async (req, res) => {
         // Accept EITHER webhook API-key auth OR admin Bearer-token auth
         const authHeader = req.headers.authorization;
         if (authHeader && authHeader.startsWith('Bearer ')) {
-            // Admin auth path
+            // Admin auth path — funnel comes from X-Funnel header (default analytics)
             const token = authHeader.split(' ')[1];
-            const { data: { user }, error } = await supabase.auth.getUser(token);
+            const { data: { user }, error } = await supabasePublic.auth.getUser(token);
             if (error || !user) return res.status(401).json({ error: 'Invalid or expired session' });
-            const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', user.id).single();
+            const requestedFunnel = resolveFunnel(req, 'analytics');
+            const { data: roleData } = await clientFor(requestedFunnel)
+                .from('user_roles').select('role').eq('user_id', user.id).single();
             if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
             req.user = user;
+            req.funnel = requestedFunnel;
         } else {
-            // Webhook API-key path — delegate to unified authenticateWebhook
+            // Webhook API-key path — delegate to unified authenticateWebhook (sets req.funnel from key)
             const authResult = await new Promise((resolve) => {
                 authenticateWebhook(req, res, () => resolve('ok'));
             });
@@ -282,12 +362,13 @@ app.post('/api/metrics', webhookLimiter, async (req, res) => {
             if (authResult !== 'ok') return;
         }
 
+        const supabase = clientFor(req.funnel);
         const body = req.body;
-        await logWebhook('zapier', body, 'received');
+        await logWebhook(req.funnel, 'zapier', body, 'received');
 
         const date = parseDateInput(body.date);
         if (!date) {
-            await logWebhook('zapier', body, 'error', 'Invalid or missing date');
+            await logWebhook(req.funnel, 'zapier', body, 'error', 'Invalid or missing date');
             return res.status(400).json({ error: 'Invalid or missing date. Use MM/DD/YYYY or YYYY-MM-DD.' });
         }
 
@@ -308,7 +389,7 @@ app.post('/api/metrics', webhookLimiter, async (req, res) => {
 
         // Only include purchase source columns if explicitly provided
         // Prevents admin form edits from clobbering webhook-sourced data to 0
-        const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar'];
+        const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa'];
         for (const col of PURCHASE_COLS) {
             if (body[col] !== undefined && body[col] !== '' && body[col] !== null) {
                 row[col] = parseInt(body[col]) || 0;
@@ -323,15 +404,15 @@ app.post('/api/metrics', webhookLimiter, async (req, res) => {
 
         if (error) throw error;
 
-        await logWebhook('zapier', body, 'processed');
-        invalidateMetricsCache();
-        invalidateInsightsCache();
-        console.log(`✅ Upserted metrics for ${date} (${dayOfWeek})`);
+        await logWebhook(req.funnel, 'zapier', body, 'processed');
+        invalidateMetricsCache(req.funnel);
+        invalidateInsightsCache(req.funnel);
+        console.log(`✅ [${req.funnel}] Upserted metrics for ${date} (${dayOfWeek})`);
         res.json({ success: true, date, day: dayOfWeek, data });
 
     } catch (err) {
         console.error('❌ POST /api/metrics error:', err.message);
-        await logWebhook('zapier', req.body, 'error', err.message);
+        if (req.funnel) await logWebhook(req.funnel, 'zapier', req.body, 'error', err.message);
         res.status(500).json({ error: 'Internal server error', detail: err.message });
     }
 });
@@ -339,6 +420,7 @@ app.post('/api/metrics', webhookLimiter, async (req, res) => {
 // POST /api/metrics/batch — Bulk upsert (for backfills)
 app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { entries } = req.body;
         if (!Array.isArray(entries) || entries.length === 0) {
             return res.status(400).json({ error: 'Send { entries: [...] } array' });
@@ -370,7 +452,7 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
                 attended: parseInt(entry.attended) || 0,
             };
             // Only include purchase columns if explicitly provided (prevents clobbering)
-            const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar'];
+            const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa'];
             for (const col of PURCHASE_COLS) {
                 if (entry[col] !== undefined && entry[col] !== '' && entry[col] !== null) {
                     row[col] = parseInt(entry[col]) || 0;
@@ -386,11 +468,11 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
             if (error) throw error;
         }
 
-        await logWebhook('batch', { count: entries.length }, 'processed');
-        invalidateMetricsCache();
+        await logWebhook(req.funnel, 'batch', { count: entries.length }, 'processed');
+        invalidateMetricsCache(req.funnel);
         // Invalidate dedup for all affected dates
-        for (const r of rows) invalidateDedupForDate(r.date);
-        invalidateInsightsCache();
+        for (const r of rows) invalidateDedupForDate(req.funnel, r.date);
+        invalidateInsightsCache(req.funnel);
         res.json({ success: true, inserted: rows.length, errors });
 
     } catch (err) {
@@ -403,6 +485,7 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
 // Zapier sends: { field: "registrations", count: 1, name: "John Doe", email: "john@example.com" }
 app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { field, count = 1, name, email, phone, execution_id, ...rest } = req.body;
         // Purchase source columns are NOT in validFields — purchases must always go through
         // field:'purchases' with a 'source' param so source routing and Post Webinar detection run.
@@ -410,10 +493,11 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
 
         // ── Purchase source mapping ──────────────────────────────────────
         const PURCHASE_SOURCE_MAP = {
-            'Paid Ads': 'purchases_fb',
-            'Native':   'purchases_native',
-            'Youtube':  'purchases_youtube',
-            'AI Bot':   'purchases_aibot',
+            'Paid Ads':    'purchases_fb',
+            'Native':      'purchases_native',
+            'Youtube':     'purchases_youtube',
+            'AI Bot':      'purchases_aibot',
+            'CPA Traffic': 'purchases_cpa',
         };
 
         if (!validFields.includes(field)) {
@@ -592,8 +676,8 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
         }
 
         // Invalidate caches — new event arrived
-        invalidateDedupForDate(isoDate);
-        invalidateInsightsCache();
+        invalidateDedupForDate(req.funnel, isoDate);
+        invalidateInsightsCache(req.funnel);
 
         console.log(`✅ Increment ${incrementField} +${count} for ${targetDate}${name ? ` (${name})` : ''}`);
         res.json({ success: true, date: targetDate, field: incrementField, count: Number(count) });
@@ -612,8 +696,9 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
 // Optional: { field: "fb_spend", value: 312.75, date: "03/14/2026" }
 app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { field, value, date: dateInput } = req.body;
-        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'attended'];
+        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa', 'attended'];
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -656,10 +741,10 @@ app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, re
 
         if (error) throw error;
 
-        await logWebhook('set', { field, value: newValue, date: targetDate }, 'processed');
-        invalidateMetricsCache();
-        invalidateInsightsCache();
-        console.log(`✅ Set ${field} = ${newValue} for ${targetDate} (was ${previous})`);
+        await logWebhook(req.funnel, 'set', { field, value: newValue, date: targetDate }, 'processed');
+        invalidateMetricsCache(req.funnel);
+        invalidateInsightsCache(req.funnel);
+        console.log(`✅ [${req.funnel}] Set ${field} = ${newValue} for ${targetDate} (was ${previous})`);
         res.json({ success: true, date: targetDate, field, previous, new: newValue });
 
     } catch (err) {
@@ -695,10 +780,11 @@ app.post('/api/refresh', dashboardLimiter, async (req, res) => {
     }
 
     try {
+        // FB sync writes to the analytics schema only (Taboola for native is future work)
         const result = await syncFacebookSpend();
         refreshTimestamps.push(now);
-        invalidateMetricsCache();
-        invalidateInsightsCache();
+        invalidateMetricsCache('analytics');
+        invalidateInsightsCache('analytics');
 
         const remaining = 3 - refreshTimestamps.length;
         return res.json({
@@ -725,8 +811,8 @@ app.post('/api/refresh-date', dashboardLimiter, async (req, res) => {
         const { fetchFacebookInsights, writeInsightsToSupabase } = await import('./fb-sync.js');
         const insights = await fetchFacebookInsights(date);
         await writeInsightsToSupabase(date, insights);
-        invalidateMetricsCache();
-        invalidateInsightsCache();
+        invalidateMetricsCache('analytics');
+        invalidateInsightsCache('analytics');
 
         console.log(`✅ Recalc for ${date}: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks`);
         return res.json({ message: `Insights for ${date} updated — $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks`, spend: insights.spend, linkClicks: insights.linkClicks });
@@ -736,9 +822,36 @@ app.post('/api/refresh-date', dashboardLimiter, async (req, res) => {
     }
 });
 
-// GET /api/me — Return current user's role and preferences
+// GET /api/me/funnels — Return the list of funnels this user can access.
+// Reads from public.user_funnel_access. If empty, defaults to ['analytics']
+// for backward compat with users who pre-date the multitenant migration.
+app.get('/api/me/funnels', dashboardLimiter, async (req, res) => {
+    try {
+        const auth = req.headers.authorization;
+        if (!auth || !auth.startsWith('Bearer ')) {
+            return res.status(401).json({ error: 'Authentication required' });
+        }
+        const token = auth.replace('Bearer ', '');
+        const { data: { user }, error } = await supabasePublic.auth.getUser(token);
+        if (error || !user) {
+            return res.status(401).json({ error: 'Invalid or expired session' });
+        }
+        const { data: rows } = await supabasePublic
+            .from('user_funnel_access')
+            .select('funnel')
+            .eq('user_id', user.id);
+        const funnels = (rows || []).map(r => r.funnel).filter(f => ALLOWED_FUNNELS.includes(f));
+        res.json({ funnels: funnels.length > 0 ? funnels : ['analytics'] });
+    } catch (err) {
+        console.error('❌ GET /api/me/funnels error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch funnels' });
+    }
+});
+
+// GET /api/me — Return current user's role and preferences (within active funnel)
 app.get('/api/me', dashboardLimiter, requireAuth, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { data } = await supabase
             .from('user_roles')
             .select('role, preferences')
@@ -766,6 +879,8 @@ app.get('/api/me', dashboardLimiter, requireAuth, async (req, res) => {
             role: data?.role || 'viewer',
             preferences: data?.preferences || {},
             default_col_order: defaultColOrder,
+            funnel: req.funnel,
+            allowed_funnels: req.allowedFunnels || [req.funnel],
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to fetch user info' });
@@ -775,6 +890,7 @@ app.get('/api/me', dashboardLimiter, requireAuth, async (req, res) => {
 // PUT /api/me/preferences — Save user preferences (hidden columns, etc.)
 app.put('/api/me/preferences', dashboardLimiter, requireAuth, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { preferences } = req.body;
         if (!preferences || typeof preferences !== 'object') {
             return res.status(400).json({ error: 'Send { preferences: { ... } }' });
@@ -815,6 +931,7 @@ app.put('/api/me/preferences', dashboardLimiter, requireAuth, async (req, res) =
 // POST /api/settings/propagate-col-order — Admin pushes their column order to all users
 app.post('/api/settings/propagate-col-order', dashboardLimiter, requireAuth, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         // Verify admin
         const { data: roleData } = await supabase.from('user_roles').select('role, preferences').eq('user_id', req.user.id).single();
         if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
@@ -852,6 +969,7 @@ app.post('/api/settings/propagate-col-order', dashboardLimiter, requireAuth, asy
 // GET /api/lenses — list all lenses (any authenticated user)
 app.get('/api/lenses', dashboardLimiter, requireAuth, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { data, error } = await supabase
             .from('dashboard_lenses')
             .select('*')
@@ -867,6 +985,7 @@ app.get('/api/lenses', dashboardLimiter, requireAuth, async (req, res) => {
 // POST /api/lenses — create a lens (admin only)
 app.post('/api/lenses', dashboardLimiter, requireAuth, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
         if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
 
@@ -891,6 +1010,7 @@ app.post('/api/lenses', dashboardLimiter, requireAuth, async (req, res) => {
 // PUT /api/lenses/:id — update a lens (admin only)
 app.put('/api/lenses/:id', dashboardLimiter, requireAuth, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
         if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
 
@@ -918,6 +1038,7 @@ app.delete('/api/lenses/:id', dashboardLimiter, requireAuth, async (req, res) =>
     try {
         if (req.params.id === 'default-all') return res.status(400).json({ error: 'Cannot delete the default lens' });
 
+        const supabase = clientFor(req.funnel);
         const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
         if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
 
@@ -947,6 +1068,7 @@ const PURCHASE_DEDUP_MAP = {
     'Youtube':       'purchases_youtube',
     'AI Bot':        'purchases_aibot',
     'Post Webinar':  'purchases_postwebinar',
+    'CPA Traffic':   'purchases_cpa',
 };
 
 function computeDedupFromEvents(events) {
@@ -989,7 +1111,8 @@ function computeDedupFromEvents(events) {
     return result;
 }
 
-async function fetchEventsForDateRange(minDate, maxDate) {
+async function fetchEventsForDateRange(funnel, minDate, maxDate) {
+    const supabase = clientFor(funnel);
     // LA is UTC-7 (PDT) or UTC-8 (PST). Events occurring in the LA evening
     // have UTC timestamps on the next calendar day (e.g. Apr 11 8pm PDT = Apr 12 03:00 UTC).
     // Pad maxDate by 1 day so we don't miss them. The dedup grouping step
@@ -998,7 +1121,7 @@ async function fetchEventsForDateRange(minDate, maxDate) {
     maxPadded.setUTCDate(maxPadded.getUTCDate() + 1);
     const maxDatePadded = maxPadded.toISOString().slice(0, 10);
 
-    console.log(`📡 Supabase fetch: events from ${minDate} to ${maxDatePadded} (padded from ${maxDate})`);
+    console.log(`📡 [${funnel}] Supabase fetch: events from ${minDate} to ${maxDatePadded} (padded from ${maxDate})`);
 
     let allEvents = [];
     // Supabase caps results at 1000 rows per query. Use 1000 as page size
@@ -1033,20 +1156,21 @@ async function fetchEventsForDateRange(minDate, maxDate) {
     return allEvents;
 }
 
-async function getDedupCounts(dates) {
+async function getDedupCounts(funnel, dates) {
     if (dates.length === 0) return {};
+    const bucket = getCacheBucket(funnel);
     const today = dateToISO(getLADate());
 
     // Today's dedup expires after 3 seconds to handle concurrent webhook races (#14)
     // Past days are cached forever (their counts can't change)
-    if (cache.dedupCounts[today] && cache.dedupTimestamps?.[today]) {
-        if (Date.now() - cache.dedupTimestamps[today] > 3000) {
-            delete cache.dedupCounts[today];
+    if (bucket.dedupCounts[today] && bucket.dedupTimestamps[today]) {
+        if (Date.now() - bucket.dedupTimestamps[today] > 3000) {
+            delete bucket.dedupCounts[today];
         }
     }
 
     // Find dates that are NOT in the cache
-    const uncachedDates = dates.filter(d => !(d in cache.dedupCounts));
+    const uncachedDates = dates.filter(d => !(d in bucket.dedupCounts));
 
     if (uncachedDates.length > 0) {
         cache.misses++;
@@ -1070,18 +1194,17 @@ async function getDedupCounts(dates) {
         }
         ranges.push([rangeStart, rangePrev]);
 
-        console.log(`📊 Cache MISS: ${uncachedDates.length} uncached date(s) across ${ranges.length} range(s)`);
+        console.log(`📊 Cache[${funnel}] MISS: ${uncachedDates.length} uncached date(s) across ${ranges.length} range(s)`);
 
         // Snapshot the epoch before the fetch. If an invalidation runs while
         // we're awaiting Supabase, the epoch will change and we must NOT
         // write the now-stale results back into the cache.
-        const epochAtStart = cache.invalidationEpoch;
+        const epochAtStart = bucket.invalidationEpoch;
 
         // Fetch each range, log, and cache in a single pass
-        if (!cache.dedupTimestamps) cache.dedupTimestamps = {};
         const computedByDate = {};
         for (const [minDate, maxDate] of ranges) {
-            const events = await fetchEventsForDateRange(minDate, maxDate);
+            const events = await fetchEventsForDateRange(funnel, minDate, maxDate);
             const computed = computeDedupFromEvents(events);
 
             // Log per-day breakdown for diagnostics
@@ -1090,7 +1213,7 @@ async function getDedupCounts(dates) {
                 dayCounts[d] = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(', ');
             }
             if (Object.keys(dayCounts).length > 0) {
-                console.log(`📊 Dedup [${minDate}→${maxDate}]:`, JSON.stringify(dayCounts));
+                console.log(`📊 Dedup[${funnel}] [${minDate}→${maxDate}]:`, JSON.stringify(dayCounts));
             }
 
             // Collect computed results so we can return them even if we
@@ -1102,21 +1225,21 @@ async function getDedupCounts(dates) {
             }
         }
 
-        if (cache.invalidationEpoch === epochAtStart) {
+        if (bucket.invalidationEpoch === epochAtStart) {
             for (const [d, counts] of Object.entries(computedByDate)) {
-                cache.dedupCounts[d] = counts;
-                if (d === today) cache.dedupTimestamps[d] = Date.now();
+                bucket.dedupCounts[d] = counts;
+                if (d === today) bucket.dedupTimestamps[d] = Date.now();
             }
         } else {
-            console.log(`⚠️  Cache: skipped dedup write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${cache.invalidationEpoch})`);
+            console.log(`⚠️  Cache[${funnel}]: skipped dedup write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${bucket.invalidationEpoch})`);
         }
 
         // Prune dedup cache: drop dates older than 120 days to prevent unbounded growth (#5)
         const pruneCutoff = new Date();
         pruneCutoff.setDate(pruneCutoff.getDate() - 120);
         const pruneISO = pruneCutoff.toISOString().slice(0, 10);
-        for (const d of Object.keys(cache.dedupCounts)) {
-            if (d < pruneISO) delete cache.dedupCounts[d];
+        for (const d of Object.keys(bucket.dedupCounts)) {
+            if (d < pruneISO) delete bucket.dedupCounts[d];
         }
 
         // Caller gets accurate numbers regardless of whether we wrote them
@@ -1125,7 +1248,7 @@ async function getDedupCounts(dates) {
         const result = {};
         for (const d of dates) {
             if (computedByDate[d]) result[d] = computedByDate[d];
-            else if (cache.dedupCounts[d]) result[d] = cache.dedupCounts[d];
+            else if (bucket.dedupCounts[d]) result[d] = bucket.dedupCounts[d];
         }
         return result;
     } else {
@@ -1135,7 +1258,7 @@ async function getDedupCounts(dates) {
     // Build result from cache
     const result = {};
     for (const d of dates) {
-        if (cache.dedupCounts[d]) result[d] = cache.dedupCounts[d];
+        if (bucket.dedupCounts[d]) result[d] = bucket.dedupCounts[d];
     }
     return result;
 }
@@ -1148,7 +1271,8 @@ async function getDedupCounts(dates) {
 // Safety: a field is only overwritten when dedup found events for it. Legacy
 // raw values are preserved when dedup says zero (e.g. days that pre-date the
 // events table). The overrides JSONB column is never touched.
-async function finalizeDailyMetricsForDate(isoDate) {
+async function finalizeDailyMetricsForDate(funnel, isoDate) {
+    const supabase = clientFor(funnel);
     // 60-day lookback so we capture late-arriving events whose
     // webinar_datetime_utc resolves to isoDate (people register early).
     const target = new Date(isoDate + 'T12:00:00Z');
@@ -1159,14 +1283,14 @@ async function finalizeDailyMetricsForDate(isoDate) {
     const fromISO = fromDate.toISOString().slice(0, 10);
     const toISO = toDate.toISOString().slice(0, 10);
 
-    const events = await fetchEventsForDateRange(fromISO, toISO);
+    const events = await fetchEventsForDateRange(funnel, fromISO, toISO);
     const dedupMap = computeDedupFromEvents(events);
     const counts = dedupMap[isoDate] || {};
 
     const FIELDS = [
         'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
         'purchases_fb', 'purchases_native', 'purchases_youtube',
-        'purchases_aibot', 'purchases_postwebinar',
+        'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa',
     ];
 
     const updates = { finalized_at: new Date().toISOString() };
@@ -1194,9 +1318,9 @@ async function finalizeDailyMetricsForDate(isoDate) {
         .update(updates).eq('date', isoDate);
     if (error) throw error;
 
-    invalidateMetricsCache();
-    invalidateInsightsCache();
-    delete cache.dedupCounts[isoDate];
+    invalidateMetricsCache(funnel);
+    invalidateInsightsCache(funnel);
+    delete getCacheBucket(funnel).dedupCounts[isoDate];
 
     return { date: isoDate, written };
 }
@@ -1204,21 +1328,24 @@ async function finalizeDailyMetricsForDate(isoDate) {
 // GET /api/metrics — Fetch all daily metrics (with caching)
 app.get('/api/metrics', dashboardLimiter, async (req, res) => {
     try {
+        const funnel = resolveFunnel(req, 'analytics');
+        const supabase = clientFor(funnel);
+        const bucket = getCacheBucket(funnel);
         const { limit = 90, offset = 0 } = req.query;
 
         // ── Response cache: serve cached response if fresh ────────────────
         const now = Date.now();
-        if (cache.metricsResponse && (now - cache.metricsUpdatedAt) < cache.metricsTTL) {
+        if (bucket.metricsResponse && (now - bucket.metricsUpdatedAt) < cache.metricsTTL) {
             // Only serve cache if request params match (default pagination)
             if (Number(limit) === 90 && Number(offset) === 0) {
                 cache.hits++;
-                return res.json(cache.metricsResponse);
+                return res.json(bucket.metricsResponse);
             }
         }
 
         // Snapshot the epoch before the Supabase fetch + dedup join so we
         // can detect a mid-flight invalidation and skip the cache write.
-        const epochAtStart = cache.invalidationEpoch;
+        const epochAtStart = bucket.invalidationEpoch;
 
         const { data, error, count } = await supabase
             .from('daily_metrics')
@@ -1237,7 +1364,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         const dates = (data || [])
             .filter(r => !r.finalized_at)
             .map(r => String(r.date).substring(0, 10));
-        const dedupMap = await getDedupCounts(dates);
+        const dedupMap = await getDedupCounts(funnel, dates);
 
         // Convert to frontend format (MM/DD/YYYY)
         // Priority: manual override > deduped count > raw daily_metrics
@@ -1254,7 +1381,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             // contain stale/legacy values from batch upserts.
             const DEDUP_COLS = new Set([
                 'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
-                'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar',
+                'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa',
             ]);
             const pick = (field) => {
                 if (ov[field] !== undefined) return ov[field];
@@ -1276,13 +1403,14 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 purchases_youtube: pick('purchases_youtube'),
                 purchases_aibot: pick('purchases_aibot'),
                 purchases_postwebinar: pick('purchases_postwebinar'),
+                purchases_cpa: pick('purchases_cpa'),
                 total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
                                  (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
-                                 (pick('purchases_postwebinar') || 0),
+                                 (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0),
                 // 'purchases' is an alias for total_purchases (backward compat for custom formulas)
                 purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
                            (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
-                           (pick('purchases_postwebinar') || 0),
+                           (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0),
                 attended: pick('attended'),
                 created_at: row.created_at,
                 updated_at: row.updated_at,
@@ -1296,11 +1424,11 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         // we just built reflects pre-invalidation Supabase state and would
         // mask the new data for up to metricsTTL.
         if (Number(limit) === 90 && Number(offset) === 0) {
-            if (cache.invalidationEpoch === epochAtStart) {
-                cache.metricsResponse = response;
-                cache.metricsUpdatedAt = now;
+            if (bucket.invalidationEpoch === epochAtStart) {
+                bucket.metricsResponse = response;
+                bucket.metricsUpdatedAt = now;
             } else {
-                console.log(`⚠️  Cache: skipped metricsResponse write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${cache.invalidationEpoch})`);
+                console.log(`⚠️  Cache[${funnel}]: skipped metricsResponse write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${bucket.invalidationEpoch})`);
             }
         }
 
@@ -1316,6 +1444,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
 // Saves edited values into the 'overrides' column so they permanently take precedence
 app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const dateInput = parseDateInput(req.params.date);
         if (!dateInput) return res.status(400).json({ error: 'Invalid date' });
 
@@ -1324,7 +1453,7 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
 
         // Only write to overrides — raw columns stay as the automated data source.
         // This prevents overrides from drifting separately from raw columns (#6).
-        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar'];
+        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa'];
         const newOverrides = {};
         for (const f of OVERRIDE_FIELDS) {
             if (body[f] !== undefined) {
@@ -1344,8 +1473,8 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
             .single();
 
         if (error) throw error;
-        invalidateMetricsCache();
-        invalidateInsightsCache();
+        invalidateMetricsCache(req.funnel);
+        invalidateInsightsCache(req.funnel);
         res.json({ success: true, data });
 
     } catch (err) {
@@ -1357,6 +1486,7 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
 // DELETE /api/metrics/:date
 app.delete('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const dateInput = parseDateInput(req.params.date);
         if (!dateInput) return res.status(400).json({ error: 'Invalid date' });
 
@@ -1367,8 +1497,8 @@ app.delete('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, as
             .eq('date', isoDate);
 
         if (error) throw error;
-        invalidateDedupForDate(isoDate);
-        invalidateInsightsCache();
+        invalidateDedupForDate(req.funnel, isoDate);
+        invalidateInsightsCache(req.funnel);
         res.json({ success: true, deleted: dateInput });
 
     } catch (err) {
@@ -1385,6 +1515,7 @@ app.delete('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, as
 // GET /api/custom-metrics
 app.get('/api/custom-metrics', dashboardLimiter, async (req, res) => {
     try {
+        const supabase = clientFor(resolveFunnel(req, 'analytics'));
         const { data, error } = await supabase
             .from('custom_metrics')
             .select('*')
@@ -1401,6 +1532,7 @@ app.get('/api/custom-metrics', dashboardLimiter, async (req, res) => {
 // POST /api/custom-metrics
 app.post('/api/custom-metrics', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { name, formula, format = 'number' } = req.body;
         if (!name || !formula) {
             return res.status(400).json({ error: 'name and formula required' });
@@ -1423,6 +1555,7 @@ app.post('/api/custom-metrics', dashboardLimiter, requireAuth, requireAdmin, asy
 // PUT /api/custom-metrics/:id
 app.put('/api/custom-metrics/:id', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { name, formula, format } = req.body;
         const updates = {};
         if (name) updates.name = name;
@@ -1447,6 +1580,7 @@ app.put('/api/custom-metrics/:id', dashboardLimiter, requireAuth, requireAdmin, 
 // DELETE /api/custom-metrics/:id
 app.delete('/api/custom-metrics/:id', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { error } = await supabase
             .from('custom_metrics')
             .delete()
@@ -1467,6 +1601,7 @@ app.delete('/api/custom-metrics/:id', dashboardLimiter, requireAuth, requireAdmi
 
 app.get('/api/events', dashboardLimiter, async (req, res) => {
     try {
+        const supabase = clientFor(resolveFunnel(req, 'analytics'));
         const { limit = 100, offset = 0, type } = req.query;
         let query = supabase
             .from('events')
@@ -1492,6 +1627,7 @@ app.get('/api/events', dashboardLimiter, async (req, res) => {
 
 app.get('/api/webhook-log', dashboardLimiter, async (req, res) => {
     try {
+        const supabase = clientFor(resolveFunnel(req, 'analytics'));
         const { limit = 50 } = req.query;
         const { data, error } = await supabase
             .from('webhook_log')
@@ -1512,13 +1648,15 @@ app.get('/api/webhook-log', dashboardLimiter, async (req, res) => {
 // CACHE MANAGEMENT
 // =============================================================================
 
-// POST /api/cache/clear — Authenticated: flush all caches (use after direct DB edits)
+// POST /api/cache/clear — Authenticated: flush this funnel's caches (use after direct DB edits)
 app.post('/api/cache/clear', requireAuth, async (req, res) => {
-    const daysBefore = Object.keys(cache.dedupCounts).length;
-    cache.dedupCounts = {};
-    invalidateMetricsCache();
-    invalidateInsightsCache();
-    console.log(`🧹 Cache: full clear by ${req.user.email} (${daysBefore} days flushed)`);
+    const bucket = getCacheBucket(req.funnel);
+    const daysBefore = Object.keys(bucket.dedupCounts).length;
+    bucket.dedupCounts = {};
+    bucket.dedupTimestamps = {};
+    invalidateMetricsCache(req.funnel);
+    invalidateInsightsCache(req.funnel);
+    console.log(`🧹 Cache[${req.funnel}]: full clear by ${req.user.email} (${daysBefore} days flushed)`);
     res.json({ success: true, message: `Cache cleared (${daysBefore} days flushed)` });
 });
 
@@ -1529,8 +1667,27 @@ app.post('/api/cache/clear', requireAuth, async (req, res) => {
 // each new yesterday going forward, so this only needs to run once.
 //
 // Optional body: { force: true } — re-finalize rows even if finalized_at is set.
+// POST /api/admin/finalize-date — Re-finalize a single day. Recomputes the
+// dedup counts from events and overwrites the canonical columns (and
+// finalized_at) in daily_metrics. Use after editing/inserting events for
+// a past day. Body: { date: "YYYY-MM-DD" or "MM/DD/YYYY" }
+app.post('/api/admin/finalize-date', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const dateInput = parseDateInput(req.body?.date);
+        if (!dateInput) return res.status(400).json({ error: 'Send { date: "YYYY-MM-DD" or "MM/DD/YYYY" }' });
+        const isoDate = dateToISO(dateInput);
+        const result = await finalizeDailyMetricsForDate(req.funnel, isoDate);
+        console.log(`🧊 [${req.funnel}] Finalize ${isoDate} by ${req.user.email}: ${JSON.stringify(result.written)}`);
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('❌ POST /api/admin/finalize-date error:', err.message);
+        res.status(500).json({ error: 'Finalize failed', detail: err.message });
+    }
+});
+
 app.post('/api/admin/finalize-past-days', requireAuth, requireAdmin, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { force = false } = req.body || {};
         const todayISO = dateToISO(getLADate());
 
@@ -1547,7 +1704,7 @@ app.post('/api/admin/finalize-past-days', requireAuth, requireAdmin, async (req,
         for (const row of rows || []) {
             const isoDate = String(row.date).substring(0, 10);
             try {
-                const r = await finalizeDailyMetricsForDate(isoDate);
+                const r = await finalizeDailyMetricsForDate(req.funnel, isoDate);
                 results.push({ date: isoDate, ok: true, written: r.written });
             } catch (err) {
                 console.error(`❌ Finalize ${isoDate} failed:`, err.message);
@@ -1556,7 +1713,7 @@ app.post('/api/admin/finalize-past-days', requireAuth, requireAdmin, async (req,
         }
 
         const okCount = results.filter(r => r.ok).length;
-        console.log(`🧊 Backfill: finalized ${okCount}/${results.length} past days (force=${force}) by ${req.user.email}`);
+        console.log(`🧊 Backfill[${req.funnel}]: finalized ${okCount}/${results.length} past days (force=${force}) by ${req.user.email}`);
         res.json({ total: results.length, finalized: okCount, results });
     } catch (err) {
         console.error('❌ POST /api/admin/finalize-past-days error:', err.message);
@@ -1570,7 +1727,17 @@ app.post('/api/admin/finalize-past-days', requireAuth, requireAdmin, async (req,
 
 app.get('/api/health', async (req, res) => {
     try {
-        const { data, error } = await supabase.from('daily_metrics').select('id').limit(1);
+        // Health-check the analytics schema as the canonical liveness probe.
+        const { error } = await supabasePublic.from('daily_metrics').select('id').limit(1);
+        const cachePerFunnel = {};
+        for (const [funnel, b] of Object.entries(cache.byFunnel)) {
+            cachePerFunnel[funnel] = {
+                dedup_days_cached: Object.keys(b.dedupCounts).length,
+                metrics_cached: !!b.metricsResponse,
+                metrics_age_sec: b.metricsUpdatedAt ? Math.round((Date.now() - b.metricsUpdatedAt) / 1000) : null,
+                insights_cached: !!b.insightsContext,
+            };
+        }
         res.json({
             status: 'ok',
             timestamp: new Date().toISOString(),
@@ -1578,10 +1745,7 @@ app.get('/api/health', async (req, res) => {
             la_time: new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }),
             database: error ? 'error' : 'connected',
             cache: {
-                dedup_days_cached: Object.keys(cache.dedupCounts).length,
-                metrics_cached: !!cache.metricsResponse,
-                metrics_age_sec: cache.metricsUpdatedAt ? Math.round((Date.now() - cache.metricsUpdatedAt) / 1000) : null,
-                insights_cached: !!cache.insightsContext,
+                per_funnel: cachePerFunnel,
                 hits: cache.hits,
                 misses: cache.misses,
                 hit_rate: (cache.hits + cache.misses) > 0 ? `${Math.round(cache.hits / (cache.hits + cache.misses) * 100)}%` : 'N/A',
@@ -1601,11 +1765,11 @@ app.get('/api/health', async (req, res) => {
 // This pulls today's cumulative spend from Facebook and writes it to Supabase
 if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
     cron.schedule('0,30 * * * *', async () => {
-        console.log('🔄 FB sync cron triggered');
+        console.log('🔄 FB sync cron triggered (analytics funnel only)');
         try {
             await syncFacebookSpend();
-            invalidateMetricsCache();
-            invalidateInsightsCache();
+            invalidateMetricsCache('analytics');
+            invalidateInsightsCache('analytics');
         } catch (err) {
             console.error('❌ FB sync cron failed:', err.message);
         }
@@ -1624,29 +1788,14 @@ if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
     cron.schedule('0 4 * * *', async () => {
         try {
             const yesterdayISO = computeYesterdayLA();
-            console.log(`🌙 Daily 4 AM cron: fetching final ad insights for ${yesterdayISO}`);
+            console.log(`🌙 Daily 4 AM cron: fetching final ad insights for ${yesterdayISO} (analytics)`);
             const insights = await fetchFacebookInsights(yesterdayISO);
             await writeInsightsToSupabase(yesterdayISO, insights);
-            invalidateMetricsCache();
-            invalidateInsightsCache();
+            invalidateMetricsCache('analytics');
+            invalidateInsightsCache('analytics');
             console.log(`✅ Daily 4 AM cron: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks written for ${yesterdayISO}`);
         } catch (err) {
             console.error('❌ Daily 4 AM ad-spend cron failed:', err.message);
-        }
-    }, { timezone: 'America/Los_Angeles' });
-
-    // Cron: daily at 4:05 AM PST — finalize yesterday's deduped event counts
-    // into the canonical daily_metrics columns. Runs after the 4:00 AM FB
-    // sync so spend/link clicks are settled. After finalization, /api/metrics
-    // reads yesterday's row directly and skips the dedup engine.
-    cron.schedule('5 4 * * *', async () => {
-        try {
-            const yesterdayISO = computeYesterdayLA();
-            console.log(`🧊 Daily 4:05 AM cron: finalizing daily_metrics for ${yesterdayISO}`);
-            const result = await finalizeDailyMetricsForDate(yesterdayISO);
-            console.log(`✅ Finalized ${yesterdayISO}: ${JSON.stringify(result.written)}`);
-        } catch (err) {
-            console.error('❌ Daily 4:05 AM finalize cron failed:', err.message);
         }
     }, { timezone: 'America/Los_Angeles' });
 
@@ -1655,28 +1804,55 @@ if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
     console.log('⚠️  Facebook sync disabled — set FB_ACCESS_TOKEN and FB_AD_ACCOUNT_ID to enable');
 }
 
-// Manual trigger — hit this to force a sync right now
+// Helper: yesterday in LA as YYYY-MM-DD (used by finalize cron below; also
+// defined inside the FB block above for the FB-only crons).
+const _computeYesterdayLA = () => {
+    const now = new Date();
+    const y = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    y.setDate(y.getDate() - 1);
+    return `${y.getFullYear()}-${String(y.getMonth() + 1).padStart(2, '0')}-${String(y.getDate()).padStart(2, '0')}`;
+};
+
+// Cron: daily at 4:05 AM PST — finalize yesterday's deduped event counts
+// into the canonical daily_metrics columns for EVERY funnel. Runs regardless
+// of FB config (the dedup engine doesn't depend on FB).
+cron.schedule('5 4 * * *', async () => {
+    const yesterdayISO = _computeYesterdayLA();
+    for (const funnel of ALLOWED_FUNNELS) {
+        try {
+            console.log(`🧊 [${funnel}] Daily 4:05 AM cron: finalizing daily_metrics for ${yesterdayISO}`);
+            const result = await finalizeDailyMetricsForDate(funnel, yesterdayISO);
+            console.log(`✅ [${funnel}] Finalized ${yesterdayISO}: ${JSON.stringify(result.written)}`);
+        } catch (err) {
+            console.error(`❌ [${funnel}] Daily 4:05 AM finalize cron failed:`, err.message);
+        }
+    }
+}, { timezone: 'America/Los_Angeles' });
+
+// Manual trigger — force a FB sync right now (analytics-only since FB is
+// not used by the native funnel; Taboola integration is future work)
 app.post('/api/fb-sync', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
         const result = await syncFacebookSpend();
         if (!result) {
             return res.status(400).json({ error: 'FB sync not configured — check FB_ACCESS_TOKEN and FB_AD_ACCOUNT_ID' });
         }
-        invalidateMetricsCache();
-        invalidateInsightsCache();
+        invalidateMetricsCache('analytics');
+        invalidateInsightsCache('analytics');
         res.json({ success: true, ...result });
     } catch (err) {
         res.status(500).json({ error: 'FB sync failed', detail: err.message });
     }
 });
 
-// GET /api/fb-sync/status — check if sync is configured and last run
+// GET /api/fb-sync/status — check if sync is configured and last run.
+// FB sync is analytics-only so we read from the analytics webhook_log.
 app.get('/api/fb-sync/status', dashboardLimiter, async (req, res) => {
     const configured = !!(process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID);
 
     let lastSync = null;
     if (configured) {
-        const { data } = await supabase
+        const { data } = await clientFor('analytics')
             .from('webhook_log')
             .select('*')
             .eq('source', 'fb-sync')
@@ -1700,7 +1876,8 @@ app.get('/api/fb-sync/status', dashboardLimiter, async (req, res) => {
 
 app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => {
     try {
-        // Verify admin role
+        const supabase = clientFor(req.funnel);
+        // Verify admin role within the active funnel
         const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
         if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
 
@@ -1715,7 +1892,7 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
             // Fetch events for the requested date range
             const fetchFrom = dateFrom || '2020-01-01';
             const fetchTo = dateTo || dateToISO(getLADate());
-            const events = await fetchEventsForDateRange(fetchFrom, fetchTo);
+            const events = await fetchEventsForDateRange(req.funnel, fetchFrom, fetchTo);
 
             // Apply the same dedup logic as computeDedupFromEvents, but keep the winning rows
             const seen = {}; // key: "YYYY-MM-DD|eventKey|userKey" → first event
@@ -1826,6 +2003,8 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
     }
 
     try {
+        const supabase = clientFor(req.funnel);
+        const bucket = getCacheBucket(req.funnel);
         const { messages = [] } = req.body;
         if (!Array.isArray(messages) || messages.length === 0) {
             return res.status(400).json({ error: 'Send { messages: [{ role, content }] }' });
@@ -1835,17 +2014,17 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
         let metricsData, dailyEventCounts, recentEvents;
 
         const now = Date.now();
-        if (cache.insightsContext && (now - cache.insightsUpdatedAt) < cache.insightsTTL) {
+        if (bucket.insightsContext && (now - bucket.insightsUpdatedAt) < cache.insightsTTL) {
             // Serve from cache
-            ({ metricsData, dailyEventCounts, recentEvents } = cache.insightsContext);
-            console.log('📦 Cache HIT: insights context');
+            ({ metricsData, dailyEventCounts, recentEvents } = bucket.insightsContext);
+            console.log(`📦 Cache[${req.funnel}] HIT: insights context`);
         } else {
-            console.log('📊 Cache MISS: fetching insights context from Supabase');
+            console.log(`📊 Cache[${req.funnel}] MISS: fetching insights context from Supabase`);
 
             // Snapshot the epoch before the async fetches. If an invalidation
             // runs while we're waiting on Supabase, skip the cache write so
             // the next request rebuilds from fresh state.
-            const epochAtStart = cache.invalidationEpoch;
+            const epochAtStart = bucket.invalidationEpoch;
 
             const [metricsRes, eventsRes] = await Promise.all([
                 supabase.from('daily_metrics').select('*').order('date', { ascending: false }).limit(90),
@@ -1858,14 +2037,14 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
             const dates = rawRows
                 .filter(r => !r.finalized_at)
                 .map(r => String(r.date).substring(0, 10));
-            const dedupMap = await getDedupCounts(dates);
+            const dedupMap = await getDedupCounts(req.funnel, dates);
 
             metricsData = rawRows.map(r => {
                 const dateStr = String(r.date).substring(0, 10);
                 const deduped = dedupMap[dateStr] || {};
                 const hasDedup = Object.keys(deduped).length > 0;
                 const ov = r.overrides || {};
-                const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar']);
+                const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa']);
                 const pick = (field) => {
                     if (ov[field] !== undefined) return ov[field];
                     if (deduped[field] !== undefined) return deduped[field];
@@ -1887,9 +2066,10 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
                     purchases_youtube: pick('purchases_youtube') || 0,
                     purchases_aibot: pick('purchases_aibot') || 0,
                     purchases_postwebinar: pick('purchases_postwebinar') || 0,
+                    purchases_cpa: pick('purchases_cpa') || 0,
                     total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
                                      (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
-                                     (pick('purchases_postwebinar') || 0),
+                                     (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0),
                 };
             });
 
@@ -1919,11 +2099,11 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
 
             // Store in cache only if no invalidation occurred mid-fetch.
             // The current request still uses the freshly built context.
-            if (cache.invalidationEpoch === epochAtStart) {
-                cache.insightsContext = { metricsData, dailyEventCounts, recentEvents };
-                cache.insightsUpdatedAt = now;
+            if (bucket.invalidationEpoch === epochAtStart) {
+                bucket.insightsContext = { metricsData, dailyEventCounts, recentEvents };
+                bucket.insightsUpdatedAt = now;
             } else {
-                console.log(`⚠️  Cache: skipped insightsContext write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${cache.invalidationEpoch})`);
+                console.log(`⚠️  Cache[${req.funnel}]: skipped insightsContext write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${bucket.invalidationEpoch})`);
             }
         }
 
@@ -1947,6 +2127,7 @@ THE FUNNEL STAGES (in order):
    - purchases_youtube (Youtube) — from Youtube campaigns
    - purchases_aibot (AI Chat Bot) — from AI chatbot interactions
    - purchases_postwebinar (Post Webinar) — Paid Ads purchases made 12+ hours AFTER attending a webinar
+   - purchases_cpa (CPA Traffic Funnel) — purchases attributed to the CPA Traffic source
    - total_purchases — sum of all purchase sources above
 
 KEY METRICS TO TRACK:
@@ -2020,6 +2201,7 @@ INSTRUCTIONS:
 // GET /api/insights/conversations — list all chats for the authenticated user
 app.get('/api/insights/conversations', dashboardLimiter, requireAuth, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { data, error } = await supabase
             .from('chat_conversations')
             .select('id, title, updated_at')
@@ -2037,6 +2219,7 @@ app.get('/api/insights/conversations', dashboardLimiter, requireAuth, async (req
 // GET /api/insights/conversations/:id — fetch a single conversation with messages
 app.get('/api/insights/conversations/:id', dashboardLimiter, requireAuth, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { data, error } = await supabase
             .from('chat_conversations')
             .select('*')
@@ -2058,6 +2241,7 @@ app.get('/api/insights/conversations/:id', dashboardLimiter, requireAuth, async 
 // PUT /api/insights/conversations/:id — create or update a conversation
 app.put('/api/insights/conversations/:id', dashboardLimiter, requireAuth, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { title, messages } = req.body;
         if (!Array.isArray(messages)) {
             return res.status(400).json({ error: 'messages must be an array' });
@@ -2085,6 +2269,7 @@ app.put('/api/insights/conversations/:id', dashboardLimiter, requireAuth, async 
 // DELETE /api/insights/conversations/:id — delete a conversation
 app.delete('/api/insights/conversations/:id', dashboardLimiter, requireAuth, async (req, res) => {
     try {
+        const supabase = clientFor(req.funnel);
         const { error } = await supabase
             .from('chat_conversations')
             .delete()

@@ -11,6 +11,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "db:migrate": "psql $DATABASE_URL -f db/schema.sql",
+    "db:migrate:native": "psql $DATABASE_URL -f db/native_schema.sql",
     "generate-key": "node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"",
     "test:webhook": "node scripts/test-webhook.js",
     "test:fb-sync": "node fb-sync.js"
