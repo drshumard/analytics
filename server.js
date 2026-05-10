@@ -543,18 +543,24 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
                     }
                 }
             } else {
-                // All other event types: 5-minute dedup window (webhook retry protection)
+                // All other event types: 5-minute dedup window (webhook retry protection).
+                // For stayeduntil, the milestone (45/60/80) is part of the dedup key —
+                // hitting 45 then 60 from the same user within 5 min are NOT duplicates.
                 const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-                const { data: existing } = await supabase
+                let q = supabase
                     .from('events')
                     .select('id')
                     .eq('event_type', field)
                     .eq('email', email)
-                    .gte('event_time', fiveMinAgo)
-                    .limit(1);
+                    .gte('event_time', fiveMinAgo);
+                if (field === 'stayeduntil' && rest.stayeduntil !== undefined) {
+                    q = q.eq('metadata->>stayeduntil', String(rest.stayeduntil));
+                }
+                const { data: existing } = await q.limit(1);
 
                 if (existing && existing.length > 0) {
-                    console.log(`⏭️  Dedup skip: ${field} for ${email} (duplicate within 5min)`);
+                    const detail = field === 'stayeduntil' ? `${field} ${rest.stayeduntil}min` : field;
+                    console.log(`⏭️  Dedup skip: ${detail} for ${email} (duplicate within 5min)`);
                     return res.json({ success: true, duplicate: true, message: 'Duplicate event skipped' });
                 }
             }
