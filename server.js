@@ -1345,9 +1345,12 @@ async function getDedupCounts(funnel, dates) {
 // columns of daily_metrics, then mark the row as finalized. After this runs,
 // /api/metrics reads the row directly without consulting the events table.
 //
-// Safety: a field is only overwritten when dedup found events for it. Legacy
-// raw values are preserved when dedup says zero (e.g. days that pre-date the
-// events table). The overrides JSONB column is never touched.
+// Safety: a field is overwritten when dedup found events for it, OR when the
+// events table has at least one event of the same parent event_type for this
+// date (the events table is authoritative for that type, so a recomputed zero
+// must be written — otherwise deletions can't propagate). Days with no events
+// of a given parent type keep their legacy raw values untouched. The overrides
+// JSONB column is never touched.
 async function finalizeDailyMetricsForDate(funnel, isoDate) {
     const supabase = clientFor(funnel);
     // 60-day lookback so we capture late-arriving events whose
@@ -1364,6 +1367,26 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
     const dedupMap = computeDedupFromEvents(events);
     const counts = dedupMap[isoDate] || {};
 
+    // Which event_types are present in the events table for isoDate. If a
+    // parent event_type has at least one row, the events table owns the truth
+    // for that type and a recomputed zero must be written (otherwise deleting
+    // the last event of a kind leaves the stale canonical column in place).
+    // Date assignment mirrors computeDedupFromEvents.
+    const eventTypesOnDate = new Set();
+    for (const ev of events) {
+        let d;
+        if (ev.metadata?.webinar_datetime_utc) {
+            const cleaned = ev.metadata.webinar_datetime_utc.replace(/(\d+)(st|nd|rd|th)/gi, '$1');
+            const parsed = new Date(cleaned + ' UTC');
+            d = !isNaN(parsed.getTime())
+                ? parsed.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' })
+                : new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+        } else {
+            d = new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+        }
+        if (d === isoDate) eventTypesOnDate.add(ev.event_type);
+    }
+
     const FIELDS = [
         'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
         'purchases_fb', 'purchases_native', 'purchases_youtube',
@@ -1371,12 +1394,22 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
         'stayed_45', 'stayed_60', 'stayed_80',
     ];
 
+    const FIELD_PARENT = {
+        registrations: 'registrations', attended: 'attended', replays: 'replays',
+        viewedcta: 'viewedcta', clickedcta: 'clickedcta',
+        purchases_fb: 'purchases', purchases_native: 'purchases',
+        purchases_youtube: 'purchases', purchases_aibot: 'purchases',
+        purchases_postwebinar: 'purchases', purchases_cpa: 'purchases',
+        stayed_45: 'stayeduntil', stayed_60: 'stayeduntil', stayed_80: 'stayeduntil',
+    };
+
     const updates = { finalized_at: new Date().toISOString() };
     const written = {};
     for (const f of FIELDS) {
         // counts[f] is the per-variant breakdown; canonical columns store the total
         const v = Number(counts[f]?.all) || 0;
-        if (v > 0) {
+        const parentAuthoritative = eventTypesOnDate.has(FIELD_PARENT[f]);
+        if (v > 0 || parentAuthoritative) {
             updates[f] = v;
             written[f] = v;
         }
