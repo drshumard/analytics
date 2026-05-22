@@ -25,7 +25,8 @@
     "express-rate-limit": "^7.4.0",
     "helmet": "^7.1.0",
     "node-cron": "^3.0.3",
-    "react-datepicker": "^9.1.0"
+    "react-datepicker": "^9.1.0",
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.0",

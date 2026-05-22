@@ -7,6 +7,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -48,7 +49,9 @@ const FUNNEL_BRANDS = {
     native:    { brand: 'Dr Shumard', context: 'a medical practice', funnelName: 'Native Ads Funnel' },
 };
 
-const supabasePublic = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+const supabasePublic = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+    realtime: { transport: ws },
+});
 
 const _funnelClients = new Map();
 function clientFor(funnel) {
@@ -57,6 +60,7 @@ function clientFor(funnel) {
     if (!_funnelClients.has(funnel)) {
         _funnelClients.set(funnel, createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
             db: { schema },
+            realtime: { transport: ws },
         }));
     }
     return _funnelClients.get(funnel);

@@ -5,6 +5,7 @@
 // ============================================================================
 
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
 import 'dotenv/config';
 
 const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
@@ -17,6 +18,7 @@ const FB_API_VERSION = process.env.FB_API_VERSION || 'v23.0';
 // Taboola, not Facebook, so this sync is intentionally analytics-only.
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
     db: { schema: 'public' },
+    realtime: { transport: ws },
 });
 
 // ─── Get today's date in LA timezone ─────────────────────────────────────────
