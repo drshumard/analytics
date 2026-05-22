@@ -776,7 +776,7 @@ export default function App() {
             {isAdmin && <button style={{ ...S.btnLight, opacity: finalizing ? 0.6 : 1 }} disabled={finalizing} onClick={finalizePastDays} title="Freeze deduped values for all past days into the canonical columns">{finalizing ? "Finalizing…" : "Finalize Past Days"}</button>}
             {view === "dash" && (
               <>
-                <button style={S.btnLight} onClick={() => setView("insights")}>Insights</button>
+                <button style={S.btnLight} onClick={() => setView("insights")}>AI Insights</button>
                 <button style={S.btnLight} onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}>Activity Log</button>
                 {isAdmin && <button style={S.btnLight} onClick={() => setView("query")}>Query Data</button>}
                 {isAdmin && <button style={S.btnLight} onClick={() => { setEditCM(null); setView("custom-list"); }}>Manage Metrics</button>}
@@ -810,7 +810,7 @@ export default function App() {
           <button className="mobile-nav-item" onClick={refreshWebhook}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={16} stroke="#6B7280" /> Refresh Data</button>
           {view === "dash" && (
             <>
-              <button className="mobile-nav-item" onClick={() => setView("insights")}><I d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" size={16} stroke="#6B7280" /> Insights</button>
+              <button className="mobile-nav-item" onClick={() => setView("insights")}><I d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" size={16} stroke="#6B7280" /> AI Insights</button>
               <button className="mobile-nav-item" onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}><I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" size={16} stroke="#6B7280" /> Activity Log</button>
               {isAdmin && <button className="mobile-nav-item" onClick={() => setView("query")}><I d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" size={16} stroke="#6B7280" /> Query Data</button>}
               {isAdmin && <button className="mobile-nav-item" onClick={() => { setEditCM(null); setView("custom-list"); }}><I d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" size={16} stroke="#6B7280" /> Manage Metrics</button>}
@@ -843,7 +843,7 @@ export default function App() {
         </div>
       )}
 
-      <main className="main-content" style={S.main}>
+      <main className="main-content" style={view === "insights" ? { padding: 0, maxWidth: "none", margin: 0 } : S.main}>
         {view === "dash" && (
           <div className="fi">
             <div className="title-row" style={S.titleRow}>
@@ -1169,7 +1169,7 @@ export default function App() {
             </div>
           </div>
         )}
-        {view === "insights" && <InsightsChat flash={flash} isMobile={isMobile} />}
+        {view === "insights" && <InsightsChat flash={flash} isMobile={isMobile} activeFunnel={activeFunnel} />}
         {view === "query" && <QueryBuilder flash={flash} />}
       </main>
 
@@ -1510,34 +1510,379 @@ function CMForm({ initial, onSubmit, onCancel, metrics, customs = [] }) {
 }
 
 // Simple markdown renderer for chat messages
-function renderMd(text) {
-  if (!text) return text;
-  return text.split('\n').map((line, i) => {
-    // Headers
-    if (line.startsWith('### ')) return <h4 key={i} style={{ fontSize: 14, fontWeight: 700, color: "#111827", margin: "12px 0 4px" }}>{line.slice(4)}</h4>;
-    if (line.startsWith('## ')) return <h3 key={i} style={{ fontSize: 15, fontWeight: 700, color: "#111827", margin: "14px 0 4px" }}>{line.slice(3)}</h3>;
-    if (line.startsWith('# ')) return <h2 key={i} style={{ fontSize: 16, fontWeight: 700, color: "#111827", margin: "16px 0 6px" }}>{line.slice(2)}</h2>;
-    // Bullet points
-    if (line.startsWith('- ') || line.startsWith('* ')) {
-      const content = line.slice(2);
-      return <div key={i} style={{ paddingLeft: 12, margin: "3px 0", display: "flex", gap: 6 }}><span style={{ color: "#9CA3AF" }}>•</span><span>{renderInline(content)}</span></div>;
-    }
-    // Empty line
-    if (line.trim() === '') return <div key={i} style={{ height: 8 }} />;
-    // Regular paragraph
-    return <p key={i} style={{ margin: "3px 0", lineHeight: 1.6 }}>{renderInline(line)}</p>;
-  });
+const CHART_COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#8B5CF6', '#EF4444', '#06B6D4'];
+
+function niceCeil(n) {
+  if (n <= 0) return 1;
+  const exp = Math.pow(10, Math.floor(Math.log10(n)));
+  const norm = n / exp;
+  let nice;
+  if (norm <= 1) nice = 1;
+  else if (norm <= 2) nice = 2;
+  else if (norm <= 5) nice = 5;
+  else nice = 10;
+  return nice * exp;
+}
+function fmtChartNum(v) {
+  if (!Number.isFinite(v)) return '';
+  const abs = Math.abs(v);
+  if (abs >= 1e6) return (v / 1e6).toFixed(abs >= 1e7 ? 0 : 1) + 'M';
+  if (abs >= 1e3) return (v / 1e3).toFixed(abs >= 1e4 ? 0 : 1) + 'k';
+  if (abs >= 10) return v.toFixed(0);
+  if (abs >= 1) return v.toFixed(1);
+  if (abs > 0) return v.toFixed(2);
+  return '0';
 }
 
-function renderInline(text) {
-  // Bold **text**
-  const parts = text.split(/(\*\*[^*]+\*\*)/g);
-  return parts.map((part, i) => {
-    if (part.startsWith('**') && part.endsWith('**')) {
-      return <strong key={i} style={{ fontWeight: 700, color: "#111827" }}>{part.slice(2, -2)}</strong>;
-    }
-    return <span key={i}>{part}</span>;
+function MdChart({ spec }) {
+  if (!spec || !Array.isArray(spec.data) || spec.data.length === 0) {
+    return <div style={{ padding: 12, color: '#9CA3AF', fontSize: 13 }}>(empty chart)</div>;
+  }
+  const type = spec.type === 'bar' ? 'bar' : (spec.type === 'area' ? 'area' : 'line');
+  const xKey = spec.x || 'x';
+  const series = (Array.isArray(spec.series) ? spec.series : []).filter(s => s && s.key);
+  if (series.length === 0) return <div style={{ padding: 12, color: '#9CA3AF', fontSize: 13 }}>(chart has no series)</div>;
+
+  const W = 640, H = 280, PAD_L = 48, PAD_R = 16, PAD_T = 12, PAD_B = 44;
+  const innerW = W - PAD_L - PAD_R;
+  const innerH = H - PAD_T - PAD_B;
+
+  let yMin = 0, yMax = 0;
+  spec.data.forEach(d => {
+    series.forEach(s => {
+      const v = Number(d[s.key]);
+      if (Number.isFinite(v)) {
+        if (v < yMin) yMin = v;
+        if (v > yMax) yMax = v;
+      }
+    });
   });
+  if (yMax === yMin) yMax = yMin + 1;
+  // 10% headroom above the tallest value so bars/lines don't kiss the top edge.
+  const niceMax = niceCeil(yMax * 1.1);
+  const niceMin = yMin >= 0 ? 0 : -niceCeil(-yMin * 1.1);
+  const range = niceMax - niceMin || 1;
+  const clipId = `chartclip-${Math.random().toString(36).slice(2, 9)}`;
+
+  const yScale = (v) => PAD_T + innerH - ((v - niceMin) / range) * innerH;
+  const xCount = spec.data.length;
+  const xScale = (i) => PAD_L + (xCount === 1 ? innerW / 2 : (i / (xCount - 1)) * innerW);
+  const groupW = innerW / Math.max(xCount, 1);
+  const barW = type === 'bar' ? Math.max(2, (groupW * 0.8) / series.length) : 0;
+
+  const yTickCount = 5;
+  const yTicks = [];
+  for (let t = 0; t <= yTickCount; t++) {
+    const v = niceMin + range * (t / yTickCount);
+    yTicks.push({ v, y: yScale(v) });
+  }
+
+  const xLabelEvery = Math.max(1, Math.ceil(xCount / 8));
+  const zeroY = yScale(0);
+
+  const chartWrap = { margin: "12px 0", padding: 14, border: "1px solid #E5E7EB", borderRadius: 12, background: "#fff" };
+  const chartTitle = { fontSize: 13, fontWeight: 600, color: "#111827", marginBottom: 8 };
+  const chartLegend = { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 8, justifyContent: "center" };
+  const chartLegendItem = { display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, color: "#4B5563" };
+
+  return (
+    <div style={chartWrap}>
+      {spec.title && <div style={chartTitle}>{spec.title}</div>}
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+        <defs>
+          <clipPath id={clipId}>
+            <rect x={PAD_L} y={PAD_T} width={innerW} height={innerH} />
+          </clipPath>
+        </defs>
+        {yTicks.map((t, i) => (
+          <g key={`t${i}`}>
+            <line x1={PAD_L} y1={t.y} x2={W - PAD_R} y2={t.y} stroke="#F3F4F6" strokeWidth={1} />
+            <text x={PAD_L - 6} y={t.y + 3} fontSize={10} fill="#9CA3AF" textAnchor="end">{fmtChartNum(t.v)}</text>
+          </g>
+        ))}
+        <line x1={PAD_L} y1={H - PAD_B} x2={W - PAD_R} y2={H - PAD_B} stroke="#E5E7EB" />
+        {spec.data.map((d, i) => (i % xLabelEvery === 0 || i === xCount - 1) && (
+          <text key={`x${i}`} x={xScale(i)} y={H - PAD_B + 14} fontSize={10} fill="#6B7280" textAnchor="middle">
+            {(() => { const s = String(d[xKey] ?? ''); return s.length > 10 ? s.slice(0, 10) : s; })()}
+          </text>
+        ))}
+        <g clipPath={`url(#${clipId})`}>
+        {series.map((s, si) => {
+          const color = s.color || CHART_COLORS[si % CHART_COLORS.length];
+          if (type === 'bar') {
+            return spec.data.map((d, i) => {
+              const v = Number(d[s.key]);
+              if (!Number.isFinite(v)) return null;
+              // Center the group of bars on each x position. 80% of group
+              // width is used for bars; the remaining 20% gives breathing room.
+              const x = xScale(i) - (barW * series.length) / 2 + si * barW;
+              const y = yScale(v);
+              const h = Math.abs(zeroY - y);
+              return <rect key={`${si}-${i}`} x={x} y={Math.min(y, zeroY)} width={barW * 0.86} height={Math.max(h, 1)} fill={color} rx={2} />;
+            });
+          }
+          const pts = spec.data
+            .map((d, i) => {
+              const v = Number(d[s.key]);
+              return Number.isFinite(v) ? { x: xScale(i), y: yScale(v) } : null;
+            })
+            .filter(Boolean);
+          if (pts.length === 0) return null;
+          const polyPts = pts.map(p => `${p.x},${p.y}`).join(' ');
+          if (type === 'area' && pts.length >= 2) {
+            const area = `M${pts[0].x},${zeroY} L${pts.map(p => `${p.x},${p.y}`).join(' L')} L${pts[pts.length-1].x},${zeroY} Z`;
+            return (
+              <g key={`s${si}`}>
+                <path d={area} fill={color} opacity={0.14} />
+                <polyline points={polyPts} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" />
+              </g>
+            );
+          }
+          return (
+            <g key={`s${si}`}>
+              <polyline points={polyPts} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+              {pts.length <= 60 && pts.map((p, i) => (
+                <circle key={i} cx={p.x} cy={p.y} r={2.5} fill={color} />
+              ))}
+            </g>
+          );
+        })}
+        </g>
+      </svg>
+      <div style={chartLegend}>
+        {series.map((s, si) => (
+          <span key={si} style={chartLegendItem}>
+            <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color || CHART_COLORS[si % CHART_COLORS.length], display: "inline-block" }} />
+            <span>{s.label || s.key}</span>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const MD = {
+  h1: { fontSize: 20, fontWeight: 700, color: "#0F172A", margin: "18px 0 8px", letterSpacing: "-0.02em", lineHeight: 1.3 },
+  h2: { fontSize: 17, fontWeight: 700, color: "#0F172A", margin: "16px 0 6px", letterSpacing: "-0.01em", lineHeight: 1.3 },
+  h3: { fontSize: 15, fontWeight: 700, color: "#0F172A", margin: "14px 0 4px", lineHeight: 1.3 },
+  h4: { fontSize: 14, fontWeight: 600, color: "#0F172A", margin: "12px 0 4px", lineHeight: 1.3 },
+  p: { margin: "6px 0", lineHeight: 1.6 },
+  ul: { margin: "6px 0 6px 4px", padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 2 },
+  ol: { margin: "6px 0 6px 4px", padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 2 },
+  liRow: { display: "flex", gap: 8, lineHeight: 1.6, alignItems: "flex-start" },
+  bullet: { color: "#9CA3AF", flexShrink: 0, lineHeight: 1.6 },
+  num: { color: "#6B7280", fontWeight: 600, fontVariantNumeric: "tabular-nums", flexShrink: 0, minWidth: 18, lineHeight: 1.6 },
+  code: { background: "#F3F4F6", padding: "1px 6px", borderRadius: 4, fontSize: "0.88em", fontFamily: "'IBM Plex Mono', ui-monospace, monospace", color: "#0F172A", border: "1px solid #E5E7EB" },
+  preWrap: { margin: "10px 0", borderRadius: 10, overflow: "hidden", border: "1px solid #1F2937" },
+  preLang: { background: "#1F2937", color: "#9CA3AF", padding: "6px 14px", fontSize: 11, fontWeight: 600, fontFamily: "'IBM Plex Mono', ui-monospace, monospace", textTransform: "lowercase", letterSpacing: "0.04em" },
+  pre: { background: "#0F172A", color: "#E5E7EB", padding: "12px 16px", overflow: "auto", fontSize: 12.5, lineHeight: 1.55, fontFamily: "'IBM Plex Mono', ui-monospace, monospace", margin: 0, whiteSpace: "pre" },
+  blockquote: { borderLeft: "3px solid #E5E7EB", padding: "4px 0 4px 14px", margin: "10px 0", color: "#4B5563", fontStyle: "italic" },
+  hr: { border: "none", borderTop: "1px solid #E5E7EB", margin: "16px 0" },
+  link: { color: "#2563EB", textDecoration: "underline", textUnderlineOffset: 2 },
+  strong: { fontWeight: 700, color: "#0F172A" },
+  em: { fontStyle: "italic" },
+  strike: { textDecoration: "line-through", color: "#9CA3AF" },
+  // Wrap is a horizontal-scroll container. Tables size to their content
+  // (max-content) but stretch to at least the column width — so narrow tables
+  // fill the space and wide tables get a horizontal scrollbar instead of
+  // crushing their cells.
+  tableWrap: { margin: "12px 0", border: "1px solid #E5E7EB", borderRadius: 10, overflowX: "auto", maxWidth: "100%" },
+  table: { borderCollapse: "collapse", minWidth: "100%", width: "max-content", fontSize: 13, background: "#fff" },
+  th: { background: "#FAFAFA", padding: "10px 14px", textAlign: "left", fontWeight: 600, color: "#374151", borderBottom: "1px solid #E5E7EB", fontSize: 12, whiteSpace: "nowrap" },
+  td: { padding: "10px 14px", borderBottom: "1px solid #F3F4F6", color: "#374151", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" },
+  trEven: { background: "#FAFBFC" },
+};
+
+const splitTableRow = (line) => {
+  let l = line.trim();
+  if (l.startsWith('|')) l = l.slice(1);
+  if (l.endsWith('|')) l = l.slice(0, -1);
+  return l.split('|').map(c => c.trim());
+};
+const isTableSeparator = (line) => {
+  if (!line || !line.includes('|')) return false;
+  const cells = splitTableRow(line);
+  return cells.length > 0 && cells.every(c => /^:?-+:?$/.test(c));
+};
+const isBlockLine = (line) => (
+  line.startsWith('```') ||
+  /^#{1,4}\s/.test(line) ||
+  /^---+\s*$/.test(line) || /^\*\*\*+\s*$/.test(line) ||
+  line.startsWith('>') ||
+  /^\s*[-*]\s+/.test(line) ||
+  /^\s*\d+\.\s+/.test(line)
+);
+
+function renderInline(text, baseKey = 0) {
+  if (!text) return null;
+  const regex = /(`[^`]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(_[^_\n]+_)|(~~[^~\n]+~~)|(\[[^\]]+\]\([^)\s]+\))/g;
+  const out = [];
+  let last = 0;
+  let m;
+  let k = baseKey;
+  while ((m = regex.exec(text)) !== null) {
+    if (m.index > last) out.push(<span key={k++}>{text.slice(last, m.index)}</span>);
+    const s = m[0];
+    if (s.startsWith('`')) {
+      out.push(<code key={k++} style={MD.code}>{s.slice(1, -1)}</code>);
+    } else if (s.startsWith('**')) {
+      out.push(<strong key={k++} style={MD.strong}>{s.slice(2, -2)}</strong>);
+    } else if (s.startsWith('~~')) {
+      out.push(<span key={k++} style={MD.strike}>{s.slice(2, -2)}</span>);
+    } else if (s.startsWith('[')) {
+      const lm = s.match(/^\[([^\]]+)\]\(([^)\s]+)\)$/);
+      if (lm) out.push(<a key={k++} href={lm[2]} target="_blank" rel="noopener noreferrer" style={MD.link}>{lm[1]}</a>);
+      else out.push(<span key={k++}>{s}</span>);
+    } else if (s.startsWith('*') || s.startsWith('_')) {
+      out.push(<em key={k++} style={MD.em}>{s.slice(1, -1)}</em>);
+    }
+    last = m.index + s.length;
+  }
+  if (last < text.length) out.push(<span key={k++}>{text.slice(last)}</span>);
+  return out.length > 0 ? out : text;
+}
+
+function renderMd(text) {
+  if (!text) return text;
+  const lines = text.split('\n');
+  const out = [];
+  let i = 0;
+  let key = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Fenced code block
+    if (line.startsWith('```')) {
+      const lang = line.slice(3).trim();
+      const code = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith('```')) { code.push(lines[i]); i++; }
+      i++;
+      // Special-case ```chart — parse JSON and render an inline SVG chart.
+      // Fall back to a code block if the JSON is malformed.
+      if (lang === 'chart') {
+        try {
+          const spec = JSON.parse(code.join('\n'));
+          out.push(<MdChart key={key++} spec={spec} />);
+          continue;
+        } catch (e) {
+          out.push(
+            <div key={key++} style={MD.preWrap}>
+              <div style={MD.preLang}>chart (invalid JSON)</div>
+              <pre style={MD.pre}>{code.join('\n')}</pre>
+            </div>
+          );
+          continue;
+        }
+      }
+      out.push(
+        <div key={key++} style={MD.preWrap}>
+          {lang && <div style={MD.preLang}>{lang}</div>}
+          <pre style={MD.pre}>{code.join('\n')}</pre>
+        </div>
+      );
+      continue;
+    }
+
+    // Heading
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) {
+      const lvl = h[1].length;
+      const inline = renderInline(h[2], 0);
+      const k = key++;
+      if (lvl === 1) out.push(<h1 key={k} style={MD.h1}>{inline}</h1>);
+      else if (lvl === 2) out.push(<h2 key={k} style={MD.h2}>{inline}</h2>);
+      else if (lvl === 3) out.push(<h3 key={k} style={MD.h3}>{inline}</h3>);
+      else out.push(<h4 key={k} style={MD.h4}>{inline}</h4>);
+      i++; continue;
+    }
+
+    // Horizontal rule
+    if (/^---+\s*$/.test(line) || /^\*\*\*+\s*$/.test(line)) {
+      out.push(<hr key={key++} style={MD.hr} />);
+      i++; continue;
+    }
+
+    // Table: header | --- | rows
+    if (line.includes('|') && i + 1 < lines.length && isTableSeparator(lines[i+1])) {
+      const header = splitTableRow(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+        rows.push(splitTableRow(lines[i])); i++;
+      }
+      out.push(
+        <div key={key++} style={MD.tableWrap}>
+          <table style={MD.table}>
+            <thead>
+              <tr>{header.map((c, j) => <th key={j} style={MD.th}>{renderInline(c, 0)}</th>)}</tr>
+            </thead>
+            <tbody>
+              {rows.map((r, ri) => (
+                <tr key={ri} style={ri % 2 === 1 ? MD.trEven : undefined}>
+                  {r.map((c, ci) => <td key={ci} style={MD.td}>{renderInline(c, 0)}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+      continue;
+    }
+
+    // Blockquote
+    if (line.startsWith('>')) {
+      const q = [];
+      while (i < lines.length && lines[i].startsWith('>')) {
+        q.push(lines[i].replace(/^>\s?/, '')); i++;
+      }
+      out.push(<blockquote key={key++} style={MD.blockquote}>{renderInline(q.join(' '), 0)}</blockquote>);
+      continue;
+    }
+
+    // Unordered list
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*]\s+/, '')); i++;
+      }
+      out.push(
+        <ul key={key++} style={MD.ul}>
+          {items.map((it, j) => (
+            <li key={j} style={MD.liRow}><span style={MD.bullet}>•</span><span>{renderInline(it, 0)}</span></li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+
+    // Ordered list
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, '')); i++;
+      }
+      out.push(
+        <ol key={key++} style={MD.ol}>
+          {items.map((it, j) => (
+            <li key={j} style={MD.liRow}><span style={MD.num}>{j + 1}.</span><span>{renderInline(it, 0)}</span></li>
+          ))}
+        </ol>
+      );
+      continue;
+    }
+
+    // Blank line
+    if (line.trim() === '') { i++; continue; }
+
+    // Paragraph (gather consecutive non-special lines)
+    const para = [];
+    while (i < lines.length && lines[i].trim() !== '' && !isBlockLine(lines[i])) {
+      para.push(lines[i]); i++;
+    }
+    out.push(<p key={key++} style={MD.p}>{renderInline(para.join(' '), 0)}</p>);
+  }
+  return out;
 }
 
 function QueryBuilder({ flash }) {
@@ -1584,7 +1929,7 @@ function QueryBuilder({ flash }) {
 
   const eventTypes = ["registrations", "attended", "replays", "viewedcta", "clickedcta", "purchases"];
   const QS = {
-    wrap: { padding: "32px 40px", maxWidth: 1200, margin: "0 auto", className: "query-wrap" },
+    wrap: { padding: "32px 40px", maxWidth: 1400, margin: "0 auto", className: "query-wrap" },
     header: { marginBottom: 24 },
     badge: { display: "inline-block", padding: "4px 10px", borderRadius: 6, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", background: "#EEF4FF", color: "#3538CD", marginBottom: 10 },
     title: { fontSize: 22, fontWeight: 700, color: "#111827", margin: 0 },
@@ -1597,7 +1942,7 @@ function QueryBuilder({ flash }) {
     actions: { display: "flex", gap: 10, alignItems: "flex-end" },
     resultBar: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 },
     resultCount: { fontSize: 13, color: "#6B7280", fontWeight: 500 },
-    tableWrap: { overflowX: "auto", borderRadius: 10, border: "1px solid #E8E8E6" },
+    tableWrap: { overflowX: "auto", border: "1px solid #E8E8E6", marginLeft: "calc(-1 * (100vw - 100%) / 2)", marginRight: "calc(-1 * (100vw - 100%) / 2)", width: "100vw", maxWidth: "100vw", borderRadius: 0, borderLeft: "none", borderRight: "none" },
     table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
     th: { padding: "10px 14px", textAlign: "left", fontWeight: 600, color: "#6B7280", borderBottom: "1px solid #E8E8E6", background: "#FAFAFA", whiteSpace: "normal", maxWidth: 100, lineHeight: 1.3, cursor: "pointer", userSelect: "none" },
     td: { padding: "9px 14px", borderBottom: "1px solid #F3F4F6", color: "#374151", whiteSpace: "nowrap", maxWidth: 250, overflow: "hidden", textOverflow: "ellipsis" },
@@ -1694,7 +2039,35 @@ function QueryBuilder({ flash }) {
   );
 }
 
-function InsightsChat({ flash, isMobile }) {
+const TYPING_STATUSES = [
+  "Pulling up your metrics",
+  "Crunching the numbers",
+  "Spotting trends",
+  "Comparing periods",
+  "Running the math",
+  "Querying the data",
+  "Charting the results",
+  "Putting it together",
+  "Almost there",
+];
+
+function TypingStatus({ IC }) {
+  const [idx, setIdx] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setIdx(i => (i + 1) % TYPING_STATUSES.length), 2400);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div style={IC.typing}>
+      <div className="blink-1" style={IC.dot} />
+      <div className="blink-2" style={IC.dot} />
+      <div className="blink-3" style={IC.dot} />
+      <span key={idx} className="fi" style={IC.typingText}>{TYPING_STATUSES[idx]}…</span>
+    </div>
+  );
+}
+
+function InsightsChat({ flash, isMobile, activeFunnel }) {
   const [history, setHistory] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [chatMsgs, setChatMsgs] = useState([]);
@@ -1827,131 +2200,259 @@ function InsightsChat({ flash, isMobile }) {
     return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
   };
 
-  const IC = {
-    outer: { display: "flex", height: "calc(100vh - 120px)", gap: 0, position: "relative" },
-    sidebar: { width: sidebarOpen ? (isMobile ? "100%" : 260) : 0, minWidth: sidebarOpen ? (isMobile ? "100%" : 260) : 0, background: "#F9FAFB", borderRight: sidebarOpen && !isMobile ? "1px solid #E5E7EB" : "none", display: "flex", flexDirection: "column", overflow: "hidden", transition: "width 0.2s, min-width 0.2s", borderRadius: "12px 0 0 12px", ...(isMobile && sidebarOpen ? { position: "absolute", inset: 0, zIndex: 10, borderRadius: 12 } : {}) },
-    sidebarHeader: { padding: "16px", borderBottom: "1px solid #E5E7EB", display: "flex", justifyContent: "space-between", alignItems: "center" },
-    sidebarTitle: { fontSize: 13, fontWeight: 600, color: "#374151", letterSpacing: "0.02em", textTransform: "uppercase" },
-    newBtn: { padding: "5px 10px", background: "#111827", color: "#fff", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "Inter, sans-serif" },
-    chatList: { flex: 1, overflowY: "auto", padding: "8px" },
-    chatItem: { padding: "10px 12px", borderRadius: 8, cursor: "pointer", marginBottom: 4, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, transition: "background 0.1s" },
-    chatItemActive: { background: "#fff", border: "1px solid #E5E7EB", boxShadow: "0 1px 2px rgba(0,0,0,0.04)" },
-    chatItemInactive: { background: "transparent", border: "1px solid transparent" },
-    chatTitle: { fontSize: 13, fontWeight: 500, color: "#111827", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 },
-    chatTime: { fontSize: 11, color: "#9CA3AF", whiteSpace: "nowrap", marginTop: 2 },
-    delBtn: { background: "none", border: "none", cursor: "pointer", padding: 2, fontSize: 14, color: "#D1D5DB", flexShrink: 0 },
-    main: { flex: 1, display: "flex", flexDirection: "column", padding: "0 0 0 16px", minWidth: 0 },
-    header: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 },
-    headerLeft: {},
-    title: { fontSize: 24, fontWeight: 600, color: "#111827", letterSpacing: "-0.02em" },
-    sub: { fontSize: 13, color: "#6B7280", marginTop: 4 },
-    toggleBtn: { background: "none", border: "1px solid #E5E7EB", borderRadius: 8, cursor: "pointer", padding: "6px 10px", fontSize: 13, color: "#6B7280", fontFamily: "Inter, sans-serif" },
-    body: { flex: 1, overflowY: "auto", padding: "0 4px", display: "flex", flexDirection: "column", gap: 12 },
-    empty: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20 },
-    emptyIcon: { width: 48, height: 48, borderRadius: "50%", background: "linear-gradient(135deg, #EEF2FF, #E0E7FF)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24 },
-    emptyTitle: { fontSize: 18, fontWeight: 600, color: "#111827" },
-    emptyDesc: { fontSize: 14, color: "#6B7280", textAlign: "center", maxWidth: 360 },
-    chips: { display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "center", marginTop: 8 },
-    chip: { padding: "8px 14px", background: "#fff", border: "1px solid #E5E7EB", borderRadius: 20, fontSize: 13, color: "#374151", cursor: "pointer", fontWeight: 500, transition: "all 0.15s" },
-    userBub: { alignSelf: "flex-end", maxWidth: "75%", padding: "10px 16px", background: "#111827", color: "#fff", borderRadius: "16px 16px 4px 16px", fontSize: 14, lineHeight: 1.5 },
-    aiBub: { alignSelf: "flex-start", maxWidth: "85%", padding: "14px 18px", background: "#F9FAFB", border: "1px solid #E5E7EB", borderRadius: "16px 16px 16px 4px", fontSize: 14, lineHeight: 1.5, color: "#374151" },
-    typing: { alignSelf: "flex-start", padding: "12px 18px", background: "#F9FAFB", border: "1px solid #E5E7EB", borderRadius: "16px 16px 16px 4px", display: "flex", gap: 5, alignItems: "center" },
-    dot: { width: 6, height: 6, borderRadius: "50%", background: "#9CA3AF" },
-    inputWrap: { display: "flex", gap: 8, padding: "12px 0", borderTop: "1px solid #F3F4F6", marginTop: 8 },
-    input: { flex: 1, padding: "12px 16px", border: "1px solid #E5E7EB", borderRadius: 12, fontSize: 14, outline: "none", fontFamily: "Inter, sans-serif", background: "#fff" },
-    sendBtn: { padding: "10px 20px", background: "#111827", color: "#fff", border: "none", borderRadius: 12, fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "Inter, sans-serif", whiteSpace: "nowrap" },
+  const quickPrompts = [
+    { letter: "W", color: "#3B82F6", label: "Weekly Recap", prompt: "Summarize this week's performance and call out anything unusual." },
+    { letter: "F", color: "#F97316", label: "Funnel Health", prompt: "Walk me through the funnel step by step and flag where we're losing the most people." },
+    { letter: "T", color: "#8B5CF6", label: "Trend Analyst", prompt: "What trends do you see in the last 14 days of metrics?" },
+  ];
+
+  const grouped = (() => {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const yesterday = new Date(today); yesterday.setDate(yesterday.getDate() - 1);
+    const buckets = { Today: [], Yesterday: [], Earlier: [] };
+    for (const c of [...history].sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))) {
+      const d = new Date(c.updated_at); d.setHours(0, 0, 0, 0);
+      if (d.getTime() === today.getTime()) buckets.Today.push(c);
+      else if (d.getTime() === yesterday.getTime()) buckets.Yesterday.push(c);
+      else buckets.Earlier.push(c);
+    }
+    return buckets;
+  })();
+
+  const shareChat = async () => {
+    if (chatMsgs.length === 0) { flash("Start a chat first", "err"); return; }
+    const text = chatMsgs.map(m => `**${m.role === "user" ? "You" : "Funnel AI"}:** ${m.content}`).join("\n\n");
+    try { await navigator.clipboard.writeText(text); flash("Chat copied to clipboard", "ok"); }
+    catch { flash("Copy failed", "err"); }
   };
+
+  const sourceLabel = activeFunnel ? activeFunnel.charAt(0).toUpperCase() + activeFunnel.slice(1) : "Select Source";
+
+  const IC = {
+    outer: { display: "flex", height: "calc(100vh - 64px)", gap: 0, position: "relative", background: "#fff", border: "none", borderRadius: 0, overflow: "hidden" },
+
+    sidebar: { width: sidebarOpen ? (isMobile ? "100%" : 280) : 0, minWidth: sidebarOpen ? (isMobile ? "100%" : 280) : 0, background: "#fff", borderRight: sidebarOpen && !isMobile ? "1px solid #F1F3F5" : "none", display: "flex", flexDirection: "column", overflow: "hidden", transition: "width 0.2s, min-width 0.2s", ...(isMobile && sidebarOpen ? { position: "absolute", inset: 0, zIndex: 10 } : {}) },
+    sidebarHeader: { padding: "18px 20px 10px", display: "flex", justifyContent: "space-between", alignItems: "center" },
+    sidebarTitle: { fontSize: 16, fontWeight: 700, color: "#111827", letterSpacing: "-0.01em" },
+    iconOnlyBtn: { background: "none", border: "none", cursor: "pointer", padding: 4, color: "#9CA3AF", display: "inline-flex", alignItems: "center", justifyContent: "center", borderRadius: 6 },
+    newChatBtn: { margin: "0 16px 14px", padding: "10px 16px", background: "#0F172A", color: "#fff", border: "none", borderRadius: 999, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: fn, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6 },
+
+    groupHeader: { padding: "14px 20px 6px", display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12, fontWeight: 500, color: "#9CA3AF" },
+    groupHeaderClickable: { cursor: "pointer", userSelect: "none" },
+
+    savedItem: { padding: "8px 12px", margin: "0 8px", display: "flex", alignItems: "center", gap: 10, cursor: "pointer", borderRadius: 8, transition: "background 0.1s" },
+    savedLabel: { fontSize: 13, color: "#111827", fontWeight: 500, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+    savedMore: { fontSize: 16, color: "#D1D5DB" },
+
+    chatList: { flex: 1, overflowY: "auto", paddingBottom: 16 },
+    histItem: { padding: "8px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", fontSize: 13, color: "#4B5563", transition: "background 0.1s", position: "relative" },
+    histItemActive: { color: "#111827", fontWeight: 500, background: "#F3F4F6" },
+    histDot: { position: "absolute", left: 0, top: "50%", transform: "translateY(-50%)", width: 3, height: 18, background: "#0F172A", borderRadius: "0 3px 3px 0" },
+    histTitle: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 },
+    histDel: { background: "none", border: "none", cursor: "pointer", color: "#D1D5DB", fontSize: 16, padding: 2, lineHeight: 1, flexShrink: 0 },
+
+    main: { flex: 1, display: "flex", flexDirection: "column", minWidth: 0, background: "#fff" },
+    topbar: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 24px", borderBottom: "1px solid #F1F3F5", gap: 12, flexWrap: "wrap" },
+    brand: { display: "flex", alignItems: "center", gap: 8 },
+    brandName: { fontSize: 15, fontWeight: 600, color: "#111827", letterSpacing: "-0.01em" },
+    brandPill: { padding: "2px 8px", background: "#F3F4F6", color: "#4B5563", fontSize: 11, fontWeight: 600, borderRadius: 6 },
+    topActions: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
+    pillBtn: { padding: "7px 14px", background: "#fff", border: "1px solid #E5E7EB", borderRadius: 999, fontSize: 13, fontWeight: 500, color: "#374151", cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6, fontFamily: fn },
+    pillBtnDark: { padding: "7px 16px", background: "#0F172A", color: "#fff", border: "none", borderRadius: 999, fontSize: 13, fontWeight: 600, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6, fontFamily: fn },
+
+    body: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 },
+    // Scroll container is full-width so backgrounds extend edge-to-edge.
+    // The column constrains text/markdown to a comfortable reading width.
+    msgScroll: { flex: 1, overflowY: "auto", padding: "32px 24px 8px", minHeight: 0 },
+    msgColumn: { maxWidth: 760, margin: "0 auto", display: "flex", flexDirection: "column", gap: 24 },
+
+    // User: tight rounded bubble, right-aligned. Uniform 16px radius (no tail).
+    userBub: { alignSelf: "flex-end", maxWidth: "80%", padding: "10px 16px", background: "#0F172A", color: "#fff", borderRadius: 16, fontSize: 15, lineHeight: 1.5, whiteSpace: "pre-wrap", wordBreak: "break-word" },
+    // Assistant: NO bubble. Markdown flows naturally up to the column width.
+    aiMessage: { color: "#111827", fontSize: 15, lineHeight: 1.65, wordBreak: "break-word" },
+
+    typing: { alignSelf: "flex-start", padding: "10px 16px", background: "transparent", display: "flex", gap: 6, alignItems: "center" },
+    dot: { width: 5, height: 5, borderRadius: "50%", background: "#D1D5DB" },
+    typingText: { fontSize: 13, color: "#6B7280", fontWeight: 500, marginLeft: 6, fontVariantNumeric: "tabular-nums" },
+
+    // Bottom area hosts the input column. Sticky-feeling via the body's flex layout.
+    bottomWrap: { padding: "12px 24px 18px", background: "linear-gradient(180deg, rgba(255,255,255,0) 0%, #fff 30%)" },
+    bottomColumn: { maxWidth: 760, margin: "0 auto" },
+
+    // Single calm input container. No internal divider, no sparkle, just space.
+    inputCard: { width: "100%", background: "#fff", border: "1px solid #E5E7EB", borderRadius: 16, padding: "10px 12px 8px 16px", boxShadow: "0 1px 2px rgba(15,23,42,0.04)", transition: "border-color 0.15s, box-shadow 0.15s" },
+    inputCardFocus: { borderColor: "#9CA3AF", boxShadow: "0 4px 14px rgba(15,23,42,0.07)" },
+    textInput: { width: "100%", border: "none", outline: "none", background: "transparent", fontSize: 15, color: "#111827", fontFamily: fn, padding: "6px 2px", lineHeight: 1.5 },
+
+    // Footer row inside the input card. No background, no border — just spacing.
+    inputFooter: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4, gap: 8 },
+    sourceBtn: { display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 8px", background: "transparent", border: "none", fontSize: 12, fontWeight: 500, color: "#6B7280", cursor: "default", fontFamily: fn, borderRadius: 6 },
+    // Send is an icon-only square button. Subtle when disabled, prominent when ready.
+    sendBtn: { width: 32, height: 32, display: "inline-flex", alignItems: "center", justifyContent: "center", background: "#0F172A", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", padding: 0, transition: "opacity 0.15s, background 0.15s" },
+
+    disclaimer: { fontSize: 11, color: "#9CA3AF", textAlign: "center", marginTop: 10, lineHeight: 1.5 },
+    disclaimerLink: { color: "#6B7280", textDecoration: "underline" },
+
+    // Empty-state greeting shown above the input column when no messages exist.
+    emptyGreet: { padding: "80px 16px 24px", textAlign: "center" },
+    emptyGreetTitle: { fontSize: 24, fontWeight: 600, color: "#111827", letterSpacing: "-0.02em", marginBottom: 8 },
+    emptyGreetSub: { fontSize: 14, color: "#6B7280", lineHeight: 1.55, maxWidth: 480, margin: "0 auto" },
+  };
+
+  const avatarStyle = (color) => ({ width: 28, height: 28, borderRadius: "50%", background: color, color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, flexShrink: 0 });
+
+  const InputCard = (
+    <div
+      style={IC.inputCard}
+      onFocus={e => { e.currentTarget.style.borderColor = IC.inputCardFocus.borderColor; e.currentTarget.style.boxShadow = IC.inputCardFocus.boxShadow; }}
+      onBlur={e => { e.currentTarget.style.borderColor = IC.inputCard.border.split(' ').slice(-1)[0]; e.currentTarget.style.boxShadow = IC.inputCard.boxShadow; }}
+    >
+      <input
+        style={IC.textInput}
+        value={chatInput}
+        onChange={e => setChatInput(e.target.value)}
+        onKeyDown={e => e.key === "Enter" && !e.shiftKey && sendMessage()}
+        placeholder="Ask anything about your funnel…"
+        disabled={chatLoading}
+        autoFocus
+      />
+      <div style={IC.inputFooter}>
+        <button style={IC.sourceBtn} type="button" title="Active funnel">
+          <I d="M3 6h18 M6 12h12 M10 18h4" size={12} stroke="#6B7280" /> {sourceLabel}
+        </button>
+        <button
+          style={{ ...IC.sendBtn, opacity: chatLoading || !chatInput.trim() ? 0.4 : 1, cursor: chatLoading || !chatInput.trim() ? "default" : "pointer" }}
+          onClick={() => sendMessage()}
+          disabled={chatLoading || !chatInput.trim()}
+          title="Send"
+        >
+          <I d="M12 19V5 M5 12l7-7 7 7" size={14} stroke="#fff" sw={2.2} />
+        </button>
+      </div>
+    </div>
+  );
+
+  const Disclaimer = (
+    <div style={IC.disclaimer}>
+      Funnel AI may display inaccurate info, so please double check the response. <span style={IC.disclaimerLink}>Your Privacy &amp; Funnel AI</span>
+    </div>
+  );
 
   return (
     <div className="insights-outer" style={IC.outer}>
       {/* Sidebar */}
-      <div style={IC.sidebar}>
-        <div style={IC.sidebarHeader}>
-          <span style={IC.sidebarTitle}>Chat History</span>
-          <button style={IC.newBtn} onClick={newChat}>+ New</button>
-        </div>
-        <div style={IC.chatList}>
-          {historyLoading ? (
-            <div style={{ padding: 16, textAlign: "center", color: "#9CA3AF", fontSize: 13 }}>Loading…</div>
-          ) : history.length === 0 ? (
-            <div style={{ padding: 16, textAlign: "center", color: "#9CA3AF", fontSize: 13 }}>No conversations yet</div>
-          ) : (
-            [...history].sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at)).map(chat => (
+      {sidebarOpen && (
+        <div style={IC.sidebar}>
+          <div style={IC.sidebarHeader}>
+            <span style={IC.sidebarTitle}>Chat</span>
+            <button style={IC.iconOnlyBtn} title="Search"><I d="M21 21l-4.35-4.35 M11 19a8 8 0 1 1 0-16 8 8 0 0 1 0 16z" size={16} stroke="#9CA3AF" /></button>
+          </div>
+          <button style={IC.newChatBtn} onClick={newChat}>
+            <I d="M12 5v14 M5 12h14" size={14} stroke="#fff" /> New Chat
+            <I d="M12 3l1.9 5.8 5.8 1.9-5.8 1.9L12 18.4l-1.9-5.8L4.3 10.7l5.8-1.9z" size={12} stroke="#fff" />
+          </button>
+
+          <div style={IC.groupHeader}>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <I d="M12 2l2.39 7.36H22l-6.18 4.49L18.21 22 12 17.27 5.79 22l2.39-8.15L2 9.36h7.61z" size={12} stroke="#9CA3AF" /> Saved
+            </span>
+          </div>
+          <div>
+            {quickPrompts.map(q => (
               <div
-                key={chat.id}
-                style={{ ...IC.chatItem, ...(activeId === chat.id ? IC.chatItemActive : IC.chatItemInactive) }}
-                onClick={() => setActiveId(chat.id)}
-                onMouseEnter={e => { if (activeId !== chat.id) e.currentTarget.style.background = "#F3F4F6"; }}
-                onMouseLeave={e => { if (activeId !== chat.id) e.currentTarget.style.background = "transparent"; }}
+                key={q.label}
+                style={IC.savedItem}
+                onClick={() => sendMessage(q.prompt)}
+                onMouseEnter={e => { e.currentTarget.style.background = "#F3F4F6"; }}
+                onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}
               >
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={IC.chatTitle}>{chat.title}</div>
-                  <div style={IC.chatTime}>{fmtTime(new Date(chat.updated_at).getTime())}</div>
-                </div>
-                <button style={IC.delBtn} onClick={e => { e.stopPropagation(); deleteChat(chat.id); }} title="Delete">×</button>
+                <div style={avatarStyle(q.color)}>{q.letter}</div>
+                <span style={IC.savedLabel}>{q.label}</span>
+                <span style={IC.savedMore}>···</span>
               </div>
-            ))
-          )}
+            ))}
+          </div>
+
+          <div style={IC.chatList}>
+            {historyLoading ? (
+              <div style={{ padding: 16, textAlign: "center", color: "#9CA3AF", fontSize: 13 }}>Loading…</div>
+            ) : history.length === 0 ? (
+              <div style={{ padding: 16, textAlign: "center", color: "#9CA3AF", fontSize: 13 }}>No conversations yet</div>
+            ) : (
+              Object.entries(grouped).map(([group, items]) => (
+                items.length > 0 && (
+                  <div key={group}>
+                    <div style={IC.groupHeader}>
+                      <span>{group}</span>
+                      <span style={{ fontSize: 10, color: "#D1D5DB" }}>▾</span>
+                    </div>
+                    {items.map(chat => (
+                      <div
+                        key={chat.id}
+                        style={{ ...IC.histItem, ...(activeId === chat.id ? IC.histItemActive : {}) }}
+                        onClick={() => setActiveId(chat.id)}
+                        onMouseEnter={e => { if (activeId !== chat.id) e.currentTarget.style.background = "#FAFAFA"; }}
+                        onMouseLeave={e => { if (activeId !== chat.id) e.currentTarget.style.background = "transparent"; }}
+                      >
+                        {activeId === chat.id && <span style={IC.histDot} />}
+                        <span style={IC.histTitle}>{chat.title}</span>
+                        <button style={IC.histDel} onClick={e => { e.stopPropagation(); deleteChat(chat.id); }} title="Delete">×</button>
+                      </div>
+                    ))}
+                  </div>
+                )
+              ))
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Main chat area */}
       <div style={IC.main}>
-        <div style={IC.header}>
-          <div style={IC.headerLeft}>
-            <h1 style={IC.title}>✨ AI Insights</h1>
-            <div style={IC.sub}>Ask questions about your funnel data · Powered by Claude</div>
+        <div style={IC.topbar}>
+          <div style={IC.brand}>
+            <span style={IC.brandName}>Funnel AI</span>
+            <span style={IC.brandPill}>Beta</span>
           </div>
-          <button style={IC.toggleBtn} onClick={() => setSidebarOpen(p => !p)}>
-            {sidebarOpen ? "◀ Hide" : "▶ History"}
-          </button>
+          <div style={IC.topActions}>
+            <button style={IC.pillBtn} onClick={shareChat} title="Copy conversation">
+              <I d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7 M16 6l-4-4-4 4 M12 2v13" size={13} stroke="#6B7280" />
+              Share
+            </button>
+            <button style={IC.pillBtnDark} onClick={newChat}>
+              New Chat
+              <I d="M12 3l1.9 5.8 5.8 1.9-5.8 1.9L12 18.4l-1.9-5.8L4.3 10.7l5.8-1.9z" size={12} stroke="#fff" />
+            </button>
+          </div>
         </div>
 
         <div style={IC.body}>
-          {chatMsgs.length === 0 && !chatLoading ? (
-            <div style={IC.empty}>
-              <div style={IC.emptyIcon}>📊</div>
-              <div style={IC.emptyTitle}>Ask me anything about your data</div>
-              <div style={IC.emptyDesc}>I can analyze trends, compare periods, identify anomalies, and suggest improvements for your marketing funnel.</div>
-              <div style={IC.chips}>
-                {starters.map(s => (
-                  <button key={s} style={IC.chip} onClick={() => sendMessage(s)} onMouseEnter={e => { e.target.style.background = "#F3F4F6"; e.target.style.borderColor = "#D1D5DB"; }} onMouseLeave={e => { e.target.style.background = "#fff"; e.target.style.borderColor = "#E5E7EB"; }}>
-                    {s}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <>
-              {chatMsgs.map((m, i) => (
-                <div key={i} style={m.role === "user" ? IC.userBub : IC.aiBub}>
-                  {m.role === "assistant" ? renderMd(m.content) : m.content}
+          <div style={IC.msgScroll}>
+            <div style={IC.msgColumn}>
+              {chatMsgs.length === 0 && !chatLoading ? (
+                <div style={IC.emptyGreet}>
+                  <div style={IC.emptyGreetTitle}>What would you like to explore?</div>
+                  <div style={IC.emptyGreetSub}>Ask about trends, compare periods, dig into a specific day, or pull a chart of any metric over time.</div>
                 </div>
-              ))}
-              {chatLoading && (
-                <div style={IC.typing}>
-                  <div className="blink-1" style={IC.dot} />
-                  <div className="blink-2" style={IC.dot} />
-                  <div className="blink-3" style={IC.dot} />
-                </div>
+              ) : (
+                <>
+                  {chatMsgs.map((m, i) => (
+                    m.role === "user"
+                      ? <div key={i} style={IC.userBub}>{m.content}</div>
+                      : <div key={i} style={IC.aiMessage}>{renderMd(m.content)}</div>
+                  ))}
+                  {chatLoading && <TypingStatus IC={IC} />}
+                </>
               )}
               <div ref={chatEndRef} />
-            </>
-          )}
-        </div>
-
-        <div style={IC.inputWrap}>
-          <input
-            style={IC.input}
-            value={chatInput}
-            onChange={e => setChatInput(e.target.value)}
-            onKeyDown={e => e.key === "Enter" && !e.shiftKey && sendMessage()}
-            placeholder="Ask about your metrics, trends, conversions..."
-            disabled={chatLoading}
-          />
-          <button style={{ ...IC.sendBtn, opacity: chatLoading || !chatInput.trim() ? 0.5 : 1 }} onClick={() => sendMessage()} disabled={chatLoading || !chatInput.trim()}>
-            {chatLoading ? "Thinking..." : "Send"}
-          </button>
+            </div>
+          </div>
+          <div style={IC.bottomWrap}>
+            <div style={IC.bottomColumn}>
+              {InputCard}
+              {Disclaimer}
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -2128,7 +2629,7 @@ input:focus{outline:none;border-color:#D1D5DB!important;box-shadow:0 0 0 3px rgb
 
   /* Insights chat */
   .insights-outer {
-    height: calc(100vh - 80px) !important;
+    height: calc(100vh - 56px) !important;
   }
 
   /* Modal */

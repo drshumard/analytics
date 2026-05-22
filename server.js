@@ -41,6 +41,13 @@ if (!API_KEY) {
 const FUNNEL_TO_SCHEMA = { analytics: 'public', native: 'native' };
 const ALLOWED_FUNNELS = Object.keys(FUNNEL_TO_SCHEMA);
 
+// Per-funnel branding used by the AI insights chat. Each entry shapes the
+// system prompt so the model knows which business/channel it's analyzing.
+const FUNNEL_BRANDS = {
+    analytics: { brand: 'Dr Shumard', context: 'a medical practice', funnelName: 'Main (FB Ads) Funnel' },
+    native:    { brand: 'Dr Shumard', context: 'a medical practice', funnelName: 'Native Ads Funnel' },
+};
+
 const supabasePublic = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const _funnelClients = new Map();
@@ -2120,135 +2127,398 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
+// ─── AI Insights: data helpers (used by tools) ────────────────────────────────
+
+// Build dedup-aware daily metrics for ALL history, cached per funnel.
+// Multiple tool calls in one chat (or chat session) reuse the cache.
+async function loadAllInsightsMetrics(funnel) {
+    const supabase = clientFor(funnel);
+    const bucket = getCacheBucket(funnel);
+    const now = Date.now();
+
+    if (bucket.insightsContext?.metrics && (now - bucket.insightsUpdatedAt) < cache.insightsTTL) {
+        return bucket.insightsContext.metrics;
+    }
+
+    const epochAtStart = bucket.invalidationEpoch;
+    // No limit — daily_metrics is one row per day, dataset is tiny.
+    const metricsRes = await supabase
+        .from('daily_metrics')
+        .select('*')
+        .order('date', { ascending: false });
+
+    const rawRows = metricsRes.data || [];
+    const dates = rawRows.filter(r => !r.finalized_at).map(r => String(r.date).substring(0, 10));
+    const dedupMap = await getDedupCounts(funnel, dates);
+
+    const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa', 'stayed_45', 'stayed_60', 'stayed_80']);
+    const metrics = rawRows.map(r => {
+        const dateStr = String(r.date).substring(0, 10);
+        const deduped = dedupMap[dateStr] || {};
+        const hasDedup = Object.keys(deduped).length > 0;
+        const ov = r.overrides || {};
+        const pick = (field) => {
+            if (ov[field] !== undefined) return ov[field];
+            const dd = deduped[field];
+            if (dd !== undefined) return dd.all ?? 0;
+            if (hasDedup && PURCHASE_SUB_COLS.has(field)) return 0;
+            return r[field];
+        };
+        return {
+            date: dateStr,
+            day: r.day_of_week,
+            fb_spend: ov.fb_spend !== undefined ? ov.fb_spend : Number(r.fb_spend),
+            fb_link_clicks: ov.fb_link_clicks !== undefined ? ov.fb_link_clicks : Number(r.fb_link_clicks || 0),
+            registrations: pick('registrations'),
+            attended: pick('attended'),
+            replays: pick('replays'),
+            viewedcta: pick('viewedcta'),
+            clickedcta: pick('clickedcta'),
+            purchases_fb: pick('purchases_fb') || 0,
+            purchases_native: pick('purchases_native') || 0,
+            purchases_youtube: pick('purchases_youtube') || 0,
+            purchases_aibot: pick('purchases_aibot') || 0,
+            purchases_postwebinar: pick('purchases_postwebinar') || 0,
+            purchases_cpa: pick('purchases_cpa') || 0,
+            stayed_45: pick('stayed_45') || 0,
+            stayed_60: pick('stayed_60') || 0,
+            stayed_80: pick('stayed_80') || 0,
+            total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
+                             (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
+                             (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0),
+        };
+    });
+
+    if (bucket.invalidationEpoch === epochAtStart) {
+        bucket.insightsContext = { ...(bucket.insightsContext || {}), metrics };
+        bucket.insightsUpdatedAt = now;
+    }
+
+    return metrics;
+}
+
+async function getInsightsMetrics(funnel, from, to) {
+    const all = await loadAllInsightsMetrics(funnel);
+    return all.filter(r => (!from || r.date >= from) && (!to || r.date <= to));
+}
+
+// Aggregates daily metrics into weekly or monthly rollups. Sums additive
+// columns; recomputes ratios from the sums so they stay correct.
+async function getInsightsRollup(funnel, period, from, to) {
+    const rows = await getInsightsMetrics(funnel, from, to);
+    if (rows.length === 0) return [];
+
+    const bucketKey = (dateStr) => {
+        if (period === 'month') return dateStr.substring(0, 7);            // YYYY-MM
+        if (period === 'week') {
+            // ISO-ish: week starts Monday in LA tz; use Sunday-anchored start for simplicity
+            const d = new Date(dateStr + 'T12:00:00Z');
+            const day = d.getUTCDay(); // 0=Sun
+            const diff = -day;          // shift back to Sunday
+            d.setUTCDate(d.getUTCDate() + diff);
+            return d.toISOString().slice(0, 10);                           // YYYY-MM-DD (Sunday)
+        }
+        return dateStr;
+    };
+
+    const buckets = new Map();
+    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta','purchases_fb','purchases_native','purchases_youtube','purchases_aibot','purchases_postwebinar','purchases_cpa','stayed_45','stayed_60','stayed_80','total_purchases'];
+
+    for (const r of rows) {
+        const k = bucketKey(r.date);
+        if (!buckets.has(k)) {
+            const init = { period_start: k, days: 0 };
+            ADDITIVE.forEach(c => init[c] = 0);
+            buckets.set(k, init);
+        }
+        const b = buckets.get(k);
+        b.days++;
+        ADDITIVE.forEach(c => b[c] += Number(r[c]) || 0);
+    }
+
+    return [...buckets.values()]
+        .sort((a, b) => b.period_start.localeCompare(a.period_start))
+        .map(b => ({
+            ...b,
+            cpa:          b.total_purchases > 0 ? b.fb_spend / b.total_purchases : null,
+            cost_per_reg: b.registrations > 0   ? b.fb_spend / b.registrations   : null,
+            landing_cvr:  b.fb_link_clicks > 0  ? b.registrations / b.fb_link_clicks * 100 : null,
+            attendance:   b.registrations > 0   ? b.attended / b.registrations * 100       : null,
+            cta_view:     (b.attended + b.replays) > 0 ? b.viewedcta / (b.attended + b.replays) * 100 : null,
+            cta_click:    b.viewedcta > 0       ? b.clickedcta / b.viewedcta * 100         : null,
+            conversion:   b.clickedcta > 0      ? b.total_purchases / b.clickedcta * 100   : null,
+        }));
+}
+
+// Side-by-side comparison of two date ranges with totals and deltas.
+async function compareInsightsPeriods(funnel, aFrom, aTo, bFrom, bTo) {
+    const [a, b] = await Promise.all([
+        getInsightsMetrics(funnel, aFrom, aTo),
+        getInsightsMetrics(funnel, bFrom, bTo),
+    ]);
+
+    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta','purchases_fb','purchases_native','purchases_youtube','purchases_aibot','purchases_postwebinar','purchases_cpa','total_purchases'];
+    const sumOf = (rows) => {
+        const t = { days: rows.length };
+        ADDITIVE.forEach(c => t[c] = rows.reduce((s, r) => s + (Number(r[c]) || 0), 0));
+        t.cpa = t.total_purchases > 0 ? t.fb_spend / t.total_purchases : null;
+        t.landing_cvr = t.fb_link_clicks > 0 ? t.registrations / t.fb_link_clicks * 100 : null;
+        t.attendance  = t.registrations > 0  ? t.attended / t.registrations * 100 : null;
+        t.cta_click   = t.viewedcta > 0      ? t.clickedcta / t.viewedcta * 100 : null;
+        t.conversion  = t.clickedcta > 0     ? t.total_purchases / t.clickedcta * 100 : null;
+        return t;
+    };
+
+    const period_a = sumOf(a);
+    const period_b = sumOf(b);
+
+    const delta = {};
+    [...ADDITIVE, 'cpa', 'landing_cvr', 'attendance', 'cta_click', 'conversion'].forEach(k => {
+        const av = period_a[k];
+        const bv = period_b[k];
+        if (av == null || bv == null) { delta[k] = null; return; }
+        delta[k] = {
+            absolute: av - bv,
+            pct_change: bv !== 0 ? ((av - bv) / Math.abs(bv)) * 100 : null,
+        };
+    });
+
+    return {
+        period_a: { from: aFrom, to: aTo, ...period_a },
+        period_b: { from: bFrom, to: bTo, ...period_b },
+        delta,
+    };
+}
+
+// Per-day event counts for a date range, queried fresh from DB (no PII).
+async function getInsightsEventCounts(funnel, from, to, eventType) {
+    const supabase = clientFor(funnel);
+    let q = supabase.from('events').select('event_type, event_time');
+    if (from) q = q.gte('event_time', from + 'T00:00:00-08:00');
+    if (to)   q = q.lt('event_time', to + 'T00:00:00-08:00' /* exclusive next day */);
+    if (eventType) q = q.eq('event_type', eventType);
+    q = q.limit(50000);
+
+    const { data, error } = await q;
+    if (error) throw error;
+
+    const counts = {};
+    (data || []).forEach(e => {
+        const laDate = new Date(e.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+        counts[laDate] = counts[laDate] || {};
+        counts[laDate][e.event_type] = (counts[laDate][e.event_type] || 0) + 1;
+    });
+    return counts;
+}
+
+// Strict read-only SQL guard. Allows a single SELECT or WITH ... SELECT, no
+// DDL/DML keywords, no statement chaining. This is the primary defense; the
+// DB function adds statement_timeout + row cap as belt-and-suspenders.
+function isReadOnlySQL(sql) {
+    if (typeof sql !== 'string') return false;
+    const trimmed = sql.trim().replace(/;+\s*$/, ''); // strip trailing semicolons
+    if (trimmed.length === 0) return false;
+    if (trimmed.includes(';')) return false; // no statement chaining
+    const lower = trimmed.toLowerCase();
+    if (!lower.startsWith('select') && !lower.startsWith('with')) return false;
+    // Block dangerous keywords as whole words. Conservative: rejects them
+    // even in column/table names, which is fine for an analyst's tool.
+    const dangerous = /\b(insert|update|delete|drop|alter|create|grant|revoke|truncate|copy|merge|do|call|vacuum|analyze|reindex|cluster|comment|listen|notify|reset|set\s+(?!local))\b/i;
+    if (dangerous.test(lower)) return false;
+    return true;
+}
+
+async function runReadOnlySQL(funnel, sql) {
+    if (!isReadOnlySQL(sql)) {
+        return { error: 'Query rejected: only single SELECT or WITH statements are allowed. No DDL/DML.' };
+    }
+    const supabase = clientFor(funnel);
+    const { data, error } = await supabase.rpc('ai_run_sql', { query: sql });
+    if (error) return { error: error.message };
+    return { rows: data };
+}
+
+async function getInsightsCustomMetrics(funnel) {
+    const supabase = clientFor(funnel);
+    const { data } = await supabase.from('custom_metrics').select('name, formula, format, sort_order').order('sort_order', { ascending: true });
+    return data || [];
+}
+
+async function loadMemory(funnel, userId) {
+    const supabase = clientFor(funnel);
+    const { data } = await supabase.from('ai_memory').select('key, value, updated_at').eq('user_id', userId).order('updated_at', { ascending: false });
+    return data || [];
+}
+
+async function rememberFact(funnel, userId, key, value) {
+    const supabase = clientFor(funnel);
+    const { error } = await supabase
+        .from('ai_memory')
+        .upsert({ user_id: userId, key, value, updated_at: new Date().toISOString() }, { onConflict: 'user_id,key' });
+    if (error) throw error;
+    return { ok: true, key, value };
+}
+
+async function forgetFact(funnel, userId, key) {
+    const supabase = clientFor(funnel);
+    const { error } = await supabase.from('ai_memory').delete().eq('user_id', userId).eq('key', key);
+    if (error) throw error;
+    return { ok: true, key };
+}
+
+// ─── AI Insights: tool definitions ────────────────────────────────────────────
+const INSIGHTS_TOOLS = [
+    {
+        name: 'get_metrics',
+        description: 'Fetch daily funnel metrics for any date range in the historical data. Returns spend, registrations, attendance, CTA stages, and purchases broken down by source. Dates use YYYY-MM-DD format in Los Angeles timezone. Safe to call with multi-month ranges; result is one row per day.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                date_from: { type: 'string', description: 'Inclusive start date (YYYY-MM-DD)' },
+                date_to:   { type: 'string', description: 'Inclusive end date (YYYY-MM-DD)' },
+            },
+            required: ['date_from', 'date_to'],
+        },
+    },
+    {
+        name: 'get_metrics_rollup',
+        description: 'Fetch metrics aggregated by week or month over a date range. Sums additive columns (spend, registrations, purchases, etc.) and recomputes ratios (CPA, attendance %, conversion %) from the sums so they stay accurate. Prefer this for multi-month or trend questions — it returns ~24 rows for two years of months instead of 730 daily rows.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                period:    { type: 'string', enum: ['week', 'month'], description: 'Bucket size' },
+                date_from: { type: 'string', description: 'Inclusive start date (YYYY-MM-DD)' },
+                date_to:   { type: 'string', description: 'Inclusive end date (YYYY-MM-DD)' },
+            },
+            required: ['period', 'date_from', 'date_to'],
+        },
+    },
+    {
+        name: 'compare_periods',
+        description: 'Compare two date ranges side by side. Returns totals for each period plus absolute and percent deltas for every metric. Use for week-over-week, month-over-month, year-over-year, "this 30 days vs prior 30 days", etc.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                period_a_from: { type: 'string', description: 'Period A start (YYYY-MM-DD)' },
+                period_a_to:   { type: 'string', description: 'Period A end (YYYY-MM-DD)' },
+                period_b_from: { type: 'string', description: 'Period B (baseline/comparison) start' },
+                period_b_to:   { type: 'string', description: 'Period B (baseline/comparison) end' },
+            },
+            required: ['period_a_from', 'period_a_to', 'period_b_from', 'period_b_to'],
+        },
+    },
+    {
+        name: 'get_event_counts',
+        description: 'Aggregated event counts per day per event type (registrations, attended, replays, viewedcta, clickedcta, purchases, etc.). Use when you need raw event volumes — e.g. spot-checking dedup behavior — or for ad-hoc event-type questions. PII is never returned.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                date_from:  { type: 'string', description: 'Inclusive start date (YYYY-MM-DD), optional' },
+                date_to:    { type: 'string', description: 'Inclusive end date (YYYY-MM-DD), optional' },
+                event_type: { type: 'string', description: 'Filter to a single event type, optional' },
+            },
+        },
+    },
+    {
+        name: 'list_custom_metrics',
+        description: 'Return the list of user-defined custom metrics — display name, formula, and number format. Use when the user references a metric by name and you need to know how it is computed.',
+        input_schema: { type: 'object', properties: {} },
+    },
+    {
+        name: 'run_sql',
+        description: 'Run a read-only SQL query against the funnel\'s schema. Use this as an escape hatch for analytical questions the other tools don\'t cover — joins, grouping by day-of-week, filtering by arbitrary event attributes, etc. Tables available: daily_metrics, events, custom_metrics, dashboard_lenses. STRICT RULES: must be a single SELECT or WITH statement; no INSERT/UPDATE/DELETE/DDL; results capped at 500 rows and 5-second timeout. The query runs in the active funnel\'s schema (no need to prefix table names).',
+        input_schema: {
+            type: 'object',
+            properties: {
+                query: { type: 'string', description: 'A single SELECT or WITH ... SELECT query. No trailing semicolons needed.' },
+            },
+            required: ['query'],
+        },
+    },
+    {
+        name: 'remember',
+        description: 'Save a durable fact you\'ve learned that future chats should know — campaigns the user ran, business context, definitions, preferences, anomalies the user explained, etc. Use a short kebab-case key. Overwrites any previous value for the same key.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                key:   { type: 'string', description: 'Short kebab-case identifier, e.g. "spring-promo-2026"' },
+                value: { type: 'string', description: 'The fact to remember, in plain prose' },
+            },
+            required: ['key', 'value'],
+        },
+    },
+    {
+        name: 'forget',
+        description: 'Delete a previously remembered fact by key. Use when a remembered fact is wrong or no longer applicable.',
+        input_schema: {
+            type: 'object',
+            properties: { key: { type: 'string', description: 'The key to forget' } },
+            required: ['key'],
+        },
+    },
+];
+
+async function executeInsightsTool(name, input, ctx) {
+    const { funnel, userId } = ctx;
+    try {
+        switch (name) {
+            case 'get_metrics':
+                return await getInsightsMetrics(funnel, input.date_from, input.date_to);
+            case 'get_metrics_rollup':
+                return await getInsightsRollup(funnel, input.period, input.date_from, input.date_to);
+            case 'compare_periods':
+                return await compareInsightsPeriods(funnel, input.period_a_from, input.period_a_to, input.period_b_from, input.period_b_to);
+            case 'get_event_counts':
+                return await getInsightsEventCounts(funnel, input.date_from, input.date_to, input.event_type);
+            case 'list_custom_metrics':
+                return await getInsightsCustomMetrics(funnel);
+            case 'run_sql':
+                return await runReadOnlySQL(funnel, input.query);
+            case 'remember':
+                if (!input.key || !input.value) return { error: 'key and value required' };
+                return await rememberFact(funnel, userId, input.key, input.value);
+            case 'forget':
+                if (!input.key) return { error: 'key required' };
+                return await forgetFact(funnel, userId, input.key);
+            default:
+                return { error: `Unknown tool: ${name}` };
+        }
+    } catch (err) {
+        return { error: err.message || String(err) };
+    }
+}
+
 app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) => {
     if (!ANTHROPIC_API_KEY) {
         return res.status(503).json({ error: 'AI Insights not configured — set ANTHROPIC_API_KEY' });
     }
 
     try {
-        const supabase = clientFor(req.funnel);
-        const bucket = getCacheBucket(req.funnel);
         const { messages = [] } = req.body;
         if (!Array.isArray(messages) || messages.length === 0) {
             return res.status(400).json({ error: 'Send { messages: [{ role, content }] }' });
         }
 
-        // Fetch context: last 90 days of metrics + recent events (cached, 5-min TTL)
-        let metricsData, dailyEventCounts, recentEvents;
-
-        const now = Date.now();
-        if (bucket.insightsContext && (now - bucket.insightsUpdatedAt) < cache.insightsTTL) {
-            // Serve from cache
-            ({ metricsData, dailyEventCounts, recentEvents } = bucket.insightsContext);
-            console.log(`📦 Cache[${req.funnel}] HIT: insights context`);
-        } else {
-            console.log(`📊 Cache[${req.funnel}] MISS: fetching insights context from Supabase`);
-
-            // Snapshot the epoch before the async fetches. If an invalidation
-            // runs while we're waiting on Supabase, skip the cache write so
-            // the next request rebuilds from fresh state.
-            const epochAtStart = bucket.invalidationEpoch;
-
-            const [metricsRes, eventsRes] = await Promise.all([
-                supabase.from('daily_metrics').select('*').order('date', { ascending: false }).limit(90),
-                supabase.from('events').select('event_type, name, email, event_time').order('event_time', { ascending: false }).limit(500),
-            ]);
-
-            // Build dedup-aware metrics (same priority chain as GET /api/metrics).
-            // Skip dedup for finalized rows — their canonical columns are authoritative.
-            const rawRows = metricsRes.data || [];
-            const dates = rawRows
-                .filter(r => !r.finalized_at)
-                .map(r => String(r.date).substring(0, 10));
-            const dedupMap = await getDedupCounts(req.funnel, dates);
-
-            metricsData = rawRows.map(r => {
-                const dateStr = String(r.date).substring(0, 10);
-                const deduped = dedupMap[dateStr] || {};
-                const hasDedup = Object.keys(deduped).length > 0;
-                const ov = r.overrides || {};
-                const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa', 'stayed_45', 'stayed_60', 'stayed_80']);
-                const pick = (field) => {
-                    if (ov[field] !== undefined) return ov[field];
-                    const dd = deduped[field];
-                    // AI insights use variant-blind totals (.all)
-                    if (dd !== undefined) return dd.all ?? 0;
-                    if (hasDedup && PURCHASE_SUB_COLS.has(field)) return 0;
-                    return r[field];
-                };
-                return {
-                    date: r.date,
-                    day: r.day_of_week,
-                    fb_spend: ov.fb_spend !== undefined ? ov.fb_spend : Number(r.fb_spend),
-                    fb_link_clicks: ov.fb_link_clicks !== undefined ? ov.fb_link_clicks : Number(r.fb_link_clicks || 0),
-                    registrations: pick('registrations'),
-                    attended: pick('attended'),
-                    replays: pick('replays'),
-                    viewedcta: pick('viewedcta'),
-                    clickedcta: pick('clickedcta'),
-                    purchases_fb: pick('purchases_fb') || 0,
-                    purchases_native: pick('purchases_native') || 0,
-                    purchases_youtube: pick('purchases_youtube') || 0,
-                    purchases_aibot: pick('purchases_aibot') || 0,
-                    purchases_postwebinar: pick('purchases_postwebinar') || 0,
-                    purchases_cpa: pick('purchases_cpa') || 0,
-                    stayed_45: pick('stayed_45') || 0,
-                    stayed_60: pick('stayed_60') || 0,
-                    stayed_80: pick('stayed_80') || 0,
-                    total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
-                                     (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
-                                     (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0),
-                };
-            });
-
-            // Summarize events by date + type (instead of sending thousands of individual records)
-            const eventSummary = {};
-            recentEvents = [];
-            (eventsRes.data || []).forEach((e, i) => {
-                const laDate = new Date(e.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-                const k = `${laDate}|${e.event_type}`;
-                if (!eventSummary[k]) eventSummary[k] = 0;
-                eventSummary[k]++;
-                if (i < 50) {
-                    recentEvents.push({
-                        type: e.event_type,
-                        name: e.name,
-                        email: e.email,
-                        date: laDate,
-                    });
-                }
-            });
-            dailyEventCounts = {};
-            for (const [k, count] of Object.entries(eventSummary)) {
-                const [date, type] = k.split('|');
-                if (!dailyEventCounts[date]) dailyEventCounts[date] = {};
-                dailyEventCounts[date][type] = count;
-            }
-
-            // Store in cache only if no invalidation occurred mid-fetch.
-            // The current request still uses the freshly built context.
-            if (bucket.invalidationEpoch === epochAtStart) {
-                bucket.insightsContext = { metricsData, dailyEventCounts, recentEvents };
-                bucket.insightsUpdatedAt = now;
-            } else {
-                console.log(`⚠️  Cache[${req.funnel}]: skipped insightsContext write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${bucket.invalidationEpoch})`);
-            }
-        }
-
+        const funnel = req.funnel;
+        const brand = FUNNEL_BRANDS[funnel] || { brand: funnel, context: '', funnelName: funnel };
         const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+        const memory = await loadMemory(funnel, req.user.id);
+        const memoryBlock = memory.length === 0
+            ? '(no remembered facts yet — use the `remember` tool to save things future chats should know)'
+            : memory.map(m => `- ${m.key}: ${m.value}`).join('\n');
 
-        const systemPrompt = `You are a senior business analyst for Dr Shumard, a medical practice. You analyze their marketing funnel and provide actionable insights.
+        const systemPrompt = `You are a senior business analyst for ${brand.brand}${brand.context ? `, ${brand.context}` : ''}. You are analyzing data from their ${brand.funnelName}.
 
 TODAY'S DATE: ${today} (Los Angeles timezone)
 
 THE FUNNEL STAGES (in order):
-1. FB Spend — daily Facebook ad budget  
+1. FB Spend — daily Facebook ad budget
 2. Total Registration Page Visited (fb_link_clicks) — people who clicked the ad link to the registration page
 3. Registrations — people who signed up for the webinar
 4. Attended — people who actually attended the webinar
 5. Replays — people who watched the replay
 6. Viewed CTA — people who saw the call to action
-7. Clicked CTA — people who clicked the call to action  
+7. Clicked CTA — people who clicked the call to action
 8. Purchases — broken down by source:
    - purchases_fb (FB Purchases) — from Facebook Paid Ads
    - purchases_native (Native Ads) — from native ad placements
@@ -2258,63 +2528,141 @@ THE FUNNEL STAGES (in order):
    - purchases_cpa (CPA Traffic Funnel) — purchases attributed to the CPA Traffic source
    - total_purchases — sum of all purchase sources above
 
-KEY METRICS TO TRACK:
-- Landing Page Conversion Rate (registrations / fb_link_clicks × 100)
-- Cost per Registration (fb_spend / registrations)
-- Attendance Rate (attended / registrations × 100)
-- CTA View Rate (viewedcta / (attended + replays) × 100)
-- CTA Click Rate (clickedcta / viewedcta × 100)
-- Conversion Rate (total_purchases / clickedcta × 100)
-- Cost per Acquisition (fb_spend / total_purchases)
-- Post Webinar Rate (purchases_postwebinar / total_purchases × 100) — fraction of sales from delayed converters
+KEY METRICS:
+- Landing Page Conversion Rate = registrations / fb_link_clicks × 100
+- Cost per Registration         = fb_spend / registrations
+- Attendance Rate               = attended / registrations × 100
+- CTA View Rate                 = viewedcta / (attended + replays) × 100
+- CTA Click Rate                = clickedcta / viewedcta × 100
+- Conversion Rate               = total_purchases / clickedcta × 100
+- Cost per Acquisition          = fb_spend / total_purchases
+- Post Webinar Rate             = purchases_postwebinar / total_purchases × 100
 
-DAILY METRICS (last ${metricsData.length} days, newest first):
-${JSON.stringify(metricsData, null, 0)}
-
-DAILY EVENT COUNTS (from individual event tracking):
-${JSON.stringify(dailyEventCounts, null, 0)}
-
-RECENT EVENTS (last ${recentEvents.length} individual events):
-${JSON.stringify(recentEvents, null, 0)}
+REMEMBERED FACTS:
+${memoryBlock}
 
 INSTRUCTIONS:
+- Use tools to fetch only the data you need. Don't ask the user for date ranges — pick reasonable ones (last 7/14/30 days, last 3/6 months) based on the question.
+- For multi-week or multi-month trends, prefer \`get_metrics_rollup\` over \`get_metrics\` — fewer rows, cleaner trend.
+- For "X vs Y" or "this vs last" questions, use \`compare_periods\` — it returns deltas and % change for free.
+- For analytical questions the named tools don't cover (day-of-week patterns, hour-of-day, joins, custom aggregations), use \`run_sql\` with a SELECT. Don't be shy about it — it's the escape hatch.
+- For statistical work (forecasts, regressions, anomaly detection, t-tests), use the code execution tool. The data you've fetched is available as variables.
 - Give specific, data-backed insights. Reference actual numbers and dates.
-- Identify trends, anomalies, and opportunities.
-- Compare periods (week-over-week, day-over-day) when relevant.
-- Suggest concrete actions to improve funnel conversion.
-- Format responses with markdown: use headers, bullet points, bold for key numbers.
-- Keep responses focused and actionable — not overly long.
-- If asked about something not in the data, say so honestly.`;
+- When the user shares context worth remembering across chats (promos, definitions, business changes), use the \`remember\` tool silently.
+- If asked about something not in the data, say so honestly.
 
-        // Call Claude API
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify({
-                model: 'claude-sonnet-4-20250514',
-                max_tokens: 2048,
-                system: systemPrompt,
-                messages: messages.map(m => ({
-                    role: m.role === 'user' ? 'user' : 'assistant',
-                    content: m.content,
-                })),
-            }),
-        });
+FORMATTING:
+- Use markdown: headers, bullets, bold for key numbers, tables when comparing.
+- When a chart would communicate better than a table (any trend, distribution, or comparison across >5 data points), emit a fenced \`\`\`chart block with JSON. The frontend will render it as a real chart. Shape:
+  \`\`\`chart
+  {
+    "type": "line",                                    // "line" | "bar" | "area"
+    "title": "Daily Registrations (last 30 days)",
+    "x": "date",
+    "series": [
+      {"key": "registrations", "label": "Registrations", "color": "#3B82F6"},
+      {"key": "purchases",     "label": "Purchases",     "color": "#10B981"}
+    ],
+    "data": [
+      {"date": "2026-05-01", "registrations": 30, "purchases": 2},
+      {"date": "2026-05-02", "registrations": 35, "purchases": 3}
+    ]
+  }
+  \`\`\`
+  Use 2-4 series max. Keep it readable.`;
 
-        if (!response.ok) {
-            const errBody = await response.text();
-            console.error('❌ Claude API error:', response.status, errBody);
-            return res.status(502).json({ error: 'AI service error', detail: errBody });
+        // Build the message stack we'll send to Claude. Incoming history is
+        // user/assistant text only; we'll grow it with tool_use / tool_result
+        // pairs during the loop.
+        // Trim to last 20 turns to bound token cost on long conversations.
+        // Memory ([[remember]]) is the durable channel for older context.
+        const TRIM_KEEP = 20;
+        const trimmed = messages.length > TRIM_KEEP ? messages.slice(-TRIM_KEEP) : messages;
+        const apiMessages = trimmed.map(m => ({
+            role: m.role === 'user' ? 'user' : 'assistant',
+            content: m.content,
+        }));
+
+        // Server-side tools (managed by Anthropic): code execution sandbox.
+        // Beta gated — adjust the tool type + beta header if Anthropic
+        // updates the dated identifier.
+        const SERVER_TOOLS = [
+            { type: 'code_execution_20250522', name: 'code_execution' },
+        ];
+        const allTools = [...INSIGHTS_TOOLS, ...SERVER_TOOLS];
+
+        const MAX_ITERS = 10;
+        let lastUsage = null;
+        for (let iter = 0; iter < MAX_ITERS; iter++) {
+            const response = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': ANTHROPIC_API_KEY,
+                    'anthropic-version': '2023-06-01',
+                    'anthropic-beta': 'code-execution-2025-05-22',
+                },
+                body: JSON.stringify({
+                    model: 'claude-sonnet-4-6',
+                    max_tokens: 4096,
+                    system: systemPrompt,
+                    tools: allTools,
+                    messages: apiMessages,
+                }),
+            });
+
+            if (!response.ok) {
+                const errBody = await response.text();
+                console.error('❌ Claude API error:', response.status, errBody);
+                return res.status(502).json({ error: 'AI service error', detail: errBody });
+            }
+
+            const result = await response.json();
+            lastUsage = result.usage;
+
+            if (result.stop_reason === 'tool_use') {
+                // Only client-side tools need execution here. Server-side
+                // tools (code_execution) are already run by Anthropic and
+                // their results are embedded in the same response.
+                const ourToolNames = new Set(INSIGHTS_TOOLS.map(t => t.name));
+                const toolUses = (result.content || []).filter(c => c.type === 'tool_use' && ourToolNames.has(c.name));
+                const serverUses = (result.content || []).filter(c => c.type === 'tool_use' && !ourToolNames.has(c.name));
+                console.log(`🛠️  Chat[${funnel}] iter ${iter}: ${toolUses.length} client + ${serverUses.length} server tool call(s): ${[...toolUses, ...serverUses].map(t => t.name).join(', ')}`);
+
+                if (toolUses.length === 0) {
+                    // Only server tools fired — nothing to do client-side.
+                    // The next API call will continue from this state.
+                    apiMessages.push({ role: 'assistant', content: result.content });
+                    apiMessages.push({ role: 'user', content: 'continue' });
+                    continue;
+                }
+
+                const toolResults = [];
+                for (const tu of toolUses) {
+                    const out = await executeInsightsTool(tu.name, tu.input || {}, { funnel, userId: req.user.id });
+                    toolResults.push({
+                        type: 'tool_result',
+                        tool_use_id: tu.id,
+                        content: JSON.stringify(out),
+                    });
+                }
+
+                apiMessages.push({ role: 'assistant', content: result.content });
+                apiMessages.push({ role: 'user', content: toolResults });
+                continue;
+            }
+
+            // end_turn / max_tokens / stop_sequence — done
+            const reply = (result.content || [])
+                .filter(c => c.type === 'text')
+                .map(c => c.text)
+                .join('\n')
+                .trim() || 'No response generated.';
+            return res.json({ reply, usage: lastUsage });
         }
 
-        const result = await response.json();
-        const reply = result.content?.[0]?.text || 'No response generated.';
-
-        res.json({ reply, usage: result.usage });
+        console.error(`❌ Chat[${funnel}]: tool loop exceeded ${MAX_ITERS} iterations`);
+        return res.status(500).json({ error: 'Tool loop exceeded max iterations' });
 
     } catch (err) {
         console.error('❌ POST /api/insights/chat error:', err.message);
