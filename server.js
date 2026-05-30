@@ -6,6 +6,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import './ws-polyfill.js';   // must precede any @supabase import; see file for why
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import crypto from 'crypto';

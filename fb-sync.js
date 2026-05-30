@@ -4,6 +4,7 @@
 // via the internal /api/metrics/set logic (direct DB, no HTTP round-trip)
 // ============================================================================
 
+import './ws-polyfill.js';   // must precede the @supabase import (Node 20 WebSocket probe); see file
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import 'dotenv/config';
