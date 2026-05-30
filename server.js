@@ -11,6 +11,7 @@ import ws from 'ws';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { readFileSync } from 'fs';
 import cron from 'node-cron';
 import { syncFacebookSpend, fetchFacebookSpend, fetchFacebookInsights, writeSpendToSupabase, writeInsightsToSupabase } from './fb-sync.js';
 import 'dotenv/config';
@@ -129,6 +130,10 @@ function invalidateInsightsCache(funnel) {
     const b = getCacheBucket(funnel);
     b.insightsContext = null;
     b.insightsUpdatedAt = 0;
+    b.journeyDigest = null;       // CRM/journey rollups refresh with the metrics cache
+    b.journeyDigestAt = 0;
+    b.dataDictionary = null;      // journey data dictionary refreshes too
+    b.dataDictionaryAt = 0;
     b.invalidationEpoch++;
 }
 
@@ -144,12 +149,26 @@ app.use(helmet({
 }));
 
 // CORS
+// Dashboard/API requests honor the CORS_ORIGINS allowlist (or reflect any origin
+// when unset). Tracking requests (/shumard.js + /api/track/*) are embedded on
+// arbitrary client sites, so they always get permissive CORS — they're
+// unauthenticated and carry no credentials.
 const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').filter(Boolean);
-app.use(cors({
+const dashboardCors = cors({
     origin: corsOrigins.length > 0 ? corsOrigins : true,
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Funnel'],
-}));
+});
+app.use((req, res, next) => {
+    if (req.path === '/shumard.js' || req.path.startsWith('/api/track')) {
+        res.header('Access-Control-Allow-Origin', '*');
+        res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.header('Access-Control-Allow-Headers', 'Content-Type');
+        if (req.method === 'OPTIONS') return res.sendStatus(204);
+        return next();
+    }
+    return dashboardCors(req, res, next);
+});
 
 // Body parsing
 app.use(express.json({ limit: '1mb' }));
@@ -178,6 +197,24 @@ const webhookLimiter = rateLimit({
     max: 300,
     message: { error: 'Too many requests, try again later' },
 });
+
+// Tracking (shumard.js) fires more often than webhooks and many real visitors can
+// share one IP (corporate NAT, carriers), so it gets its own higher per-IP ceiling.
+const trackLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000,
+    max: 1200,
+    message: { error: 'Too many requests' },
+});
+
+// Drop non-human traffic (email link scanners, link-preview/headless bots) before it
+// can create contacts or clicks. shumard.js only runs in real browsers; this catches
+// JS-rendering scanners/bots that report a recognizable bot user-agent.
+const BOT_UA_RE = /bot|crawl|spider|slurp|preview|scan|proofpoint|mimecast|barracuda|googleimageproxy|google-read-aloud|feedfetch|facebookexternalhit|slackbot|telegrambot|whatsapp|discordbot|bingpreview|headless|phantomjs|puppeteer|playwright|selenium|webdriver|curl|wget|python-requests|axios|okhttp|libwww|go-http|java\//i;
+function isLikelyBot(req, payloadUA) {
+    const ua = String(payloadUA || req.headers['user-agent'] || '');
+    if (!ua) return true;                 // no user-agent at all → not a real browser
+    return BOT_UA_RE.test(ua);
+}
 
 const dashboardLimiter = rateLimit({
     windowMs: 1 * 60 * 1000,
@@ -2315,6 +2352,146 @@ async function getInsightsEventCounts(funnel, from, to, eventType) {
     return counts;
 }
 
+// Compact, cached CRM/journey rollups so common journey + webinar-timing questions
+// answer straight from the system prompt with no extra egress. Each query aggregates
+// inside Postgres (via the read-only ai_run_sql RPC) and returns only a handful of
+// rows. Refreshed on the same cadence/invalidation as the metrics cache.
+async function getInsightsJourneyDigest(funnel) {
+    const bucket = getCacheBucket(funnel);
+    const now = Date.now();
+    if (bucket.journeyDigest && (now - (bucket.journeyDigestAt || 0)) < cache.insightsTTL) {
+        return bucket.journeyDigest;
+    }
+    const supabase = clientFor(funnel);
+    const q = async (query) => {
+        const { data } = await supabase.rpc('ai_run_sql', { query });
+        return Array.isArray(data) ? data : [];  // ai_run_sql returns {error} (not an array) if a table is absent
+    };
+    const [funnelStages, webinarSlots, regsByDayOfWeek, purchasesBySource] = await Promise.all([
+        q("SELECT stage, count(*)::int AS people FROM crm_people GROUP BY 1 ORDER BY people DESC"),
+        q("SELECT metadata->>'webinar_datetime_utc' AS slot, count(*)::int AS regs FROM events WHERE event_type='registrations' AND metadata->>'webinar_datetime_utc' IS NOT NULL GROUP BY 1 ORDER BY regs DESC LIMIT 12"),
+        q("SELECT trim(to_char(event_time AT TIME ZONE 'America/Los_Angeles','Day')) AS dow, count(*)::int AS regs FROM events WHERE event_type='registrations' GROUP BY 1 ORDER BY regs DESC"),
+        q("SELECT coalesce(metadata->>'source','(unknown)') AS source, count(*)::int AS purchases FROM events WHERE event_type='purchases' GROUP BY 1 ORDER BY purchases DESC"),
+    ]);
+    const digest = { funnelStages, webinarSlots, regsByDayOfWeek, purchasesBySource };
+    bucket.journeyDigest = digest;
+    bucket.journeyDigestAt = now;
+    return digest;
+}
+
+// Full funnel as DISTINCT PEOPLE per stage, with stage-to-stage conversion and
+// drop-off. Optional date range (by event_time, LA tz). Aggregated in Postgres.
+async function getJourneyFunnel(funnel, from, to) {
+    const supabase = clientFor(funnel);
+    let where = 'email IS NOT NULL';
+    if (from) where += ` AND event_time >= '${String(from).replace(/'/g, '')}T00:00:00-08:00'`;
+    if (to)   where += ` AND event_time < ('${String(to).replace(/'/g, '')}T00:00:00-08:00'::timestamptz + interval '1 day')`;
+    const sql = `SELECT
+        count(DISTINCT email) FILTER (WHERE event_type='registrations') AS registered,
+        count(DISTINCT email) FILTER (WHERE event_type='attended')      AS attended,
+        count(DISTINCT email) FILTER (WHERE event_type='replays')       AS watched_replay,
+        count(DISTINCT email) FILTER (WHERE event_type='viewedcta')     AS saw_cta,
+        count(DISTINCT email) FILTER (WHERE event_type='clickedcta')    AS clicked_cta,
+        count(DISTINCT email) FILTER (WHERE event_type='purchases')     AS purchased
+      FROM events WHERE ${where}`;
+    const { data } = await supabase.rpc('ai_run_sql', { query: sql });
+    const row = (Array.isArray(data) && data[0]) ? data[0] : {};
+    const n = (v) => Number(v) || 0;
+    const pct = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : null);
+    const reg = n(row.registered);
+    return {
+        date_from: from || null, date_to: to || null,
+        stages: {
+            registered: reg, attended: n(row.attended), watched_replay: n(row.watched_replay),
+            saw_cta: n(row.saw_cta), clicked_cta: n(row.clicked_cta), purchased: n(row.purchased),
+        },
+        conversion_pct: {
+            registered_to_attended: pct(n(row.attended), reg),
+            attended_to_saw_cta: pct(n(row.saw_cta), n(row.attended)),
+            saw_to_clicked_cta: pct(n(row.clicked_cta), n(row.saw_cta)),
+            clicked_to_purchase: pct(n(row.purchased), n(row.clicked_cta)),
+            registered_to_purchase: pct(n(row.purchased), reg),
+        },
+    };
+}
+
+// Live data dictionary so the AI knows the FULL shape of the journey data without
+// guessing: table columns, the inventory of events.metadata keys (+ sample values),
+// and the enum-ish values actually in use (event types, purchase sources, stages,
+// tags) plus totals and date range. Cached on the metrics cadence.
+async function getJourneyDataDictionary(funnel) {
+    const bucket = getCacheBucket(funnel);
+    const now = Date.now();
+    if (bucket.dataDictionary && (now - (bucket.dataDictionaryAt || 0)) < cache.insightsTTL) {
+        return bucket.dataDictionary;
+    }
+    const supabase = clientFor(funnel);
+    const q = async (query) => { const { data } = await supabase.rpc('ai_run_sql', { query }); return Array.isArray(data) ? data : []; };
+    const [eventTypes, metadataKeys, purchaseSources, stages, tags, totals] = await Promise.all([
+        q("SELECT event_type, count(*)::int AS count FROM events GROUP BY 1 ORDER BY count DESC"),
+        q("SELECT k AS key, count(*)::int AS occurrences, (array_agg(DISTINCT left(v, 80)))[1:4] AS sample_values FROM events e, LATERAL jsonb_each_text(e.metadata) AS kv(k, v) WHERE jsonb_typeof(e.metadata) = 'object' GROUP BY k ORDER BY occurrences DESC"),
+        q("SELECT coalesce(metadata->>'source', '(unknown)') AS source, count(*)::int AS purchases FROM events WHERE event_type='purchases' GROUP BY 1 ORDER BY purchases DESC"),
+        q("SELECT stage, count(*)::int AS people FROM crm_people GROUP BY 1 ORDER BY people DESC"),
+        q("SELECT t AS tag, count(*)::int AS contacts FROM tracking_contacts, unnest(tags) AS t GROUP BY 1 ORDER BY contacts DESC LIMIT 50"),
+        q("SELECT (SELECT count(*) FROM events)::int AS total_events, (SELECT count(*) FROM crm_people)::int AS total_people, (SELECT count(*) FROM crm_people WHERE is_tracked)::int AS tracked_people, (SELECT count(*) FROM crm_people WHERE NOT is_tracked)::int AS legacy_people, (SELECT min(event_time) FROM events) AS earliest_event, (SELECT max(event_time) FROM events) AS latest_event"),
+    ]);
+    const dict = {
+        tables: {
+            events: 'id, event_type, name, email, phone, metadata (jsonb), event_time, created_at — one row per funnel action',
+            crm_people: 'email, name, phone, contact_id, is_tracked, stage, has_registration, has_attended, has_replay, has_viewedcta, has_clickedcta, has_purchase, event_count, attribution (jsonb), tags, first_seen, last_activity — one row per person (by email)',
+            tracking_contacts: 'contact_id, session_id, client_ip, name, email, phone, attribution (jsonb), tags, merged_into, merged_children, created_at, updated_at — shumard.js identities',
+            tracking_page_visits: 'id, contact_id, session_id, current_url, referrer_url, page_title, attribution, timestamp — every page view',
+            tracking_tag_events: 'id, contact_id, tag, current_url, timestamp — funnel tag fires',
+        },
+        event_types: eventTypes,
+        events_metadata_keys: metadataKeys,
+        purchase_sources: purchaseSources,
+        crm_stages: stages,
+        tracking_tags: tags,
+        totals: totals[0] || {},
+    };
+    bucket.dataDictionary = dict;
+    bucket.dataDictionaryAt = now;
+    return dict;
+}
+
+// List PEOPLE matching journey criteria (stage filters + optional webinar slot /
+// purchase source / registration date range). Builds SQL from structured params,
+// escapes interpolated strings, and routes through the read-only guard. Returns PII
+// for the matched people, capped (default 100, max 500).
+const JOURNEY_STAGE_COL = {
+    registration: 'has_registration', registered: 'has_registration',
+    attended: 'has_attended', attendance: 'has_attended',
+    replay: 'has_replay', replays: 'has_replay',
+    viewedcta: 'has_viewedcta', saw_cta: 'has_viewedcta', viewed_cta: 'has_viewedcta',
+    clickedcta: 'has_clickedcta', clicked_cta: 'has_clickedcta',
+    purchase: 'has_purchase', purchased: 'has_purchase', buyer: 'has_purchase',
+};
+async function getJourneySegment(funnel, params) {
+    const p = params || {};
+    const esc = (v) => String(v).replace(/['\\;]/g, '').slice(0, 120);   // strip quotes/semicolons/backslashes
+    const mapStage = (s) => JOURNEY_STAGE_COL[String(s).toLowerCase().trim()];
+    const conds = ['TRUE'];
+    for (const s of (Array.isArray(p.reached_stages) ? p.reached_stages : [])) { const c = mapStage(s); if (c) conds.push(c); }
+    for (const s of (Array.isArray(p.not_reached_stages) ? p.not_reached_stages : [])) { const c = mapStage(s); if (c) conds.push(`NOT ${c}`); }
+    if (p.webinar_slot) conds.push(`email_key IN (SELECT lower(email) FROM events WHERE event_type='registrations' AND metadata->>'webinar_datetime_utc' ILIKE '%${esc(p.webinar_slot)}%' AND email IS NOT NULL)`);
+    if (p.purchase_source) conds.push(`email_key IN (SELECT lower(email) FROM events WHERE event_type='purchases' AND metadata->>'source' ILIKE '${esc(p.purchase_source)}' AND email IS NOT NULL)`);
+    const dfrom = /^\d{4}-\d{2}-\d{2}$/.test(p.registered_from || '') ? p.registered_from : null;
+    const dto = /^\d{4}-\d{2}-\d{2}$/.test(p.registered_to || '') ? p.registered_to : null;
+    if (dfrom || dto) {
+        let sub = "SELECT lower(email) FROM events WHERE event_type='registrations' AND email IS NOT NULL";
+        if (dfrom) sub += ` AND event_time >= '${dfrom}T00:00:00-08:00'`;
+        if (dto) sub += ` AND event_time < ('${dto}T00:00:00-08:00'::timestamptz + interval '1 day')`;
+        conds.push(`email_key IN (${sub})`);
+    }
+    const limit = Math.min(Math.max(parseInt(p.limit, 10) || 100, 1), 500);
+    const sql = `SELECT email, name, phone, stage, event_count, is_tracked, last_activity FROM crm_people WHERE ${conds.join(' AND ')} ORDER BY last_activity DESC NULLS LAST LIMIT ${limit}`;
+    const result = await runReadOnlySQL(funnel, sql);
+    if (result.error) return result;
+    const rows = result.rows || [];
+    return { count: rows.length, truncated: rows.length >= limit, filters: p, people: rows };
+}
+
 // Strict read-only SQL guard. Allows a single SELECT or WITH ... SELECT, no
 // DDL/DML keywords, no statement chaining. This is the primary defense; the
 // DB function adds statement_timeout + row cap as belt-and-suspenders.
@@ -2430,7 +2607,7 @@ const INSIGHTS_TOOLS = [
     },
     {
         name: 'run_sql',
-        description: 'Run a read-only SQL query against the funnel\'s schema. Use this as an escape hatch for analytical questions the other tools don\'t cover — joins, grouping by day-of-week, filtering by arbitrary event attributes, etc. Tables available: daily_metrics, events, custom_metrics, dashboard_lenses. STRICT RULES: must be a single SELECT or WITH statement; no INSERT/UPDATE/DELETE/DDL; results capped at 500 rows and 5-second timeout. The query runs in the active funnel\'s schema (no need to prefix table names).',
+        description: 'Run a read-only SQL query against the funnel\'s schema. Use this as an escape hatch for analytical questions the other tools don\'t cover — joins, grouping by day-of-week, filtering by arbitrary event attributes, per-person journeys, etc. Tables/views: daily_metrics; events (one row per funnel action — columns id, event_type ∈ registrations/attended/replays/viewedcta/clickedcta/purchases/stayeduntil, name, email, phone, event_time, metadata jsonb); metadata holds webinar_datetime_utc (text like "April 11th 2026, 10:00:00 pm"), source (purchase source), stayeduntil; crm_people (ONE ROW PER PERSON by email, merging shumard.js tracking + events — columns email, name, phone, stage, is_tracked, has_registration/has_attended/has_replay/has_viewedcta/has_clickedcta/has_purchase, event_count, attribution jsonb, tags, first_seen, last_activity); tracking_contacts / tracking_page_visits / tracking_tag_events (per-person attribution, page journey, tag fires); custom_metrics; dashboard_lenses. Examples: busiest webinar slots → SELECT metadata->>\'webinar_datetime_utc\', count(*) FROM events WHERE event_type=\'registrations\' GROUP BY 1 ORDER BY 2 DESC; registrations by weekday → GROUP BY to_char(event_time AT TIME ZONE \'America/Los_Angeles\',\'Day\'). STRICT RULES: single SELECT or WITH statement; no INSERT/UPDATE/DELETE/DDL; results capped at 500 rows and 5-second timeout. Runs in the active funnel\'s schema (no need to prefix table names).',
         input_schema: {
             type: 'object',
             properties: {
@@ -2460,6 +2637,59 @@ const INSIGHTS_TOOLS = [
             required: ['key'],
         },
     },
+    {
+        name: 'get_journey_funnel',
+        description: 'The full customer-journey funnel as DISTINCT PEOPLE at each stage (registered → attended → watched_replay → saw_cta → clicked_cta → purchased), plus stage-to-stage conversion % and overall registered→purchase %. Optional date range filters by event time (LA timezone). Use for "what does my funnel look like", drop-off, and conversion questions — it gets the distinct-person math right (unlike summing daily event counts).',
+        input_schema: {
+            type: 'object',
+            properties: {
+                date_from: { type: 'string', description: 'Inclusive start date (YYYY-MM-DD), optional' },
+                date_to:   { type: 'string', description: 'Inclusive end date (YYYY-MM-DD), optional' },
+            },
+        },
+    },
+    {
+        name: 'get_contact_journey',
+        description: 'One person\'s COMPLETE journey by email or contact_id: identity, attribution, current stage, and a single chronological timeline merging their page views, tag fires, and funnel events (registered/attended/CTA/purchase). Use for "show me what <email> did", sample buyer paths, or auditing a specific person. Returns PII (name/email/phone) for that one contact.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                identifier: { type: 'string', description: 'The person\'s email address or tracking contact_id' },
+            },
+            required: ['identifier'],
+        },
+    },
+    {
+        name: 'describe_journey_data',
+        description: 'Live data dictionary for the customer-journey data: every table/view and its columns, the full inventory of keys present in events.metadata (with sample values), and the actual enum values in use (event types, purchase sources, CRM stages, tracking tags) plus totals and date range. Call this FIRST when you need to know exactly what is queryable before writing a run_sql query — so you never guess a column or metadata key.',
+        input_schema: { type: 'object', properties: {} },
+    },
+    {
+        name: 'get_journey_segment',
+        description: 'List the actual PEOPLE matching journey criteria — e.g. "registered but never attended" (reached_stages:["registration"], not_reached_stages:["attended"]), "buyers from the May 10 webinar" (reached_stages:["purchase"], webinar_slot:"May 10"), "attended but didn\'t buy". Returns a capped list with email, name, phone, and stage. Use when the user wants WHO matches a segment; for counts only, prefer get_journey_funnel. Returns PII for the matched people.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                reached_stages:     { type: 'array', items: { type: 'string' }, description: 'Stages the person MUST have reached. Any of: registration, attended, replay, saw_cta, clicked_cta, purchase.' },
+                not_reached_stages: { type: 'array', items: { type: 'string' }, description: 'Stages the person must NOT have reached (e.g. ["attended"] for registrants who were no-shows).' },
+                webinar_slot:       { type: 'string', description: 'Substring of the registration webinar datetime, e.g. "May 10" or "April 11th 2026, 10:00:00 pm".' },
+                purchase_source:    { type: 'string', description: 'Restrict to people who purchased from this source, e.g. "Paid Ads", "AI Bot".' },
+                registered_from:    { type: 'string', description: 'Registration date range start (YYYY-MM-DD), optional.' },
+                registered_to:      { type: 'string', description: 'Registration date range end (YYYY-MM-DD), optional.' },
+                limit:              { type: 'number', description: 'Max people to return (default 100, max 500).' },
+            },
+        },
+    },
+    {
+        name: 'get_email_report',
+        description: 'Email-marketing performance: for each email source (the el= label on email links, where traffic_source=email) — clicks, unique people who clicked, how many then PURCHASED AFTER clicking (click→sale ordering; by default any purchase after the click counts, no time limit), and the click→buyer conversion %, plus totals. Use for "which emails convert best", "email click-through and sales", or comparing email sources. Counts only (no revenue captured yet). Empty until emails go out carrying the tracking link.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                window_days: { type: 'number', description: 'Optional cap: only count a purchase if it happens within this many days after the click. Omit for no cap (any purchase after the click counts).' },
+            },
+        },
+    },
 ];
 
 async function executeInsightsTool(name, input, ctx) {
@@ -2478,6 +2708,17 @@ async function executeInsightsTool(name, input, ctx) {
                 return await getInsightsCustomMetrics(funnel);
             case 'run_sql':
                 return await runReadOnlySQL(funnel, input.query);
+            case 'get_journey_funnel':
+                return await getJourneyFunnel(funnel, input.date_from, input.date_to);
+            case 'get_contact_journey':
+                if (!input.identifier) return { error: 'identifier (email or contact_id) required' };
+                return (await buildContactJourney(clientFor(funnel), String(input.identifier))) || { error: 'No contact found for that identifier' };
+            case 'describe_journey_data':
+                return await getJourneyDataDictionary(funnel);
+            case 'get_journey_segment':
+                return await getJourneySegment(funnel, input || {});
+            case 'get_email_report':
+                return await getEmailReportData(funnel, input && input.window_days);
             case 'remember':
                 if (!input.key || !input.value) return { error: 'key and value required' };
                 return await rememberFact(funnel, userId, input.key, input.value);
@@ -2511,6 +2752,22 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
             ? '(no remembered facts yet — use the `remember` tool to save things future chats should know)'
             : memory.map(m => `- ${m.key}: ${m.value}`).join('\n');
 
+        // CRM / journey digest — compact cached rollups injected into the prompt so
+        // common journey/timing questions are answered with no extra egress. Best-effort:
+        // if the CRM tables aren't present in this funnel yet, the block stays empty.
+        let journeyBlock = '';
+        try {
+            const dg = await getInsightsJourneyDigest(funnel);
+            if (dg && ((dg.funnelStages && dg.funnelStages.length) || (dg.webinarSlots && dg.webinarSlots.length))) {
+                const lines = [];
+                if (dg.funnelStages.length) lines.push('People by stage: ' + dg.funnelStages.map(r => `${r.stage} ${r.people}`).join(', '));
+                if (dg.webinarSlots.length) lines.push('Busiest webinar slots (registrations): ' + dg.webinarSlots.slice(0, 6).map(r => `${r.slot} (${r.regs})`).join('; '));
+                if (dg.regsByDayOfWeek && dg.regsByDayOfWeek.length) lines.push('Registrations by weekday: ' + dg.regsByDayOfWeek.map(r => `${r.dow} ${r.regs}`).join(', '));
+                if (dg.purchasesBySource && dg.purchasesBySource.length) lines.push('Purchases by source: ' + dg.purchasesBySource.map(r => `${r.source} ${r.purchases}`).join(', '));
+                journeyBlock = `\n\nCRM / CUSTOMER JOURNEY (per-person — query via run_sql):\nThe crm_people view = one row per person (by email), merging shumard.js tracking with funnel events: columns email, name, phone, stage (lead→registration→attended→replay→viewedcta→clickedcta→purchase), is_tracked (false = LEGACY, pre-tracking contact), has_* booleans, event_count, attribution (jsonb), first_seen, last_activity. The events.metadata jsonb holds webinar_datetime_utc, source, stayeduntil. For journey/timing deep-dives, run_sql against crm_people / events.metadata.\nCURRENT SNAPSHOT (refreshed every few minutes):\n- ${lines.join('\n- ')}`;
+            }
+        } catch { /* digest is best-effort — never block the chat */ }
+
         const systemPrompt = `You are a senior business analyst for ${brand.brand}${brand.context ? `, ${brand.context}` : ''}. You are analyzing data from their ${brand.funnelName}.
 
 TODAY'S DATE: ${today} (Los Angeles timezone)
@@ -2540,7 +2797,7 @@ KEY METRICS:
 - CTA Click Rate                = clickedcta / viewedcta × 100
 - Conversion Rate               = total_purchases / clickedcta × 100
 - Cost per Acquisition          = fb_spend / total_purchases
-- Post Webinar Rate             = purchases_postwebinar / total_purchases × 100
+- Post Webinar Rate             = purchases_postwebinar / total_purchases × 100${journeyBlock}
 
 REMEMBERED FACTS:
 ${memoryBlock}
@@ -2550,6 +2807,13 @@ INSTRUCTIONS:
 - For multi-week or multi-month trends, prefer \`get_metrics_rollup\` over \`get_metrics\` — fewer rows, cleaner trend.
 - For "X vs Y" or "this vs last" questions, use \`compare_periods\` — it returns deltas and % change for free.
 - For analytical questions the named tools don't cover (day-of-week patterns, hour-of-day, joins, custom aggregations), use \`run_sql\` with a SELECT. Don't be shy about it — it's the escape hatch.
+- CUSTOMER JOURNEY — you can see the funnel end to end, per person:
+  • \`get_journey_funnel\` — distinct-people funnel + stage-to-stage conversion/drop-off (optionally date-ranged). Use for funnel/conversion/drop-off questions.
+  • \`get_contact_journey\` — one person's full chronological timeline by email or contact_id. Use for "what did <email> do" or sample buyer/non-buyer paths.
+  • \`get_journey_segment\` — the LIST of people matching a segment (registered-but-not-attended, buyers from a given webinar slot, attended-but-didn't-buy, etc.). Use when the user wants WHO, not just how many.
+  • \`get_email_report\` — email-marketing performance by source (clicks → people → buyers → conversion %, traffic_source=email). Use for "which emails convert best".
+  • \`describe_journey_data\` — live schema + every \`events.metadata\` key (with samples) + enum values. Call it FIRST when unsure what's queryable, so you never guess a column or metadata key.
+  • \`run_sql\` against \`crm_people\` / \`events.metadata\` for anything else (webinar-slot popularity, attribution, cohorts). The journey snapshot above already answers the most common ones — cite it directly when it suffices.
 - For statistical work (forecasts, regressions, anomaly detection, t-tests), use the code execution tool. The data you've fetched is available as variables.
 - Give specific, data-backed insights. Reference actual numbers and dates.
 - When the user shares context worth remembering across chats (promos, definitions, business changes), use the \`remember\` tool silently.
@@ -2760,6 +3024,670 @@ app.delete('/api/insights/conversations/:id', dashboardLimiter, requireAuth, asy
         res.json({ success: true });
     } catch (err) {
         console.error('❌ DELETE /api/insights/conversations error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+
+// =============================================================================
+// TRACKING + CRM — shumard.js identity stitching (ported from the `tether` engine)
+//
+// Public, unauthenticated endpoints called by shumard.js on the client site:
+//   GET  /shumard.js              — the tracking script (?tag= sets an auto-tag)
+//   POST /api/track/pageview      — log a pageview
+//   POST /api/track/lead          — email/phone captured on a form field
+//   POST /api/track/registration  — a form was submitted
+//   POST /api/track/tag           — apply a funnel tag (attended, replay, cta…)
+//
+// Writes go to the request's funnel schema via clientFor(resolveFunnel(req)),
+// defaulting to `analytics` (public). The stitching engine fuses browser
+// identities into one contact by session_id > email > shared-IP, following a
+// merged_into chain. Mirrors tether/backend/server.py.
+// =============================================================================
+
+const ATTR_KNOWN_FIELDS = [
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+    'utm_id', 'campaign_id', 'adset_id', 'ad_id',
+    'fbclid', 'fbc', 'fbp', 'gclid', 'ttclid', 'source_link_tag', 'fb_ad_set_id', 'google_campaign_id',
+    'source', 'traffic_source',   // email-link params: el → source, htrafficsource → traffic_source
+];
+
+// The tracker script is loaded once; per-request placeholders are swapped in.
+const TRACKER_JS = (() => {
+    try { return readFileSync(path.join(__dirname, 'tracking', 'shumard.js'), 'utf8'); }
+    catch (e) { console.error('⚠️  Could not load tracking/shumard.js:', e.message); return ''; }
+})();
+
+function trackingClientIp(req) {
+    const xff = req.headers['x-forwarded-for'];
+    if (xff) return String(xff).split(',')[0].trim();
+    const real = req.headers['x-real-ip'];
+    if (real) return String(real).trim();
+    return req.ip || null;
+}
+
+function normEmail(email) {
+    if (!email || typeof email !== 'string') return null;
+    return email.trim().toLowerCase() || null;
+}
+
+// Clean an attribution object: known fields (capped at 500 chars) + an `extra`
+// map for every unrecognised param. Empty → {}.
+function safeAttribution(raw) {
+    if (!raw || typeof raw !== 'object') return {};
+    const cap = (v) => String(v).slice(0, 500);
+    const out = {};
+    for (const k of ATTR_KNOWN_FIELDS) if (raw[k]) out[k] = cap(raw[k]);
+    const extra = {};
+    for (const [k, v] of Object.entries(raw)) {
+        if (k === 'extra' || ATTR_KNOWN_FIELDS.includes(k)) continue;
+        if (v) extra[k] = cap(v);
+    }
+    if (raw.extra && typeof raw.extra === 'object') {
+        for (const [k, v] of Object.entries(raw.extra)) if (v) extra[k] = cap(v);
+    }
+    if (Object.keys(extra).length) out.extra = extra;
+    return out;
+}
+
+// True only when there are real UTM/click-ID signals (ignores `extra`).
+function hasRealAttribution(attr) {
+    if (!attr || typeof attr !== 'object') return false;
+    return Object.entries(attr).some(([k, v]) => k !== 'extra' && v);
+}
+
+// Fill base's empty fields from incoming (base wins); union the `extra` maps.
+function mergeAttribution(base, incoming) {
+    const merged = { ...(base && typeof base === 'object' ? base : {}) };
+    if (!incoming || typeof incoming !== 'object') return merged;
+    for (const [k, v] of Object.entries(incoming)) {
+        if (k === 'extra') continue;
+        if (v && !merged[k]) merged[k] = v;
+    }
+    if (incoming.extra && typeof incoming.extra === 'object') {
+        const ex = { ...(merged.extra && typeof merged.extra === 'object' ? merged.extra : {}) };
+        for (const [k, v] of Object.entries(incoming.extra)) if (v && !ex[k]) ex[k] = v;
+        if (Object.keys(ex).length) merged.extra = ex;
+    }
+    return merged;
+}
+
+const NAME_SUFFIXES = new Set(['jr', 'jr.', 'sr', 'sr.', 'ii', 'iii', 'iv', 'v', 'phd', 'ph.d', 'ph.d.', 'md', 'm.d', 'm.d.', 'esq', 'esq.', 'dds', 'd.d.s', 'd.d.s.']);
+function parseFullName(full) {
+    if (!full || typeof full !== 'string') return [null, null];
+    const name = full.trim().split(/\s+/).join(' ');
+    if (!name) return [null, null];
+    let parts = name.split(' ');
+    while (parts.length > 1) {
+        const last = parts[parts.length - 1].toLowerCase();
+        if (NAME_SUFFIXES.has(last) || NAME_SUFFIXES.has(last.replace(/\.$/, ''))) parts = parts.slice(0, -1);
+        else break;
+    }
+    if (parts.length === 0) return [null, null];
+    if (parts.length === 1) return [parts[0], null];
+    if (parts.length === 2) return [parts[0], parts[1]];
+    return [parts.slice(0, -1).join(' '), parts[parts.length - 1]];
+}
+
+// Follow merged_into to the surviving root contact_id. Cycle-guarded.
+async function resolveContactId(sb, contactId) {
+    const visited = new Set();
+    let cid = contactId;
+    while (cid && !visited.has(cid)) {
+        visited.add(cid);
+        const { data } = await sb.from('tracking_contacts').select('merged_into').eq('contact_id', cid).maybeSingle();
+        if (!data || !data.merged_into) return cid;
+        cid = data.merged_into;
+    }
+    return contactId;
+}
+
+// Create or update a contact. Caller passes the resolved (non-merged) contact_id.
+async function upsertContact(sb, data, nowIso, clientIp) {
+    const cid = data.contact_id;
+    if (!cid) return;
+
+    let firstName = data.first_name || null;
+    let lastName = data.last_name || null;
+    if (data.name && !firstName && !lastName) [firstName, lastName] = parseFullName(data.name);
+    const email = normEmail(data.email);
+
+    const { data: existing } = await sb.from('tracking_contacts').select('*').eq('contact_id', cid).maybeSingle();
+
+    if (existing) {
+        const update = { updated_at: nowIso };
+        if (data.name) update.name = data.name;
+        if (email) update.email = email;
+        if (data.phone) update.phone = data.phone;
+        if (data.session_id) update.session_id = data.session_id;
+        if (firstName && !existing.first_name) update.first_name = firstName;
+        if (lastName && !existing.last_name) update.last_name = lastName;
+        if (clientIp && !existing.client_ip) update.client_ip = clientIp;
+        if (data.user_agent && !existing.user_agent) update.user_agent = String(data.user_agent).slice(0, 1000);
+        if (data.attribution) {
+            const merged = mergeAttribution(existing.attribution, safeAttribution(data.attribution));
+            if (JSON.stringify(merged) !== JSON.stringify(existing.attribution || {})) update.attribution = merged;
+        }
+        await sb.from('tracking_contacts').update(update).eq('contact_id', cid);
+    } else {
+        // Only create a contact with identity OR meaningful attribution. Pure
+        // anonymous loads are skipped — their visits are still logged and will be
+        // attached once the contact is identified (and stitched).
+        const attr = safeAttribution(data.attribution);
+        const hasIdentity = !!(data.name || email || data.phone || firstName || lastName);
+        const hasExtra = !!(attr.extra && Object.keys(attr.extra).length);
+        if (!hasIdentity && !hasRealAttribution(attr) && !hasExtra) return;
+
+        const row = {
+            contact_id: cid,
+            session_id: data.session_id || null,
+            client_ip: clientIp || null,
+            user_agent: data.user_agent ? String(data.user_agent).slice(0, 1000) : null,
+            name: data.name || null,
+            email,
+            phone: data.phone || null,
+            first_name: firstName,
+            last_name: lastName,
+            attribution: attr,
+            created_at: nowIso,
+            updated_at: nowIso,
+        };
+        const { error } = await sb.from('tracking_contacts').insert(row);
+        if (error) {
+            // Race: a concurrent request inserted first — fall back to update.
+            const update = { updated_at: nowIso };
+            if (data.name) update.name = data.name;
+            if (email) update.email = email;
+            if (data.phone) update.phone = data.phone;
+            if (data.session_id) update.session_id = data.session_id;
+            await sb.from('tracking_contacts').update(update).eq('contact_id', cid);
+        }
+    }
+}
+
+async function logVisit(sb, contactId, sessionId, currentUrl, referrerUrl, pageTitle, attribution, nowIso, clientIp) {
+    if (!currentUrl) return null;
+    const { data, error } = await sb.from('tracking_page_visits').insert({
+        contact_id: contactId,
+        session_id: sessionId || null,
+        client_ip: clientIp || null,
+        current_url: currentUrl,
+        referrer_url: referrerUrl || null,
+        page_title: pageTitle || null,
+        attribution: safeAttribution(attribution),
+        timestamp: nowIso,
+    }).select('id').maybeSingle();
+    if (error) { console.error('track: logVisit failed:', error.message); return null; }
+    return data ? data.id : null;
+}
+
+// Merge child contact into parent: copy identity/attribution where the parent is
+// empty, union tags, reassign the child's visits + tag-events to the parent, and
+// mark the child merged_into the parent.
+async function doStitch(sb, parentId, childId, nowIso) {
+    if (parentId === childId) return { status: 'same', contact_id: parentId };
+    const { data: parent } = await sb.from('tracking_contacts').select('*').eq('contact_id', parentId).maybeSingle();
+    const { data: child } = await sb.from('tracking_contacts').select('*').eq('contact_id', childId).maybeSingle();
+    if (!parent || !child) return { status: 'not_found' };
+    if (child.merged_into === parentId) return { status: 'already_merged', merged_into: parentId };
+
+    // Already merged into a DIFFERENT parent → un-merge first, then re-merge.
+    if (child.merged_into && child.merged_into !== parentId) {
+        const oldParentId = child.merged_into;
+        const { data: oldParent } = await sb.from('tracking_contacts').select('merged_children').eq('contact_id', oldParentId).maybeSingle();
+        if (oldParent) {
+            await sb.from('tracking_contacts')
+                .update({ merged_children: (oldParent.merged_children || []).filter((x) => x !== childId) })
+                .eq('contact_id', oldParentId);
+        }
+        await sb.from('tracking_page_visits').update({ contact_id: childId })
+            .eq('contact_id', oldParentId).eq('original_contact_id', childId);
+        await sb.from('tracking_tag_events').update({ contact_id: childId })
+            .eq('contact_id', oldParentId).eq('original_contact_id', childId);
+        await sb.from('tracking_contacts').update({ merged_into: null }).eq('contact_id', childId);
+    }
+
+    const parentUpdate = { updated_at: nowIso };
+    for (const f of ['name', 'email', 'phone', 'first_name', 'last_name', 'session_id', 'client_ip']) {
+        if (child[f] && !parent[f]) parentUpdate[f] = child[f];
+    }
+    const mergedAttr = mergeAttribution(parent.attribution, child.attribution);
+    if (JSON.stringify(mergedAttr) !== JSON.stringify(parent.attribution || {})) parentUpdate.attribution = mergedAttr;
+
+    const unionTags = Array.from(new Set([...(parent.tags || []), ...(child.tags || [])]));
+    if (unionTags.length !== (parent.tags || []).length) parentUpdate.tags = unionTags;
+
+    const mc = parent.merged_children || [];
+    if (!mc.includes(childId)) mc.push(childId);
+    parentUpdate.merged_children = mc;
+
+    await sb.from('tracking_contacts').update(parentUpdate).eq('contact_id', parentId);
+
+    // Reassign child's visits + tag-events → parent (original_contact_id keeps provenance)
+    await sb.from('tracking_page_visits').update({ contact_id: parentId, original_contact_id: childId }).eq('contact_id', childId);
+    await sb.from('tracking_tag_events').update({ contact_id: parentId, original_contact_id: childId }).eq('contact_id', childId);
+
+    await sb.from('tracking_contacts').update({ merged_into: parentId, updated_at: nowIso }).eq('contact_id', childId);
+    console.log(`🔗 Stitched ${childId.slice(0, 8)} → ${parentId.slice(0, 8)}`);
+    return { status: 'stitched', parent_contact_id: parentId, child_contact_id: childId };
+}
+
+// Stitch contacts sharing a session_id (strongest signal — shared cross-frame
+// via postMessage). Prefer attribution-rich, then identity-rich, then older as parent.
+async function sessionAutoStitch(sb, contactId, sessionId, nowIso) {
+    if (!sessionId) return;
+    const { data: contacts } = await sb.from('tracking_contacts')
+        .select('*').eq('session_id', sessionId).is('merged_into', null).neq('contact_id', contactId).limit(20);
+    if (!contacts || !contacts.length) return;
+    let current = (await sb.from('tracking_contacts').select('*').eq('contact_id', contactId).maybeSingle()).data;
+    if (!current || current.merged_into) return;
+    const hasIdentity = (c) => !!(c.email || c.phone || c.name);
+    for (const cand of contacts) {
+        const cAttr = hasRealAttribution(current.attribution), candAttr = hasRealAttribution(cand.attribution);
+        const cId = hasIdentity(current), candId = hasIdentity(cand);
+        if (cAttr && !candAttr) await doStitch(sb, contactId, cand.contact_id, nowIso);
+        else if (candAttr && !cAttr) await doStitch(sb, cand.contact_id, contactId, nowIso);
+        else if (cId && !candId) await doStitch(sb, contactId, cand.contact_id, nowIso);
+        else if (candId && !cId) await doStitch(sb, cand.contact_id, contactId, nowIso);
+        else if ((current.created_at || '') <= (cand.created_at || '')) await doStitch(sb, contactId, cand.contact_id, nowIso);
+        else await doStitch(sb, cand.contact_id, contactId, nowIso);
+        current = (await sb.from('tracking_contacts').select('*').eq('contact_id', contactId).maybeSingle()).data;
+        if (!current || current.merged_into) break;
+    }
+}
+
+// Stitch contacts sharing an IP within a 15-minute window: attribution↔identity
+// cross-match, or the iframe-companion rule (attribution-rich + fully anonymous).
+// Skips entirely on crowded/shared IPs (guard below).
+async function ipAutoStitch(sb, contactId, clientIp, nowIso) {
+    if (!clientIp) return;
+    // Crowded-IP guard: more than 3 non-merged contacts on one IP = a shared address
+    // (office NAT, mobile CGNAT, VPN). Flag them all and skip IP-stitch so strangers
+    // behind one IP are never fused. (Email + session stitching still apply.)
+    const { count: ipCount } = await sb.from('tracking_contacts')
+        .select('*', { count: 'exact', head: true })
+        .eq('client_ip', clientIp).is('merged_into', null);
+    if ((ipCount || 0) > 3) {
+        await sb.from('tracking_contacts')
+            .update({ flagged_shared_ip: true })
+            .eq('client_ip', clientIp).is('merged_into', null).eq('flagged_shared_ip', false);
+        return;
+    }
+    const windowStart = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    const { data: candidates } = await sb.from('tracking_contacts')
+        .select('*').eq('client_ip', clientIp).is('merged_into', null).neq('contact_id', contactId)
+        .gte('created_at', windowStart).limit(10);
+    if (!candidates || !candidates.length) return;
+    const current = (await sb.from('tracking_contacts').select('*').eq('contact_id', contactId).maybeSingle()).data;
+    if (!current || current.merged_into) return;
+    const hasId = (c) => !!(c.email || c.phone);
+    const cAttr = hasRealAttribution(current.attribution), cId = hasId(current);
+    for (const cand of candidates) {
+        // Shared-IP guard: never merge two different devices/browsers (NAT, carriers,
+        // households). If both sides report a user agent and they differ, skip.
+        if (current.user_agent && cand.user_agent && current.user_agent !== cand.user_agent) continue;
+        const candAttr = hasRealAttribution(cand.attribution), candId = hasId(cand);
+        if (cAttr && candId && !cId && !candAttr) { await doStitch(sb, contactId, cand.contact_id, nowIso); break; }
+        else if (candAttr && cId && !cAttr && !candId) { await doStitch(sb, cand.contact_id, contactId, nowIso); break; }
+        else if (cAttr && !candAttr && !candId) { await doStitch(sb, contactId, cand.contact_id, nowIso); break; }
+        else if (candAttr && !cAttr && !cId) { await doStitch(sb, cand.contact_id, contactId, nowIso); break; }
+    }
+}
+
+// Stitch contacts sharing an email — the richer contact (attribution/identity)
+// becomes the parent. Returns the surviving contact_id.
+async function emailAutoStitch(sb, contactId, email, nowIso) {
+    const e = normEmail(email);
+    if (!e) return contactId;
+    const { data: existing } = await sb.from('tracking_contacts')
+        .select('*').eq('email', e).is('merged_into', null).neq('contact_id', contactId).limit(1).maybeSingle();
+    if (!existing) return contactId;
+    const current = (await sb.from('tracking_contacts').select('*').eq('contact_id', contactId).maybeSingle()).data;
+    if (!current || current.merged_into) return contactId;
+    const richness = (c) => {
+        let s = 0; const a = c.attribution || {};
+        if (a.fbclid) s += 10;
+        if (a.gclid) s += 10;
+        if (a.utm_source || a.utm_medium || a.utm_campaign) s += 5;
+        if (c.phone) s += 3;
+        if (c.name) s += 2;
+        if (c.first_name && c.last_name) s += 2;
+        if (c.tags) s += c.tags.length;
+        return s;
+    };
+    const [parentId, childId] = richness(current) > richness(existing)
+        ? [contactId, existing.contact_id]
+        : [existing.contact_id, contactId];
+    await doStitch(sb, parentId, childId, nowIso);
+    return parentId;
+}
+
+// Apply a tag to a contact (idempotent set membership). Logs a timeline event the
+// first time the tag is seen for that contact.
+async function applyTag(sb, contactId, tag, currentUrl, nowIso, clientIp) {
+    const eid = await resolveContactId(sb, contactId);
+    const { data: existing } = await sb.from('tracking_contacts').select('contact_id, tags').eq('contact_id', eid).maybeSingle();
+    let firstTime = true;
+    if (existing) {
+        const tags = existing.tags || [];
+        if (tags.includes(tag)) firstTime = false;
+        else await sb.from('tracking_contacts').update({ tags: [...tags, tag], updated_at: nowIso }).eq('contact_id', eid);
+    } else {
+        await sb.from('tracking_contacts').insert({
+            contact_id: eid, client_ip: clientIp || null, tags: [tag], attribution: {}, created_at: nowIso, updated_at: nowIso,
+        });
+    }
+    if (firstTime) {
+        await sb.from('tracking_tag_events').insert({ contact_id: eid, tag, current_url: currentUrl || null, timestamp: nowIso });
+    }
+    await ipAutoStitch(sb, eid, clientIp, nowIso);
+    return eid;
+}
+
+// ─── Tracking script ─────────────────────────────────────────────────────────
+app.get('/shumard.js', (req, res) => {
+    const backendUrl = (process.env.TRACKING_PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+    const tag = req.query.tag ? String(req.query.tag).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) : '';
+    const body = TRACKER_JS
+        .replace(/__TRACKING_BACKEND_URL__/g, backendUrl)
+        .replace(/__TRACKING_AUTO_TAG__/g, tag);
+    res.set('Content-Type', 'application/javascript; charset=utf-8');
+    res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.send(body);
+});
+
+// ─── Tracking ingestion ────────────────────────────────────────────────────────
+// Bot/scanner guard for every tracking endpoint (replies ok so the bot won't retry).
+app.use('/api/track', (req, res, next) => {
+    if (isLikelyBot(req, req.body && req.body.user_agent)) return res.json({ status: 'ok', skipped: 'bot' });
+    next();
+});
+
+app.post('/api/track/pageview', trackLimiter, async (req, res) => {
+    try {
+        const sb = clientFor(resolveFunnel(req));
+        const now = new Date().toISOString();
+        const ip = trackingClientIp(req);
+        const d = req.body || {};
+        if (!d.contact_id) return res.status(400).json({ error: 'contact_id required' });
+        const eid = await resolveContactId(sb, d.contact_id);
+        await upsertContact(sb, { contact_id: eid, session_id: d.session_id, attribution: d.attribution, user_agent: d.user_agent }, now, ip);
+        const vid = await logVisit(sb, eid, d.session_id, d.current_url, d.referrer_url, d.page_title, d.attribution, now, ip);
+        await ipAutoStitch(sb, eid, ip, now);
+        res.json({ status: 'ok', visit_id: vid, contact_id: eid });
+    } catch (e) { console.error('❌ POST /api/track/pageview:', e.message); res.status(500).json({ error: 'tracking error' }); }
+});
+
+app.post('/api/track/lead', trackLimiter, async (req, res) => {
+    try {
+        const sb = clientFor(resolveFunnel(req));
+        const now = new Date().toISOString();
+        const ip = trackingClientIp(req);
+        const d = req.body || {};
+        if (!d.contact_id) return res.status(400).json({ error: 'contact_id required' });
+        let eid = await resolveContactId(sb, d.contact_id);
+        await upsertContact(sb, {
+            contact_id: eid, session_id: d.session_id, email: d.email, phone: d.phone,
+            name: d.name, first_name: d.first_name, last_name: d.last_name,
+            attribution: d.attribution, user_agent: d.user_agent,
+        }, now, ip);
+        if (d.email) eid = await emailAutoStitch(sb, eid, d.email, now);   // email is the most reliable match
+        await sessionAutoStitch(sb, eid, d.session_id, now);
+        await ipAutoStitch(sb, eid, ip, now);
+        res.json({ status: 'ok', contact_id: eid });
+    } catch (e) { console.error('❌ POST /api/track/lead:', e.message); res.status(500).json({ error: 'tracking error' }); }
+});
+
+app.post('/api/track/registration', trackLimiter, async (req, res) => {
+    try {
+        const sb = clientFor(resolveFunnel(req));
+        const now = new Date().toISOString();
+        const ip = trackingClientIp(req);
+        const d = req.body || {};
+        if (!d.contact_id) return res.status(400).json({ error: 'contact_id required' });
+        let eid = await resolveContactId(sb, d.contact_id);
+        await upsertContact(sb, {
+            contact_id: eid, session_id: d.session_id, email: d.email, phone: d.phone,
+            name: d.name, first_name: d.first_name, last_name: d.last_name,
+            attribution: d.attribution, user_agent: d.user_agent,
+        }, now, ip);
+        if (d.current_url) await logVisit(sb, eid, d.session_id, d.current_url, d.referrer_url, d.page_title || 'Registration', d.attribution, now, ip);
+        if (d.email) eid = await emailAutoStitch(sb, eid, d.email, now);
+        await sessionAutoStitch(sb, eid, d.session_id, now);
+        await ipAutoStitch(sb, eid, ip, now);
+        res.json({ status: 'ok', contact_id: eid });
+    } catch (e) { console.error('❌ POST /api/track/registration:', e.message); res.status(500).json({ error: 'tracking error' }); }
+});
+
+app.post('/api/track/tag', trackLimiter, async (req, res) => {
+    try {
+        const sb = clientFor(resolveFunnel(req));
+        const now = new Date().toISOString();
+        const ip = trackingClientIp(req);
+        const d = req.body || {};
+        if (!d.contact_id || !d.tag) return res.status(400).json({ error: 'contact_id and tag required' });
+        const tag = String(d.tag).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+        if (!tag) return res.status(400).json({ error: 'invalid tag' });
+        const eid = await applyTag(sb, d.contact_id, tag, d.current_url, now, ip);
+        res.json({ status: 'ok', contact_id: eid, tag });
+    } catch (e) { console.error('❌ POST /api/track/tag:', e.message); res.status(500).json({ error: 'tracking error' }); }
+});
+
+
+// =============================================================================
+// CRM — read endpoints (the people spine: tracking_contacts ⋈ events by email)
+//
+//   GET /api/crm/contacts        — paginated, searchable people list (crm_people view)
+//   GET /api/crm/contacts/:id    — one person + full chronological journey
+//   GET /api/crm/stats           — funnel counts for the CRM header
+//
+// Gated by requireAuth (PII). Reads the funnel schema via clientFor(req.funnel).
+// =============================================================================
+
+// Human labels for funnel events shown on the journey timeline.
+const CRM_EVENT_LABELS = {
+    registrations: 'Registered', attended: 'Attended', replays: 'Watched replay',
+    viewedcta: 'Saw CTA', clickedcta: 'Clicked CTA', purchases: 'Purchased', stayeduntil: 'Stayed on webinar',
+};
+
+function crmStageFromTypes(types) {
+    if (types.has('purchases')) return 'purchase';
+    if (types.has('clickedcta')) return 'clickedcta';
+    if (types.has('viewedcta')) return 'viewedcta';
+    if (types.has('replays')) return 'replay';
+    if (types.has('attended')) return 'attended';
+    if (types.has('registrations')) return 'registration';
+    return 'lead';
+}
+
+app.get('/api/crm/contacts', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const sb = clientFor(req.funnel);
+        const { search = '', stage = '', limit = 100, offset = 0 } = req.query;
+        let q = sb.from('crm_people').select('*', { count: 'exact' });
+        if (stage) q = q.eq('stage', stage);
+        if (search) {
+            // Strip PostgREST or()-breaking chars (commas separate conditions; % is a wildcard)
+            const s = String(search).replace(/[%,()]/g, ' ').trim();
+            if (s) q = q.or(`email.ilike.%${s}%,name.ilike.%${s}%,phone.ilike.%${s}%`);
+        }
+        q = q.order('last_activity', { ascending: false, nullsFirst: false })
+            .range(Number(offset), Number(offset) + Number(limit) - 1);
+        const { data, error, count } = await q;
+        if (error) throw error;
+        const rows = data || [];
+        // Attach visit_count for just this page's tracked contacts (one query;
+        // keeps the view free of a per-row subquery across all ~13k people).
+        const ids = rows.filter((r) => r.contact_id).map((r) => r.contact_id);
+        const counts = {};
+        if (ids.length) {
+            const { data: vrows } = await sb.from('tracking_page_visits').select('contact_id').in('contact_id', ids);
+            for (const v of vrows || []) counts[v.contact_id] = (counts[v.contact_id] || 0) + 1;
+        }
+        for (const r of rows) r.visit_count = r.contact_id ? (counts[r.contact_id] || 0) : 0;
+        res.json({ data: rows, total: count || 0 });
+    } catch (err) {
+        console.error('❌ GET /api/crm/contacts error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+app.get('/api/crm/stats', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const sb = clientFor(req.funnel);
+        // One pass over the view (tiny boolean columns) tallied in JS — a single DB
+        // hit, ~2x faster than 8 separate count queries. If the people count ever
+        // grows past a few hundred thousand, swap this for a crm_stats() RPC.
+        const { data, error } = await sb
+            .from('crm_people')
+            .select('is_tracked,has_registration,has_attended,has_replay,has_viewedcta,has_clickedcta,has_purchase')
+            .range(0, 199999);
+        if (error) throw error;
+        const rows = data || [];
+        const s = { total: rows.length, tracked: 0, registrations: 0, attended: 0, replays: 0, viewedcta: 0, clickedcta: 0, purchases: 0 };
+        for (const r of rows) {
+            if (r.is_tracked) s.tracked++;
+            if (r.has_registration) s.registrations++;
+            if (r.has_attended) s.attended++;
+            if (r.has_replay) s.replays++;
+            if (r.has_viewedcta) s.viewedcta++;
+            if (r.has_clickedcta) s.clickedcta++;
+            if (r.has_purchase) s.purchases++;
+        }
+        res.json(s);
+    } catch (err) {
+        console.error('❌ GET /api/crm/stats error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Assemble one person's complete journey: identity + a single chronological timeline
+// merging page views, tag fires (by contact_id) and funnel events (by email). Returns
+// null when no such contact/email exists. Shared by the CRM detail endpoint and the
+// get_contact_journey AI tool.
+async function buildContactJourney(sb, raw) {
+    let contactId = null, email = null, contact = null;
+    if (raw.includes('@')) {
+        email = normEmail(raw);
+        const { data } = await sb.from('tracking_contacts').select('*').eq('email', email).is('merged_into', null).limit(1).maybeSingle();
+        if (data) { contact = data; contactId = data.contact_id; }
+    } else {
+        contactId = await resolveContactId(sb, raw);
+        const { data } = await sb.from('tracking_contacts').select('*').eq('contact_id', contactId).maybeSingle();
+        if (data) { contact = data; email = data.email; }
+    }
+    if (!contactId && !email) return null;
+
+    // Three timeline sources: page views + tag fires (by contact_id), funnel events (by email).
+    const [{ data: visits }, { data: tags }, { data: events }] = await Promise.all([
+        contactId ? sb.from('tracking_page_visits').select('*').eq('contact_id', contactId).order('timestamp', { ascending: true }).limit(1000) : Promise.resolve({ data: [] }),
+        contactId ? sb.from('tracking_tag_events').select('*').eq('contact_id', contactId).order('timestamp', { ascending: true }).limit(500) : Promise.resolve({ data: [] }),
+        email ? sb.from('events').select('*').ilike('email', email).order('event_time', { ascending: true }).limit(1000) : Promise.resolve({ data: [] }),
+    ]);
+
+    const timeline = [];
+    for (const v of (visits || [])) timeline.push({ ts: v.timestamp, kind: 'pageview', label: v.page_title || 'Page view', url: v.current_url, referrer: v.referrer_url || null });
+    for (const t of (tags || [])) timeline.push({ ts: t.timestamp, kind: 'tag', label: CRM_EVENT_LABELS[t.tag] || t.tag, tag: t.tag, url: t.current_url || null });
+    for (const e of (events || [])) {
+        let label = CRM_EVENT_LABELS[e.event_type] || e.event_type;
+        if (e.event_type === 'stayeduntil' && e.metadata && e.metadata.stayeduntil) label = `Stayed ${e.metadata.stayeduntil}m`;
+        if (e.event_type === 'purchases' && e.metadata && e.metadata.source) label = `Purchased (${e.metadata.source})`;
+        timeline.push({ ts: e.event_time, kind: 'event', event_type: e.event_type, label, source: (e.metadata && e.metadata.source) || null });
+    }
+    timeline.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+
+    const types = new Set((events || []).map((e) => e.event_type));
+    const evName = (events || []).map((e) => e.name).find(Boolean) || null;
+    const evPhone = (events || []).map((e) => e.phone).find(Boolean) || null;
+
+    return {
+        contact: {
+            contact_id: contactId,
+            email: (contact && contact.email) || email,
+            name: (contact && contact.name) || evName,
+            phone: (contact && contact.phone) || evPhone,
+            first_name: (contact && contact.first_name) || null,
+            last_name: (contact && contact.last_name) || null,
+            attribution: (contact && contact.attribution) || {},
+            tags: (contact && contact.tags) || [],
+            is_tracked: !!contactId,
+            is_shared_ip: !!(contact && contact.flagged_shared_ip),
+            merged_children: (contact && contact.merged_children) || [],
+            created_at: (contact && contact.created_at) || null,
+            stage: crmStageFromTypes(types),
+        },
+        timeline,
+        visits: visits || [],
+        events: events || [],
+        stats: { visit_count: (visits || []).length, event_count: (events || []).length, tag_count: (tags || []).length },
+    };
+}
+
+app.get('/api/crm/contacts/:id', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const journey = await buildContactJourney(clientFor(req.funnel), decodeURIComponent(req.params.id));
+        if (!journey) return res.status(404).json({ error: 'Contact not found' });
+        res.json(journey);
+    } catch (err) {
+        console.error('❌ GET /api/crm/contacts/:id error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+
+// Email performance — email clicks (tracking_page_visits where traffic_source=email)
+// grouped by source (el), tied to purchasers by email. Counts only (no revenue data).
+// Shared by the Email Report endpoint and the get_email_report AI tool.
+async function getEmailReportData(funnel, windowDays) {
+    const sb = clientFor(funnel);
+    // Attribution = click → sale ordering: a "buyer" is anyone who PURCHASED AFTER
+    // clicking the email. No time cap by default; pass windowDays to additionally
+    // require the purchase within N days of the click.
+    const win = (windowDays != null && windowDays !== '' && parseInt(windowDays, 10) > 0) ? Math.min(parseInt(windowDays, 10), 3650) : 0;
+    const upperBound = win > 0 ? ` AND e.event_time <= cl.click_ts + (interval '1 day' * ${win})` : '';
+    const clicksCTE = `clicks AS (
+        SELECT v.attribution->>'source' AS source, lower(c.email) AS email, v.contact_id, v.timestamp AS click_ts
+        FROM tracking_page_visits v
+        LEFT JOIN tracking_contacts c ON c.contact_id = v.contact_id
+        WHERE lower(v.attribution->>'traffic_source') = 'email'
+    )`;
+    const buyersCTE = `buyers AS (
+        SELECT DISTINCT cl.source AS source, cl.email AS email
+        FROM clicks cl
+        JOIN events e ON e.event_type='purchases' AND e.email IS NOT NULL AND lower(e.email) = cl.email
+             AND e.event_time >= cl.click_ts${upperBound}
+        WHERE cl.email IS NOT NULL
+    )`;
+    const perSourceSql = `WITH ${clicksCTE}, ${buyersCTE}
+        SELECT coalesce(cl.source, '(no source)') AS source,
+               count(*)::int AS clicks,
+               count(DISTINCT cl.email)::int AS people,
+               count(DISTINCT b.email)::int AS buyers
+        FROM clicks cl
+        LEFT JOIN buyers b ON b.source IS NOT DISTINCT FROM cl.source AND b.email = cl.email
+        GROUP BY coalesce(cl.source, '(no source)')
+        ORDER BY clicks DESC`;
+    const totalsSql = `WITH ${clicksCTE}, ${buyersCTE}
+        SELECT count(*)::int AS clicks, count(DISTINCT cl.email)::int AS people, count(DISTINCT b.email)::int AS buyers
+        FROM clicks cl
+        LEFT JOIN buyers b ON b.email = cl.email`;
+    const [r1, r2] = await Promise.all([
+        sb.rpc('ai_run_sql', { query: perSourceSql }),
+        sb.rpc('ai_run_sql', { query: totalsSql }),
+    ]);
+    const pct = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : 0);
+    const rows = Array.isArray(r1.data) ? r1.data : [];
+    const sources = rows.map(r => ({ ...r, conversion: pct(r.buyers, r.people) }));
+    const t = (Array.isArray(r2.data) && r2.data[0]) ? r2.data[0] : { clicks: 0, people: 0, buyers: 0 };
+    const totals = { clicks: t.clicks || 0, people: t.people || 0, buyers: t.buyers || 0, conversion: pct(t.buyers || 0, t.people || 0), window_days: win || null };
+    return { sources, totals };
+}
+
+app.get('/api/crm/email-report', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        res.json(await getEmailReportData(req.funnel, req.query.window));
+    } catch (err) {
+        console.error('❌ GET /api/crm/email-report error:', err.message);
         res.status(500).json({ error: 'Internal server error' });
     }
 });

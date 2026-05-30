@@ -78,7 +78,7 @@ curl "https://graph.facebook.com/v21.0/act_123456789/insights?access_token=YOUR_
 node fb-sync.js
 
 # Or trigger via the API
-curl -X POST http://localhost:3000/api/fb-sync \
+curl -X POST http://localhost:5401/api/fb-sync \
   -H "X-API-Key: your-api-key"
 ```
 

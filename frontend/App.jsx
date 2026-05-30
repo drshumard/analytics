@@ -149,6 +149,33 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Finalize failed: ${res.status}`); }
     return res.json();
   },
+  async getCrmContacts(search = "", stage = "", limit = 100, offset = 0) {
+    const headers = await getAuthHeaders();
+    const qs = new URLSearchParams({ limit, offset });
+    if (search) qs.set("search", search);
+    if (stage) qs.set("stage", stage);
+    const res = await fetch(`${API_BASE}/api/crm/contacts?${qs}`, { headers });
+    if (!res.ok) throw new Error(`Failed to fetch contacts: ${res.status}`);
+    return res.json();
+  },
+  async getCrmContact(id) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/crm/contacts/${encodeURIComponent(id)}`, { headers });
+    if (!res.ok) throw new Error(`Failed to fetch contact: ${res.status}`);
+    return res.json();
+  },
+  async getCrmStats() {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/crm/stats`, { headers });
+    if (!res.ok) throw new Error(`Failed to fetch CRM stats: ${res.status}`);
+    return res.json();
+  },
+  async getEmailReport() {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/crm/email-report`, { headers });
+    if (!res.ok) throw new Error(`Failed to fetch email report: ${res.status}`);
+    return res.json();
+  },
 };
 
 function getLocalKey() {
@@ -276,6 +303,17 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [events, setEvents] = useState([]);
   const [evFilter, setEvFilter] = useState("");
+  // CRM (people spine: tracking_contacts ⋈ events by email)
+  const [crmContacts, setCrmContacts] = useState([]);
+  const [crmStats, setCrmStats] = useState(null);
+  const [crmTotal, setCrmTotal] = useState(0);
+  const [crmSearch, setCrmSearch] = useState("");
+  const [crmStage, setCrmStage] = useState("");
+  const [crmLoading, setCrmLoading] = useState(false);
+  const [crmContact, setCrmContact] = useState(null);
+  const [crmContactTab, setCrmContactTab] = useState("journey");
+  const [emailReport, setEmailReport] = useState(null);
+  const [emailReportLoading, setEmailReportLoading] = useState(false);
   const [lenses, setLenses] = useState([]);
   const [activeLensId, setActiveLensId] = useState("default-all");
   const [lensMenuOpen, setLensMenuOpen] = useState(false);
@@ -451,6 +489,37 @@ export default function App() {
   }, [activeFunnel, allowedFunnels]);
 
   const isAdmin = userRole === "admin";
+
+  // CRM loaders. The list reloads (debounced) when entering the CRM view or when
+  // the search/stage filter changes; opening a row fetches that person's journey.
+  const loadCrm = useCallback(async () => {
+    setCrmLoading(true);
+    try {
+      const [list, stats] = await Promise.all([api.getCrmContacts(crmSearch, crmStage), api.getCrmStats()]);
+      setCrmContacts(list.data || []);
+      setCrmTotal(list.total || 0);
+      setCrmStats(stats || null);
+    } catch (e) { flash(e.message, "err"); }
+    setCrmLoading(false);
+  }, [crmSearch, crmStage]);
+  useEffect(() => {
+    if (view !== "crm") return;
+    const t = setTimeout(loadCrm, 250);
+    return () => clearTimeout(t);
+  }, [view, loadCrm]);
+  const openCrmContact = async (row) => {
+    try {
+      const data = await api.getCrmContact(row.contact_id || row.email);
+      setCrmContactTab("journey");
+      setCrmContact(data);
+    } catch (e) { flash(e.message, "err"); }
+  };
+  const loadEmailReport = useCallback(async () => {
+    setEmailReportLoading(true);
+    try { setEmailReport(await api.getEmailReport()); } catch (e) { flash(e.message, "err"); }
+    setEmailReportLoading(false);
+  }, []);
+  useEffect(() => { if (view === "emailreport") loadEmailReport(); }, [view, loadEmailReport]);
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -776,6 +845,8 @@ export default function App() {
             {isAdmin && <button style={{ ...S.btnLight, opacity: finalizing ? 0.6 : 1 }} disabled={finalizing} onClick={finalizePastDays} title="Freeze deduped values for all past days into the canonical columns">{finalizing ? "Finalizing…" : "Finalize Past Days"}</button>}
             {view === "dash" && (
               <>
+                <button style={S.btnLight} onClick={() => setView("crm")}>CRM</button>
+                <button style={S.btnLight} onClick={() => setView("emailreport")}>Email Report</button>
                 <button style={S.btnLight} onClick={() => setView("insights")}>AI Insights</button>
                 <button style={S.btnLight} onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}>Activity Log</button>
                 {isAdmin && <button style={S.btnLight} onClick={() => setView("query")}>Query Data</button>}
@@ -810,6 +881,8 @@ export default function App() {
           <button className="mobile-nav-item" onClick={refreshWebhook}><I d="M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10" size={16} stroke="#6B7280" /> Refresh Data</button>
           {view === "dash" && (
             <>
+              <button className="mobile-nav-item" onClick={() => setView("crm")}><I d="M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-2.13a4 4 0 10-4-4 4 4 0 004 4z" size={16} stroke="#6B7280" /> CRM</button>
+              <button className="mobile-nav-item" onClick={() => setView("emailreport")}><I d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z M22 6l-10 7L2 6" size={16} stroke="#6B7280" /> Email Report</button>
               <button className="mobile-nav-item" onClick={() => setView("insights")}><I d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" size={16} stroke="#6B7280" /> AI Insights</button>
               <button className="mobile-nav-item" onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}><I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" size={16} stroke="#6B7280" /> Activity Log</button>
               {isAdmin && <button className="mobile-nav-item" onClick={() => setView("query")}><I d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" size={16} stroke="#6B7280" /> Query Data</button>}
@@ -1169,6 +1242,120 @@ export default function App() {
             </div>
           </div>
         )}
+        {view === "crm" && (
+          <div className="fi">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24, gap: 16, flexWrap: "wrap" }}>
+              <div><h1 style={S.pageTitle}>CRM</h1><div style={{ fontSize: 13, color: "#6B7280", marginTop: 4 }}>{crmTotal.toLocaleString()} people · click anyone to see their full journey</div></div>
+              <div style={{ ...S.searchWrap, width: "auto", minWidth: 240, padding: "6px 12px" }}>
+                <I d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z" size={14} stroke="#6B7280" />
+                <input style={S.searchInput} placeholder="Search name, email, phone…" value={crmSearch} onChange={e => setCrmSearch(e.target.value)} />
+              </div>
+            </div>
+
+            {/* Funnel strip — click a stage to filter */}
+            <div style={{ ...S.strip, gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))" }}>
+              {[
+                { key: "", label: "People", val: crmStats?.total },
+                { key: "registration", label: "Registered", val: crmStats?.registrations, stage: "registration" },
+                { key: "attended", label: "Attended", val: crmStats?.attended, stage: "attended" },
+                { key: "replay", label: "Replay", val: crmStats?.replays, stage: "replay" },
+                { key: "viewedcta", label: "Saw CTA", val: crmStats?.viewedcta, stage: "viewedcta" },
+                { key: "clickedcta", label: "Clicked CTA", val: crmStats?.clickedcta, stage: "clickedcta" },
+                { key: "purchase", label: "Purchased", val: crmStats?.purchases, stage: "purchase" },
+              ].map(card => {
+                const active = crmStage === card.key;
+                const color = card.stage ? (CRM_STAGE_META[card.stage] || {}).color : "#111827";
+                return (
+                  <div key={card.label} onClick={() => setCrmStage(active ? "" : card.key)} style={{ ...S.stripCell, cursor: "pointer", padding: "16px 18px", boxShadow: active ? `inset 0 -3px 0 ${color}` : "none", background: active ? "#FAFAFF" : "#fff" }}>
+                    <span style={{ ...S.stripLabel, color }}>{card.label}</span>
+                    <span style={{ ...S.stripVal, fontSize: 22 }}>{card.val != null ? card.val.toLocaleString() : "—"}</span>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={S.fcard}>
+              {crmLoading ? (
+                <div style={{ textAlign: "center", padding: "48px 0", color: "#9CA3AF" }}>Loading…</div>
+              ) : crmContacts.length === 0 ? (
+                <div style={{ textAlign: "center", padding: "48px 0", color: "#9CA3AF" }}>No contacts found.</div>
+              ) : (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                    <thead>
+                      <tr>{["Name", "Email", "Phone", "Stage", "Source", "Visits", "Last seen"].map(h => <th key={h} style={{ ...S.th, textAlign: "left" }}>{h}</th>)}</tr>
+                    </thead>
+                    <tbody>
+                      {crmContacts.map((c, i) => (
+                        <tr key={c.contact_id || c.email || i} onClick={() => openCrmContact(c)} style={{ cursor: "pointer" }}>
+                          <td style={{ ...S.td, textAlign: "left", fontWeight: 600, color: "#111827" }}>{c.name || <span style={{ color: "#9CA3AF", fontStyle: "italic", fontWeight: 400 }}>Unknown</span>}{c.is_shared_ip && <span title="Seen on a shared/NAT IP — identity not auto-merged" style={{ marginLeft: 6, fontSize: 9, fontWeight: 700, letterSpacing: "0.04em", color: "#B91C1C", background: "#FEE2E2", padding: "1px 5px", borderRadius: 4, verticalAlign: "middle" }}>SHARED IP</span>}</td>
+                          <td style={{ ...S.td, textAlign: "left", color: "#374151" }}>{c.email}</td>
+                          <td style={{ ...S.td, textAlign: "left", color: "#6B7280" }}>{c.phone || "—"}</td>
+                          <td style={{ ...S.td, textAlign: "left" }}><CrmStageBadge stage={c.stage} /></td>
+                          <td style={{ ...S.td, textAlign: "left", color: "#6B7280" }}>{crmSourceLabel(c.attribution) || "—"}</td>
+                          <td style={{ ...S.td, textAlign: "left", color: c.is_tracked ? "#374151" : "#9CA3AF" }}>{c.is_tracked ? c.visit_count : "LEGACY"}</td>
+                          <td style={{ ...S.td, textAlign: "left", color: "#9CA3AF", whiteSpace: "nowrap" }}>{c.last_activity ? crmRelTime(c.last_activity) : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        {view === "emailreport" && (
+          <div className="fi">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24, gap: 16, flexWrap: "wrap" }}>
+              <div><h1 style={S.pageTitle}>Email Report</h1><div style={{ fontSize: 13, color: "#6B7280", marginTop: 4 }}>Email-click performance by source · {emailReport?.totals?.window_days ? `buyers within ${emailReport.totals.window_days} days of click` : "buyers = purchased any time after clicking"}</div></div>
+              <button style={S.btnLight} onClick={loadEmailReport}>↻ Refresh</button>
+            </div>
+
+            <div style={{ ...S.strip, gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))" }}>
+              {[
+                { label: "Clicks", val: emailReport?.totals?.clicks },
+                { label: "People", val: emailReport?.totals?.people },
+                { label: "Buyers", val: emailReport?.totals?.buyers },
+                { label: "Conversion", val: emailReport?.totals?.conversion, pct: true },
+              ].map(c => (
+                <div key={c.label} style={{ ...S.stripCell, padding: "16px 18px" }}>
+                  <span style={S.stripLabel}>{c.label}</span>
+                  <span style={{ ...S.stripVal, fontSize: 22 }}>{c.val != null ? (c.pct ? c.val + "%" : c.val.toLocaleString()) : "—"}</span>
+                </div>
+              ))}
+            </div>
+
+            <div style={S.fcard}>
+              {emailReportLoading ? (
+                <div style={{ textAlign: "center", padding: "48px 0", color: "#9CA3AF" }}>Loading…</div>
+              ) : !emailReport?.sources?.length ? (
+                <div style={{ textAlign: "center", padding: "48px 0", color: "#9CA3AF" }}>
+                  No email clicks tracked yet.
+                  <div style={{ fontSize: 13, marginTop: 8 }}>They appear once your emails link with <code style={{ background: "#F3F4F6", padding: "1px 5px", borderRadius: 4 }}>?he=&#123;&#123;contact.email&#125;&#125;&amp;el=&lt;source&gt;&amp;htrafficsource=email</code></div>
+                </div>
+              ) : (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                    <thead>
+                      <tr>{["Source (el)", "Clicks", "People", "Buyers", "Conversion"].map((h, i) => <th key={h} style={{ ...S.th, textAlign: i === 0 ? "left" : "right" }}>{h}</th>)}</tr>
+                    </thead>
+                    <tbody>
+                      {emailReport.sources.map((r, i) => (
+                        <tr key={r.source || i}>
+                          <td style={{ ...S.td, textAlign: "left", fontWeight: 600, color: "#111827" }}>{r.source}</td>
+                          <td style={{ ...S.td, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{r.clicks.toLocaleString()}</td>
+                          <td style={{ ...S.td, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{r.people.toLocaleString()}</td>
+                          <td style={{ ...S.td, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{r.buyers.toLocaleString()}</td>
+                          <td style={{ ...S.td, textAlign: "right", fontVariantNumeric: "tabular-nums", fontWeight: 600, color: r.conversion > 0 ? "#047857" : "#9CA3AF" }}>{r.conversion}%</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         {view === "insights" && <InsightsChat flash={flash} isMobile={isMobile} activeFunnel={activeFunnel} />}
         {view === "query" && <QueryBuilder flash={flash} />}
       </main>
@@ -1177,6 +1364,7 @@ export default function App() {
       {delCM && <Modal title="Delete Custom Metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
       {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
       {colEditorOpen && <ColumnEditor columns={orderedCols.filter(c => c.type !== "base" || isColVisible(c.key))} isAdmin={isAdmin} onSave={(keys) => { saveColOrder(keys); setColEditorOpen(false); }} onCancel={() => setColEditorOpen(false)} />}
+      {crmContact && <CrmContactModal contact={crmContact} tab={crmContactTab} setTab={setCrmContactTab} onClose={() => setCrmContact(null)} />}
       {summaryEditorOpen && <SummaryEditor cards={summaryCards} customs={customs} onSave={(cards) => { saveSummaryCards(cards); setSummaryEditorOpen(false); flash("Summary cards updated"); }} onCancel={() => setSummaryEditorOpen(false)} />}
       {toast && (<div className="fi" style={{ ...S.toast, borderLeft: `3px solid ${toast.type === "ok" ? "#12864A" : "#D92D20"}` }}><I d={toast.type === "ok" ? "M20 6L9 17l-5-5" : "M12 2a10 10 0 100 20 10 10 0 000-20zM12 8v4M12 16h.01"} size={16} stroke={toast.type === "ok" ? "#12864A" : "#D92D20"} sw={2.2} />{toast.msg}</div>)}
     </div>
@@ -1462,6 +1650,160 @@ function Modal({ title, msg, onCancel, onConfirm }) {
         <div style={{ fontSize: 18, fontWeight: 600, color: "#111827", marginBottom: 6 }}>{title}</div>
         <div style={{ color: "#4B5563", fontSize: 14, marginBottom: 28, lineHeight: 1.5 }}>{msg}</div>
         <div style={{ display: "flex", gap: 10 }}><button style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Cancel</button><button style={{ ...S.btnDark, background: "#DC2626", borderColor: "#DC2626", flex: 1, justifyContent: "center" }} onClick={onConfirm}>Delete</button></div>
+      </div>
+    </div>
+  );
+}
+
+// ─── CRM presentational helpers ──────────────────────────────────────────────
+const CRM_STAGE_META = {
+  lead:         { label: "Lead",        color: "#6B7280" },
+  registration: { label: "Registered",  color: "#3B82F6" },
+  attended:     { label: "Attended",    color: "#0EA5E9" },
+  replay:       { label: "Replay",      color: "#8B5CF6" },
+  viewedcta:    { label: "Saw CTA",     color: "#F59E0B" },
+  clickedcta:   { label: "Clicked CTA", color: "#10B981" },
+  purchase:     { label: "Purchased",   color: "#EF4444" },
+};
+const crmTimelineColor = (item) => {
+  if (item.kind === "pageview") return "#9CA3AF";
+  if (item.kind === "tag") return "#14B8A6";
+  const ec = { registrations: "#3B82F6", attended: "#0EA5E9", replays: "#8B5CF6", viewedcta: "#F59E0B", clickedcta: "#10B981", purchases: "#EF4444", stayeduntil: "#6366F1" };
+  return ec[item.event_type] || "#6B7280";
+};
+const crmRelTime = (ts) => {
+  const s = (Date.now() - new Date(ts).getTime()) / 1000;
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+};
+const crmSourceLabel = (attr) => {
+  if (!attr) return null;
+  return attr.utm_source || ((attr.fbclid || attr.fbc) ? "facebook" : null) || (attr.gclid ? "google" : null) || (attr.ttclid ? "tiktok" : null) || null;
+};
+function CrmStageBadge({ stage }) {
+  const m = CRM_STAGE_META[stage] || CRM_STAGE_META.lead;
+  return <span style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", color: m.color, background: `${m.color}14`, padding: "3px 9px", borderRadius: 5, whiteSpace: "nowrap" }}>{m.label}</span>;
+}
+function CrmDetailRows({ rows }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {rows.filter(([, v]) => v != null && v !== "").map(([k, v]) => (
+        <div key={k} style={{ display: "flex", fontSize: 13, gap: 12 }}>
+          <span style={{ color: "#9CA3AF", minWidth: 110, flexShrink: 0 }}>{k}</span>
+          <span style={{ color: "#374151", wordBreak: "break-all" }}>{v}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+function CrmContactModal({ contact, tab, setTab, onClose }) {
+  const c = contact.contact || {};
+  const timeline = contact.timeline || [];
+  const visits = contact.visits || [];
+  const events = contact.events || [];
+  const attr = c.attribution || {};
+  const title = c.name || c.email || "Contact";
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div style={{ ...S.modal, maxWidth: 720, width: "92%", maxHeight: "85vh", padding: 0, textAlign: "left", display: "flex", flexDirection: "column", overflow: "hidden" }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: "20px 24px", borderBottom: "1px solid #E5E7EB", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4, flexWrap: "wrap" }}>
+              <h2 style={{ fontSize: 18, fontWeight: 600, color: "#111827", margin: 0 }}>{title}</h2>
+              <CrmStageBadge stage={c.stage} />
+              {!c.is_tracked && <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", color: "#9CA3AF", background: "#F3F4F6", padding: "2px 7px", borderRadius: 4 }}>LEGACY</span>}
+              {c.is_shared_ip && <span title="Seen on a shared/NAT IP — identity was not auto-merged to avoid fusing strangers" style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", color: "#B91C1C", background: "#FEE2E2", padding: "2px 7px", borderRadius: 4 }}>⚠ SHARED IP</span>}
+            </div>
+            <div style={{ fontSize: 13, color: "#6B7280", display: "flex", gap: 12, flexWrap: "wrap" }}>
+              {c.email && <span>{c.email}</span>}
+              {c.phone && <span>{c.phone}</span>}
+            </div>
+          </div>
+          <button style={S.btnGhost} onClick={onClose}><I d="M6 18L18 6M6 6l12 12" size={18} stroke="#6B7280" /></button>
+        </div>
+        <div style={{ display: "flex", gap: 4, padding: "0 24px", borderBottom: "1px solid #E5E7EB" }}>
+          {[["journey", `Journey (${timeline.length})`], ["clicks", `Clicks (${visits.length})`], ["details", "Details"]].map(([k, label]) => (
+            <button key={k} onClick={() => setTab(k)} style={{ padding: "12px 14px", fontSize: 13, fontWeight: 600, background: "transparent", border: "none", borderBottom: tab === k ? "2px solid #111827" : "2px solid transparent", color: tab === k ? "#111827" : "#6B7280", cursor: "pointer", marginBottom: -1 }}>{label}</button>
+          ))}
+        </div>
+        <div style={{ padding: 24, overflowY: "auto", flex: 1 }}>
+          {tab === "journey" && (
+            timeline.length === 0 ? <div style={{ textAlign: "center", padding: "32px 0", color: "#9CA3AF" }}>No journey events yet.</div> : (
+              <div style={{ display: "flex", flexDirection: "column" }}>
+                {timeline.map((it, i) => {
+                  const color = crmTimelineColor(it);
+                  const last = i === timeline.length - 1;
+                  return (
+                    <div key={i} style={{ display: "flex", gap: 14 }}>
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                        <div style={{ width: 10, height: 10, borderRadius: "50%", background: color, flexShrink: 0, marginTop: 4 }} />
+                        {!last && <div style={{ width: 2, flex: 1, background: "#E5E7EB", marginTop: 2 }} />}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0, paddingBottom: last ? 0 : 18 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                          <span style={{ fontSize: 13, fontWeight: 600, color: "#111827" }}>{it.label}</span>
+                          {it.source && <span style={{ fontSize: 11, color: "#6B7280", background: "#F3F4F6", padding: "1px 6px", borderRadius: 4 }}>{it.source}</span>}
+                          <span style={{ fontSize: 12, color: "#9CA3AF" }}>{crmRelTime(it.ts)}</span>
+                        </div>
+                        {it.url && <div style={{ fontSize: 12, color: "#6B7280", marginTop: 2, wordBreak: "break-all" }}>{it.url}</div>}
+                        <div style={{ fontSize: 11, color: "#9CA3AF", marginTop: 2 }}>{new Date(it.ts).toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )
+          )}
+          {tab === "clicks" && (
+            visits.length === 0 ? <div style={{ textAlign: "center", padding: "32px 0", color: "#9CA3AF" }}>{c.is_tracked ? "No page views tracked yet." : "This contact wasn't tracked by shumard.js, so there's no on-site click activity."}</div> : (
+              <div style={{ display: "flex", flexDirection: "column" }}>
+                {visits.map((v, i) => (
+                  <div key={v.id || i} style={{ padding: "12px 0", borderBottom: i < visits.length - 1 ? "1px solid #F3F4F6" : "none" }}>
+                    <div style={{ fontSize: 13, fontWeight: 500, color: "#111827" }}>{v.page_title || "Page view"}</div>
+                    <div style={{ fontSize: 12, color: "#6B7280", wordBreak: "break-all", marginTop: 2 }}>{v.current_url}</div>
+                    <div style={{ fontSize: 11, color: "#9CA3AF", marginTop: 2 }}>{new Date(v.timestamp).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}{v.referrer_url ? ` · from ${v.referrer_url}` : ""}</div>
+                  </div>
+                ))}
+              </div>
+            )
+          )}
+          {tab === "details" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "#9CA3AF", marginBottom: 8 }}>Identity</div>
+                <CrmDetailRows rows={[["Name", c.name], ["Email", c.email], ["Phone", c.phone], ["First name", c.first_name], ["Last name", c.last_name], ["Tracked", c.is_tracked ? "yes" : "no"], ["Contact ID", c.contact_id]]} />
+              </div>
+              {Object.keys(attr).filter(k => k !== "extra").length > 0 && (
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "#9CA3AF", marginBottom: 8 }}>Attribution</div>
+                  <CrmDetailRows rows={Object.entries(attr).filter(([k]) => k !== "extra").map(([k, v]) => [k, String(v)])} />
+                  {attr.extra && Object.keys(attr.extra).length > 0 && <div style={{ marginTop: 6 }}><CrmDetailRows rows={Object.entries(attr.extra).map(([k, v]) => [`extra.${k}`, String(v)])} /></div>}
+                </div>
+              )}
+              {(c.tags || []).length > 0 && (
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "#9CA3AF", marginBottom: 8 }}>Tags</div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>{c.tags.map(t => <span key={t} style={{ fontSize: 11, background: "#F3F4F6", color: "#374151", padding: "3px 8px", borderRadius: 4 }}>{t}</span>)}</div>
+                </div>
+              )}
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "#9CA3AF", marginBottom: 8 }}>Funnel events ({events.length})</div>
+                {events.length === 0 ? <div style={{ fontSize: 13, color: "#9CA3AF" }}>None</div> : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {events.map((e, i) => (
+                      <div key={e.id || i} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, gap: 12 }}>
+                        <span style={{ color: "#374151" }}>{e.event_type}{e.metadata && e.metadata.source ? ` · ${e.metadata.source}` : ""}</span>
+                        <span style={{ color: "#9CA3AF", whiteSpace: "nowrap" }}>{new Date(e.event_time).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

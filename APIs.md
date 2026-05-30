@@ -2,52 +2,95 @@
 
 Base URL: `https://analytics.drshumard.com`
 
+**Auth models**
+- **Webhooks** → header `X-API-Key: <API_KEY>` (or `NATIVE_API_KEY`). The key selects the funnel.
+- **Dashboard / CRM / Insights** → header `Authorization: Bearer <Supabase JWT>` + `X-Funnel: analytics|native` (defaults to `analytics`). `requireAuth` validates funnel access; writes also need admin (`requireAdmin`).
+- **Tracking** (`/shumard.js`, `/api/track/*`) → public, permissive CORS (unauthenticated, embedded on client sites).
+
 ---
 
-## Webhook Endpoints
-
-All require header: `X-API-Key: <your API_KEY from .env>`
+## Webhook endpoints — `X-API-Key`
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `POST` | `/api/metrics` | Upsert a day's metrics |
-| `POST` | `/api/metrics/batch` | Upsert multiple days at once |
-| `POST` | `/api/metrics/increment` | Increment a field for a date (e.g. +1 registration) |
-| `POST` | `/api/metrics/set` | Set a specific field value for a date |
-| `POST` | `/api/fb-sync` | Trigger Facebook spend sync |
+| `POST` | `/api/metrics` | Upsert a full day's metrics |
+| `POST` | `/api/metrics/batch` | Upsert multiple days (`{ entries: [...] }`) |
+| `POST` | `/api/metrics/increment` | Add to a field for a date (event‑driven, e.g. +1 registration) |
+| `POST` | `/api/metrics/set` | Set a field to an absolute value (e.g. FB running spend total) |
+| `POST` | `/api/fb-sync` | Force a Facebook spend sync now |
+
+`increment` body: `{ "field": "registrations", "count": 1, "email": "...", "name": "...", "phone": "..." }`. Valid `field`: `fb_spend`, `fb_link_clicks`, `registrations`, `replays`, `viewedcta`, `clickedcta`, `purchases`, `attended`, `stayeduntil`. Purchases route by `metadata.source` (`Paid Ads`/`Native`/`Youtube`/`AI Bot`/`CPA Traffic`; Post‑Webinar auto‑detected). Registrations dedupe by email + webinar day; other events dedupe within 5 minutes. Each event is also written to the `events` table.
 
 ---
 
-## Dashboard Endpoints
+## Tracking endpoints — public (shumard.js)
 
-Public read access. Writes require Supabase JWT auth.
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/shumard.js` | The tracking script. `?tag=<name>` bakes in an auto‑tag. `BACKEND_URL` = `TRACKING_PUBLIC_URL`. |
+| `POST` | `/api/track/pageview` | Log a pageview |
+| `POST` | `/api/track/lead` | Email/phone captured on a form field |
+| `POST` | `/api/track/registration` | A form was submitted |
+| `POST` | `/api/track/tag` | Apply a funnel tag to a contact |
+
+Payload (pageview/lead/registration): `{ contact_id, session_id, current_url, referrer_url, page_title, attribution{}, user_agent, email?, phone?, name? }`. Attribution recognizes UTMs, `fbclid`, `_fbc`/`_fbp`, `gclid`, `ttclid`, plus `source` (from `el`) and `traffic_source` (from `htrafficsource`). Bot/scanner user‑agents return `{status:"ok",skipped:"bot"}` and write nothing. Rate limit: 1200/min per IP.
+
+---
+
+## CRM endpoints — Bearer + `X-Funnel`
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/api/crm/contacts` | People list (`?search=` `?stage=` `?limit=` `?offset=`). Returns `is_tracked`, `is_shared_ip`, `stage`, `visit_count`, … |
+| `GET` | `/api/crm/contacts/:id` | One person's full journey — `:id` is an email or `contact_id`. Returns identity + chronological `timeline` (pageviews + tags + events) + `visits` + `events`. |
+| `GET` | `/api/crm/stats` | Funnel counts for the CRM header |
+| `GET` | `/api/crm/email-report` | Email‑click performance by source (`?window=<days>` optional attribution cap; default: any purchase after the click) |
+
+Stages: `lead → registration → attended → replay → viewedcta → clickedcta → purchase`.
+
+---
+
+## AI Insights endpoints — Bearer + `X-Funnel`
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/insights/chat` | Chat with the analyst (`{ messages:[{role,content}] }`). Claude tool‑use; streams back markdown + optional `chart` blocks. |
+| `GET` | `/api/insights/conversations` | List saved conversations |
+| `GET` | `/api/insights/conversations/:id` | Get one conversation |
+| `PUT` | `/api/insights/conversations/:id` | Save/update a conversation |
+| `DELETE` | `/api/insights/conversations/:id` | Delete a conversation |
+
+The model's tools: `get_metrics`, `get_metrics_rollup`, `compare_periods`, `get_event_counts`, `list_custom_metrics`, `get_journey_funnel`, `get_contact_journey`, `get_journey_segment`, `describe_journey_data`, `get_email_report`, `run_sql` (read‑only), `remember`, `forget`.
+
+---
+
+## Dashboard endpoints — Bearer + `X-Funnel`
 
 | Method | Endpoint | Purpose | Auth |
 |---|---|---|---|
-| `GET` | `/api/metrics` | Fetch metrics (`?limit=` `?offset=`) | Public |
-| `PUT` | `/api/metrics/:date` | Update a day's entry | Admin |
-| `DELETE` | `/api/metrics/:date` | Delete a day's entry | Admin |
-| `GET` | `/api/custom-metrics` | List custom calculated metrics | Public |
-| `POST` | `/api/custom-metrics` | Create a custom metric | Admin |
-| `PUT` | `/api/custom-metrics/:id` | Update a custom metric | Admin |
-| `DELETE` | `/api/custom-metrics/:id` | Delete a custom metric | Admin |
-| `GET` | `/api/events` | List webhook events (`?type=` `?limit=`) | Public |
-|  |  | Types: `registrations`, `replays`, `viewedcta`, `clickedcta`, `purchases`, `attended` |  |
-| `GET` | `/api/webhook-log` | View webhook call log | Public |
-| `POST` | `/api/refresh` | Refresh FB spend for today | Public |
-| `POST` | `/api/refresh-date` | Refresh FB spend for a specific date | Public |
-| `GET` | `/api/me` | Get current user info/role | Auth |
-| `GET` | `/api/health` | Health check | Public |
-| `GET` | `/api/fb-sync/status` | FB sync status | Public |
+| `GET` | `/api/metrics?limit=&offset=&variant=` | Daily metrics (deduped) | Public* |
+| `PUT` | `/api/metrics/:date` | Edit a day | Admin |
+| `DELETE` | `/api/metrics/:date` | Delete a day | Admin |
+| `GET` | `/api/events?type=&limit=` | Activity log (per‑person events) | Public* |
+| `GET` | `/api/custom-metrics` · `POST` · `PUT/:id` · `DELETE/:id` | Custom calculated metrics | Public* / Admin |
+| `GET` | `/api/lenses` · `POST` · `PUT/:id` · `DELETE/:id` | Dashboard metric lenses | Auth |
+| `GET` | `/api/me` · `/api/me/funnels` · `PUT /api/me/preferences` | Current user, allowed funnels, prefs | Auth |
+| `POST` | `/api/refresh` · `/api/refresh-date` | Refresh FB spend | Public |
+| `POST` | `/api/admin/finalize-date` · `/api/admin/finalize-past-days` | Freeze deduped counts | Admin |
+| `POST` | `/api/admin/query` | Ad‑hoc query builder | Auth |
+| `POST` | `/api/cache/clear` | Clear server caches | Auth |
+| `GET` | `/api/webhook-log?limit=` | Webhook audit log | Public* |
+| `GET` | `/api/health` · `/api/fb-sync/status` | Health / FB sync status | Public |
+
+\* Read endpoints resolve the funnel from `X-Funnel` and don't require a JWT; CRM, Insights, and all writes do.
 
 ---
 
-## Key Endpoints for n8n / Zapier
+## Quick reference — webhooks for n8n / Zapier / Make
 
 ```
-POST https://analytics.drshumard.com/api/metrics/increment
-POST https://analytics.drshumard.com/api/metrics/set
-POST https://analytics.drshumard.com/api/metrics
+POST https://analytics.drshumard.com/api/metrics/increment    # +1 event (with email/name)
+POST https://analytics.drshumard.com/api/metrics/set          # overwrite a field (e.g. fb_spend)
+POST https://analytics.drshumard.com/api/metrics              # full-day upsert
 ```
-
-All with header: `X-API-Key: <your API_KEY>`
+Header on all: `X-API-Key: <API_KEY>`
