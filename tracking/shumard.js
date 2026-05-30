@@ -33,6 +33,10 @@
   /* ─── Detect iframe context ─── */
   try { store.config.isIframe = window.self !== window.top; } catch (e) { store.config.isIframe = true; }
 
+  /* Baseline URL for the SPA change watcher. Module-scoped so captureClickParams()
+     can re-sync it after scrubbing email params (prevents a self-induced dup pageview). */
+  var _spaLastUrl = window.location.href;
+
   /* ─── Storage helpers ─── */
   var LS_KEY   = 'st_contact_id';
   var SESS_KEY = 'st_session_id';
@@ -235,6 +239,9 @@
           .replace(/[?&]+(#|$)/, '$1');    /* drop a dangling ? or & */
         if (clean !== window.location.href && window.history && window.history.replaceState) {
           window.history.replaceState(null, document.title, clean);
+          /* Re-baseline the SPA URL watcher so it doesn't read OUR rewrite as a
+             navigation and fire a duplicate pageview. */
+          _spaLastUrl = window.location.href;
         }
       } catch (e) {}
     }
@@ -525,16 +532,20 @@
   });
 
   /* ─── SPA URL change detection ─── */
-  (function(){
-    var lastUrl=window.location.href;
-    setInterval(function(){
-      var cur=window.location.href;
-      if (cur!==lastUrl){
-        lastUrl=cur; store.config.prevUrl=store.config.currentUrl; store.config.currentUrl=cur;
-        store.processedData.pageSent=false; captureClickParams(); sendPageview(); bindForms(); bindLooseInputs();
-      }
-    }, 800);
-  })();
+  /* _spaLastUrl is module-scoped so captureClickParams() can re-baseline it after
+     scrubbing he/el/htrafficsource (otherwise our own replaceState looks like a nav). */
+  function urlNoHash(u){ return (u||'').split('#')[0]; }
+  setInterval(function(){
+    var cur=window.location.href;
+    /* Compare without the hash: a real route change updates the path/query; a bare
+       #anchor jump (e.g. #final-cta) is the same page, not a new pageview. */
+    if (urlNoHash(cur)!==urlNoHash(_spaLastUrl)){
+      _spaLastUrl=cur; store.config.prevUrl=store.config.currentUrl; store.config.currentUrl=cur;
+      store.processedData.pageSent=false; captureClickParams(); sendPageview(); bindForms(); bindLooseInputs();
+    } else {
+      _spaLastUrl=cur;  /* keep baseline current so a later real change is detected once */
+    }
+  }, 800);
 
   /* ─── Init ─── */
   function init() {
