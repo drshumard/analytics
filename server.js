@@ -3700,6 +3700,81 @@ app.get('/api/crm/email-report', dashboardLimiter, requireAuth, async (req, res)
     }
 });
 
+// Drill-down: every individual email click for one source — who, when, what page,
+// and whether/when they purchased after. The granular view behind a source row.
+async function getEmailReportClicks(funnel, source, windowDays) {
+    const sb = clientFor(funnel);
+    const win = (windowDays != null && windowDays !== '' && parseInt(windowDays, 10) > 0) ? Math.min(parseInt(windowDays, 10), 3650) : 0;
+    const upperBound = win > 0 ? ` AND e.event_time <= v.timestamp + (interval '1 day' * ${win})` : '';
+    // Exact-match the el= source; '(no source)' / empty means the source key was absent.
+    const esc = (s) => String(s).replace(/'/g, "''").replace(/[;\\]/g, '');
+    const sourceCond = (!source || source === '(no source)')
+        ? "v.attribution->>'source' IS NULL"
+        : `v.attribution->>'source' = '${esc(source)}'`;
+    const sql = `
+        SELECT v.timestamp AS click_ts,
+               v.current_url,
+               v.client_ip,
+               c.email, c.name, c.contact_id,
+               p.event_time AS purchased_at,
+               p.metadata->>'source' AS purchase_source
+        FROM tracking_page_visits v
+        LEFT JOIN tracking_contacts c ON c.contact_id = v.contact_id
+        LEFT JOIN LATERAL (
+            SELECT e.event_time, e.metadata FROM events e
+            WHERE e.event_type='purchases' AND e.email IS NOT NULL
+                  AND lower(e.email) = lower(c.email)
+                  AND e.event_time >= v.timestamp${upperBound}
+            ORDER BY e.event_time ASC LIMIT 1
+        ) p ON true
+        WHERE lower(v.attribution->>'traffic_source') = 'email' AND ${sourceCond}
+        ORDER BY v.timestamp DESC
+        LIMIT 500`;
+    // Funnel-stage breakdown: of the people who clicked this email source, how far
+    // through the funnel are they overall (distinct people who reached each stage).
+    // Post-webinar emails go to people who already registered/attended, so this is
+    // their audience composition + drop-off, not strictly "stages after the click".
+    const funnelSql = `
+        WITH clickers AS (
+            SELECT DISTINCT lower(c.email) AS email
+            FROM tracking_page_visits v
+            JOIN tracking_contacts c ON c.contact_id = v.contact_id
+            WHERE lower(v.attribution->>'traffic_source') = 'email' AND ${sourceCond}
+                  AND c.email IS NOT NULL
+        )
+        SELECT
+            count(*)::int AS clickers,
+            count(*) FILTER (WHERE ev.types ? 'registrations')::int AS registered,
+            count(*) FILTER (WHERE ev.types ? 'attended')::int      AS attended,
+            count(*) FILTER (WHERE ev.types ? 'replays')::int       AS replay,
+            count(*) FILTER (WHERE ev.types ? 'viewedcta')::int     AS saw_cta,
+            count(*) FILTER (WHERE ev.types ? 'clickedcta')::int    AS clicked_cta,
+            count(*) FILTER (WHERE ev.types ? 'purchases')::int     AS purchased
+        FROM clickers cl
+        LEFT JOIN LATERAL (
+            SELECT jsonb_object_agg(event_type, true) AS types
+            FROM events e WHERE e.email IS NOT NULL AND lower(e.email) = cl.email
+        ) ev ON true`;
+    const [clicksRes, funnelRes] = await Promise.all([
+        sb.rpc('ai_run_sql', { query: sql }),
+        sb.rpc('ai_run_sql', { query: funnelSql }),
+    ]);
+    const clicks = Array.isArray(clicksRes.data) ? clicksRes.data : [];
+    const people = new Set(clicks.map(c => (c.email || c.contact_id))).size;
+    const buyers = new Set(clicks.filter(c => c.purchased_at).map(c => c.email)).size;
+    const funnelStats = (Array.isArray(funnelRes.data) && funnelRes.data[0]) ? funnelRes.data[0] : null;
+    return { source: source || '(no source)', window_days: win || null, total_clicks: clicks.length, people, buyers, funnel: funnelStats, clicks };
+}
+
+app.get('/api/crm/email-report/clicks', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        res.json(await getEmailReportClicks(req.funnel, req.query.source, req.query.window));
+    } catch (err) {
+        console.error('❌ GET /api/crm/email-report/clicks error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 
 // =============================================================================
 // STATIC FILES (serve the React dashboard)

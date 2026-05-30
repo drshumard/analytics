@@ -176,6 +176,12 @@ const api = {
     if (!res.ok) throw new Error(`Failed to fetch email report: ${res.status}`);
     return res.json();
   },
+  async getEmailReportClicks(source) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/crm/email-report/clicks?source=${encodeURIComponent(source)}`, { headers });
+    if (!res.ok) throw new Error(`Failed to fetch clicks: ${res.status}`);
+    return res.json();
+  },
 };
 
 function getLocalKey() {
@@ -314,6 +320,8 @@ export default function App() {
   const [crmContactTab, setCrmContactTab] = useState("journey");
   const [emailReport, setEmailReport] = useState(null);
   const [emailReportLoading, setEmailReportLoading] = useState(false);
+  const [emailDrill, setEmailDrill] = useState(null);        // { source, ...clicks } or null
+  const [emailDrillLoading, setEmailDrillLoading] = useState(false);
   const [lenses, setLenses] = useState([]);
   const [activeLensId, setActiveLensId] = useState("default-all");
   const [lensMenuOpen, setLensMenuOpen] = useState(false);
@@ -520,6 +528,11 @@ export default function App() {
     setEmailReportLoading(false);
   }, []);
   useEffect(() => { if (view === "emailreport") loadEmailReport(); }, [view, loadEmailReport]);
+  const openEmailDrill = async (source) => {
+    setEmailDrillLoading(true); setEmailDrill({ source, clicks: [] });
+    try { setEmailDrill(await api.getEmailReportClicks(source)); } catch (e) { flash(e.message, "err"); setEmailDrill(null); }
+    setEmailDrillLoading(false);
+  };
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -1341,8 +1354,10 @@ export default function App() {
                     </thead>
                     <tbody>
                       {emailReport.sources.map((r, i) => (
-                        <tr key={r.source || i}>
-                          <td style={{ ...S.td, textAlign: "left", fontWeight: 600, color: "#111827" }}>{r.source}</td>
+                        <tr key={r.source || i} onClick={() => openEmailDrill(r.source)} style={{ cursor: "pointer" }} title="View individual clicks">
+                          <td style={{ ...S.td, textAlign: "left", fontWeight: 600, color: "#111827" }}>
+                            <span style={{ color: "#6B7280", marginRight: 6 }}>›</span>{r.source}
+                          </td>
                           <td style={{ ...S.td, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{r.clicks.toLocaleString()}</td>
                           <td style={{ ...S.td, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{r.people.toLocaleString()}</td>
                           <td style={{ ...S.td, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{r.buyers.toLocaleString()}</td>
@@ -1365,6 +1380,7 @@ export default function App() {
       {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
       {colEditorOpen && <ColumnEditor columns={orderedCols.filter(c => c.type !== "base" || isColVisible(c.key))} isAdmin={isAdmin} onSave={(keys) => { saveColOrder(keys); setColEditorOpen(false); }} onCancel={() => setColEditorOpen(false)} />}
       {crmContact && <CrmContactModal contact={crmContact} tab={crmContactTab} setTab={setCrmContactTab} onClose={() => setCrmContact(null)} />}
+      {emailDrill && <EmailDrillModal drill={emailDrill} loading={emailDrillLoading} onClose={() => setEmailDrill(null)} onOpenContact={(idf) => { setEmailDrill(null); openCrmContact({ email: idf }); }} />}
       {summaryEditorOpen && <SummaryEditor cards={summaryCards} customs={customs} onSave={(cards) => { saveSummaryCards(cards); setSummaryEditorOpen(false); flash("Summary cards updated"); }} onCancel={() => setSummaryEditorOpen(false)} />}
       {toast && (<div className="fi" style={{ ...S.toast, borderLeft: `3px solid ${toast.type === "ok" ? "#12864A" : "#D92D20"}` }}><I d={toast.type === "ok" ? "M20 6L9 17l-5-5" : "M12 2a10 10 0 100 20 10 10 0 000-20zM12 8v4M12 16h.01"} size={16} stroke={toast.type === "ok" ? "#12864A" : "#D92D20"} sw={2.2} />{toast.msg}</div>)}
     </div>
@@ -1804,6 +1820,108 @@ function CrmContactModal({ contact, tab, setTab, onClose }) {
             </div>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function EmailDrillModal({ drill, loading, onClose, onOpenContact }) {
+  const clicks = drill.clicks || [];
+  const fmtWhen = (ts) => new Date(ts).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const fmtGap = (click, buy) => {
+    const h = (new Date(buy).getTime() - new Date(click).getTime()) / 3600000;
+    if (h < 1) return `${Math.max(1, Math.round(h * 60))}m later`;
+    if (h < 48) return `${Math.round(h)}h later`;
+    return `${Math.round(h / 24)}d later`;
+  };
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div style={{ ...S.modal, maxWidth: 860, width: "94%", maxHeight: "85vh", padding: 0, textAlign: "left", display: "flex", flexDirection: "column", overflow: "hidden" }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: "20px 24px", borderBottom: "1px solid #E5E7EB", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#6B7280" }}>Email source</div>
+            <h2 style={{ fontSize: 18, fontWeight: 600, color: "#111827", margin: "2px 0 6px" }}>{drill.source}</h2>
+            <div style={{ fontSize: 13, color: "#6B7280", display: "flex", gap: 14, flexWrap: "wrap" }}>
+              <span><b style={{ color: "#111827" }}>{drill.total_clicks ?? clicks.length}</b> clicks</span>
+              <span><b style={{ color: "#111827" }}>{drill.people ?? "—"}</b> people</span>
+              <span><b style={{ color: "#047857" }}>{drill.buyers ?? 0}</b> buyers</span>
+            </div>
+          </div>
+          <button style={S.btnGhost} onClick={onClose}><I d="M6 18L18 6M6 6l12 12" size={18} stroke="#6B7280" /></button>
+        </div>
+        {/* Funnel-stage breakdown — of the people who clicked this source, how far they got */}
+        {!loading && drill.funnel && drill.funnel.clickers > 0 && (() => {
+          const f = drill.funnel;
+          const stages = [
+            { key: "clickers", label: "Clicked", color: "#14B8A6" },
+            { key: "registered", label: "Registered", color: "#3B82F6" },
+            { key: "attended", label: "Attended", color: "#0EA5E9" },
+            { key: "saw_cta", label: "Saw CTA", color: "#F59E0B" },
+            { key: "clicked_cta", label: "Clicked CTA", color: "#10B981" },
+            { key: "purchased", label: "Purchased", color: "#EF4444" },
+          ];
+          const base = f.clickers || 1;
+          return (
+            <div style={{ padding: "16px 24px", borderBottom: "1px solid #E5E7EB", background: "#FAFAFA" }}>
+              <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#6B7280", marginBottom: 12 }}>Funnel reach of these clickers</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {stages.map(s => {
+                  const v = f[s.key] || 0;
+                  const pct = Math.round((v / base) * 100);
+                  return (
+                    <div key={s.key} style={{ flex: "1 1 110px", minWidth: 100, background: "#fff", border: "1px solid #E5E7EB", borderRadius: 8, padding: "10px 12px" }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: s.color, marginBottom: 4 }}>{s.label}</div>
+                      <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                        <span style={{ fontSize: 20, fontWeight: 600, color: "#111827", fontVariantNumeric: "tabular-nums" }}>{v.toLocaleString()}</span>
+                        <span style={{ fontSize: 12, color: "#9CA3AF" }}>{pct}%</span>
+                      </div>
+                      <div style={{ height: 3, background: "#F3F4F6", borderRadius: 2, marginTop: 6, overflow: "hidden" }}>
+                        <div style={{ width: `${pct}%`, height: "100%", background: s.color }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 11, color: "#9CA3AF", marginTop: 10 }}>% of the {base.toLocaleString()} identified people who clicked this email. Post‑webinar emails reach people who already registered/attended — this is their overall funnel position.</div>
+            </div>
+          );
+        })()}
+        <div style={{ padding: 0, overflowY: "auto", flex: 1 }}>
+          {loading ? (
+            <div style={{ textAlign: "center", padding: "48px 0", color: "#9CA3AF" }}>Loading…</div>
+          ) : clicks.length === 0 ? (
+            <div style={{ textAlign: "center", padding: "48px 0", color: "#9CA3AF" }}>No clicks recorded for this source yet.</div>
+          ) : (
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr>{["Person", "Clicked", "Landing page", "Purchase"].map((h, i) => <th key={h} style={{ ...S.th, textAlign: i === 1 || i === 3 ? "right" : "left", position: "sticky", top: 0 }}>{h}</th>)}</tr>
+              </thead>
+              <tbody>
+                {clicks.map((c, i) => {
+                  const who = c.name || c.email || "Anonymous";
+                  let path = c.current_url;
+                  try { const u = new URL(c.current_url); path = u.hostname.replace(/^www\./, "") + u.pathname; } catch { }
+                  return (
+                    <tr key={i} onClick={() => (c.email || c.contact_id) && onOpenContact(c.email || c.contact_id)} style={{ cursor: (c.email || c.contact_id) ? "pointer" : "default" }} title={c.email ? "Open full journey" : ""}>
+                      <td style={{ ...S.td, textAlign: "left" }}>
+                        <div style={{ fontWeight: 600, color: "#111827" }}>{who}</div>
+                        {c.email && c.name && <div style={{ fontSize: 12, color: "#6B7280" }}>{c.email}</div>}
+                      </td>
+                      <td style={{ ...S.td, textAlign: "right", color: "#6B7280", whiteSpace: "nowrap" }}>{fmtWhen(c.click_ts)}</td>
+                      <td style={{ ...S.td, textAlign: "left", color: "#6B7280", maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={c.current_url}>{path}</td>
+                      <td style={{ ...S.td, textAlign: "right", whiteSpace: "nowrap" }}>
+                        {c.purchased_at
+                          ? <span style={{ color: "#047857", fontWeight: 600 }}>✓ {fmtGap(c.click_ts, c.purchased_at)}</span>
+                          : <span style={{ color: "#D1D5DB" }}>—</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+        {clicks.length >= 500 && <div style={{ padding: "10px 24px", borderTop: "1px solid #E5E7EB", fontSize: 12, color: "#9CA3AF" }}>Showing the most recent 500 clicks.</div>}
       </div>
     </div>
   );
