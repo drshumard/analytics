@@ -150,7 +150,7 @@ app.use(helmet({
 
 // CORS
 // Dashboard/API requests honor the CORS_ORIGINS allowlist (or reflect any origin
-// when unset). Tracking requests (/shumard.js + /api/track/*) are embedded on
+// when unset). Tracking requests (/shumard.js + /api/sg/*) are embedded on
 // arbitrary client sites, so they always get permissive CORS — they're
 // unauthenticated and carry no credentials.
 const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').filter(Boolean);
@@ -160,10 +160,15 @@ const dashboardCors = cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Funnel'],
 });
 app.use((req, res, next) => {
-    if (req.path === '/shumard.js' || req.path.startsWith('/api/track')) {
+    if (req.path === '/shumard.js' || req.path.startsWith('/api/sg')) {
         res.header('Access-Control-Allow-Origin', '*');
         res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         res.header('Access-Control-Allow-Headers', 'Content-Type');
+        // Override Helmet's default Cross-Origin-Resource-Policy: same-origin — the
+        // script + track endpoints are embedded on other origins (the funnel sites).
+        // Without this the browser returns the response but blocks its use with
+        // ERR_BLOCKED_BY_RESPONSE.NotSameOrigin.
+        res.header('Cross-Origin-Resource-Policy', 'cross-origin');
         if (req.method === 'OPTIONS') return res.sendStatus(204);
         return next();
     }
@@ -1770,7 +1775,10 @@ app.delete('/api/custom-metrics/:id', dashboardLimiter, requireAuth, requireAdmi
 // EVENTS LOG
 // =============================================================================
 
-app.get('/api/events', dashboardLimiter, async (req, res) => {
+// Activity Log endpoint. Named "activity" rather than the "events" keyword that
+// ad/content blockers (EasyPrivacy etc.) filter — that keyword broke this in
+// blocker-enabled browsers (e.g. Arc). Reads per-person rows from the events table.
+app.get('/api/activity', dashboardLimiter, async (req, res) => {
     try {
         const supabase = clientFor(resolveFunnel(req, 'analytics'));
         const { limit = 100, offset = 0, type } = req.query;
@@ -1787,7 +1795,7 @@ app.get('/api/events', dashboardLimiter, async (req, res) => {
         res.json({ data: data || [] });
 
     } catch (err) {
-        console.error('❌ GET /api/events error:', err.message);
+        console.error('❌ GET /api/activity error:', err.message);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -3034,10 +3042,10 @@ app.delete('/api/insights/conversations/:id', dashboardLimiter, requireAuth, asy
 //
 // Public, unauthenticated endpoints called by shumard.js on the client site:
 //   GET  /shumard.js              — the tracking script (?tag= sets an auto-tag)
-//   POST /api/track/pageview      — log a pageview
-//   POST /api/track/lead          — email/phone captured on a form field
-//   POST /api/track/registration  — a form was submitted
-//   POST /api/track/tag           — apply a funnel tag (attended, replay, cta…)
+//   POST /api/sg/pageview      — log a pageview
+//   POST /api/sg/lead          — email/phone captured on a form field
+//   POST /api/sg/registration  — a form was submitted
+//   POST /api/sg/tag           — apply a funnel tag (attended, replay, cta…)
 //
 // Writes go to the request's funnel schema via clientFor(resolveFunnel(req)),
 // defaulting to `analytics` (public). The stitching engine fuses browser
@@ -3398,12 +3406,12 @@ app.get('/shumard.js', (req, res) => {
 
 // ─── Tracking ingestion ────────────────────────────────────────────────────────
 // Bot/scanner guard for every tracking endpoint (replies ok so the bot won't retry).
-app.use('/api/track', (req, res, next) => {
+app.use('/api/sg', (req, res, next) => {
     if (isLikelyBot(req, req.body && req.body.user_agent)) return res.json({ status: 'ok', skipped: 'bot' });
     next();
 });
 
-app.post('/api/track/pageview', trackLimiter, async (req, res) => {
+app.post('/api/sg/pageview', trackLimiter, async (req, res) => {
     try {
         const sb = clientFor(resolveFunnel(req));
         const now = new Date().toISOString();
@@ -3415,10 +3423,10 @@ app.post('/api/track/pageview', trackLimiter, async (req, res) => {
         const vid = await logVisit(sb, eid, d.session_id, d.current_url, d.referrer_url, d.page_title, d.attribution, now, ip);
         await ipAutoStitch(sb, eid, ip, now);
         res.json({ status: 'ok', visit_id: vid, contact_id: eid });
-    } catch (e) { console.error('❌ POST /api/track/pageview:', e.message); res.status(500).json({ error: 'tracking error' }); }
+    } catch (e) { console.error('❌ POST /api/sg/pageview:', e.message); res.status(500).json({ error: 'tracking error' }); }
 });
 
-app.post('/api/track/lead', trackLimiter, async (req, res) => {
+app.post('/api/sg/lead', trackLimiter, async (req, res) => {
     try {
         const sb = clientFor(resolveFunnel(req));
         const now = new Date().toISOString();
@@ -3435,10 +3443,10 @@ app.post('/api/track/lead', trackLimiter, async (req, res) => {
         await sessionAutoStitch(sb, eid, d.session_id, now);
         await ipAutoStitch(sb, eid, ip, now);
         res.json({ status: 'ok', contact_id: eid });
-    } catch (e) { console.error('❌ POST /api/track/lead:', e.message); res.status(500).json({ error: 'tracking error' }); }
+    } catch (e) { console.error('❌ POST /api/sg/lead:', e.message); res.status(500).json({ error: 'tracking error' }); }
 });
 
-app.post('/api/track/registration', trackLimiter, async (req, res) => {
+app.post('/api/sg/registration', trackLimiter, async (req, res) => {
     try {
         const sb = clientFor(resolveFunnel(req));
         const now = new Date().toISOString();
@@ -3456,10 +3464,10 @@ app.post('/api/track/registration', trackLimiter, async (req, res) => {
         await sessionAutoStitch(sb, eid, d.session_id, now);
         await ipAutoStitch(sb, eid, ip, now);
         res.json({ status: 'ok', contact_id: eid });
-    } catch (e) { console.error('❌ POST /api/track/registration:', e.message); res.status(500).json({ error: 'tracking error' }); }
+    } catch (e) { console.error('❌ POST /api/sg/registration:', e.message); res.status(500).json({ error: 'tracking error' }); }
 });
 
-app.post('/api/track/tag', trackLimiter, async (req, res) => {
+app.post('/api/sg/tag', trackLimiter, async (req, res) => {
     try {
         const sb = clientFor(resolveFunnel(req));
         const now = new Date().toISOString();
@@ -3470,7 +3478,7 @@ app.post('/api/track/tag', trackLimiter, async (req, res) => {
         if (!tag) return res.status(400).json({ error: 'invalid tag' });
         const eid = await applyTag(sb, d.contact_id, tag, d.current_url, now, ip);
         res.json({ status: 'ok', contact_id: eid, tag });
-    } catch (e) { console.error('❌ POST /api/track/tag:', e.message); res.status(500).json({ error: 'tracking error' }); }
+    } catch (e) { console.error('❌ POST /api/sg/tag:', e.message); res.status(500).json({ error: 'tracking error' }); }
 });
 
 

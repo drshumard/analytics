@@ -102,7 +102,7 @@ const api = {
     return res.json();
   },
   async getEvents(limit = 100, type = "") {
-    const url = `${API_BASE}/api/events?limit=${limit}${type ? `&type=${type}` : ""}`;
+    const url = `${API_BASE}/api/activity?limit=${limit}${type ? `&type=${type}` : ""}`;
     const res = await fetch(url, { headers: getFunnelHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch events: ${res.status}`);
     return res.json();

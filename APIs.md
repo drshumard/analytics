@@ -5,7 +5,7 @@ Base URL: `https://analytics.drshumard.com`
 **Auth models**
 - **Webhooks** → header `X-API-Key: <API_KEY>` (or `NATIVE_API_KEY`). The key selects the funnel.
 - **Dashboard / CRM / Insights** → header `Authorization: Bearer <Supabase JWT>` + `X-Funnel: analytics|native` (defaults to `analytics`). `requireAuth` validates funnel access; writes also need admin (`requireAdmin`).
-- **Tracking** (`/shumard.js`, `/api/track/*`) → public, permissive CORS (unauthenticated, embedded on client sites).
+- **Tracking** (`/shumard.js`, `/api/sg/*`) → public, permissive CORS (unauthenticated, embedded on client sites).
 
 ---
 
@@ -28,10 +28,10 @@ Base URL: `https://analytics.drshumard.com`
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `GET` | `/shumard.js` | The tracking script. `?tag=<name>` bakes in an auto‑tag. `BACKEND_URL` = `TRACKING_PUBLIC_URL`. |
-| `POST` | `/api/track/pageview` | Log a pageview |
-| `POST` | `/api/track/lead` | Email/phone captured on a form field |
-| `POST` | `/api/track/registration` | A form was submitted |
-| `POST` | `/api/track/tag` | Apply a funnel tag to a contact |
+| `POST` | `/api/sg/pageview` | Log a pageview |
+| `POST` | `/api/sg/lead` | Email/phone captured on a form field |
+| `POST` | `/api/sg/registration` | A form was submitted |
+| `POST` | `/api/sg/tag` | Apply a funnel tag to a contact |
 
 Payload (pageview/lead/registration): `{ contact_id, session_id, current_url, referrer_url, page_title, attribution{}, user_agent, email?, phone?, name? }`. Attribution recognizes UTMs, `fbclid`, `_fbc`/`_fbp`, `gclid`, `ttclid`, plus `source` (from `el`) and `traffic_source` (from `htrafficsource`). Bot/scanner user‑agents return `{status:"ok",skipped:"bot"}` and write nothing. Rate limit: 1200/min per IP.
 
@@ -71,7 +71,7 @@ The model's tools: `get_metrics`, `get_metrics_rollup`, `compare_periods`, `get_
 | `GET` | `/api/metrics?limit=&offset=&variant=` | Daily metrics (deduped) | Public* |
 | `PUT` | `/api/metrics/:date` | Edit a day | Admin |
 | `DELETE` | `/api/metrics/:date` | Delete a day | Admin |
-| `GET` | `/api/events?type=&limit=` | Activity log (per‑person events) | Public* |
+| `GET` | `/api/activity?type=&limit=` | Activity log (per‑person events; named to avoid ad‑blocker keyword filters) | Public* |
 | `GET` | `/api/custom-metrics` · `POST` · `PUT/:id` · `DELETE/:id` | Custom calculated metrics | Public* / Admin |
 | `GET` | `/api/lenses` · `POST` · `PUT/:id` · `DELETE/:id` | Dashboard metric lenses | Auth |
 | `GET` | `/api/me` · `/api/me/funnels` · `PUT /api/me/preferences` | Current user, allowed funnels, prefs | Auth |

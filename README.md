@@ -13,7 +13,7 @@ Production analytics **and CRM** for a Facebook‑ads webinar funnel. It combine
 ## Architecture
 
 ```
-  Client funnel pages ──shumard.js──▶ /api/track/*  ─┐
+  Client funnel pages ──shumard.js──▶ /api/sg/*  ─┐
                                                      ├─▶ Express (server.js) ─▶ Supabase / Postgres
   Zapier / Make / Stealth ─webhooks─▶ /api/metrics/* ┘        │                  ├─ public  = "analytics" funnel
                                                               │                  └─ native  = "native"   funnel
@@ -24,7 +24,7 @@ Production analytics **and CRM** for a Facebook‑ads webinar funnel. It combine
 
 **Two data sources, joined by email:**
 1. **Webhooks** (Zapier / Make / Stealth) → `/api/metrics/*` → per‑person rows in `events` + denormalized counts in `daily_metrics`.
-2. **shumard.js** on the funnel pages → `/api/track/*` → `tracking_*` tables (identities, pageviews, tag fires), stitched into one person.
+2. **shumard.js** on the funnel pages → `/api/sg/*` → `tracking_*` tables (identities, pageviews, tag fires), stitched into one person.
 
 The **CRM** joins these by email at read time (the `crm_people` view); **AI Insights** reads everything through tools. The webhook → `events` → `daily_metrics` pipeline is independent of tracking — tracking never writes to it.
 
@@ -152,7 +152,7 @@ Conversations persist per user (`/api/insights/conversations`).
 Full reference in **[APIs.md](APIs.md)**. Summary:
 
 - **Webhooks** (`X-API-Key`): `/api/metrics`, `/api/metrics/batch`, `/api/metrics/increment`, `/api/metrics/set`, `/api/fb-sync`.
-- **Tracking** (public, permissive CORS): `GET /shumard.js`, `POST /api/track/{pageview,lead,registration,tag}`.
+- **Tracking** (public, permissive CORS): `GET /shumard.js`, `POST /api/sg/{pageview,lead,registration,tag}`.
 - **Dashboard** (Supabase JWT; `X-Funnel`): metrics, custom‑metrics, events, CRM (`/api/crm/*`), insights (`/api/insights/*`), lenses, admin.
 
 ---
@@ -200,7 +200,7 @@ All dates are **America/Los_Angeles** (`TZ` is set in `ecosystem.config.cjs`). W
 
 - Webhook API keys compared with `crypto.timingSafeEqual`; dashboard + CRM + Insights require a Supabase JWT (`requireAuth`); writes require admin (`requireAdmin`).
 - Rate limits: webhooks 300/min, dashboard 120/min, **tracking 1200/min** (per IP).
-- Helmet headers; CORS locked to `CORS_ORIGINS` for the dashboard, permissive **only** on `/shumard.js` + `/api/track/*` (unauthenticated, no credentials).
+- Helmet headers; CORS locked to `CORS_ORIGINS` for the dashboard, permissive **only** on `/shumard.js` + `/api/sg/*` (unauthenticated, no credentials).
 - The read‑only SQL tool is double‑guarded (Node validator + `ai_run_sql` row cap / timeout).
 
 ---

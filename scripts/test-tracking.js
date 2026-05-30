@@ -2,7 +2,7 @@
 // Test script — exercises the shumard.js tracking + identity-stitching engine.
 //
 // Prereqs: run db/migrate_tracking_crm.sql against the analytics funnel, then
-// start the server (npm start). The /api/track/* endpoints are public (no key).
+// start the server (npm start). The /api/sg/* endpoints are public (no key).
 //
 // Usage: API_URL=http://localhost:3000 node scripts/test-tracking.js
 //
@@ -43,7 +43,7 @@ async function post(path, body, ip) {
 // IP (so the resolve call itself never triggers an IP merge).
 let resolveSeq = 0;
 async function resolve(contactId) {
-  const r = await post('/api/track/pageview',
+  const r = await post('/api/sg/pageview',
     { contact_id: contactId, current_url: 'https://example.com/_resolve' },
     `10.99.${(resolveSeq >> 8) & 255}.${resolveSeq++ & 255}`);
   return r.contact_id;
@@ -63,38 +63,38 @@ async function main() {
   // 1. Email stitch — two browsers (different IPs), same email → one contact
   console.log('\n1️⃣  Email stitch');
   const e = `buyer-${run}@example.com`;
-  const a = await post('/api/track/lead', { contact_id: id('email-A'), email: e }, '10.0.1.1');
+  const a = await post('/api/sg/lead', { contact_id: id('email-A'), email: e }, '10.0.1.1');
   assert(a.contact_id === id('email-A'), 'first lead keeps its contact_id');
-  await post('/api/track/lead', { contact_id: id('email-B'), email: e }, '10.0.1.2');
+  await post('/api/sg/lead', { contact_id: id('email-B'), email: e }, '10.0.1.2');
   assert(await resolve(id('email-B')) === id('email-A'), 'second browser (same email) resolves to the first contact');
 
   // 2. Session stitch — attribution-rich pageview + identity lead sharing a session_id (different IPs)
   console.log('\n2️⃣  Session stitch (cross-frame postMessage shares session_id)');
   const sess = id('sess');
-  await post('/api/track/pageview', {
+  await post('/api/sg/pageview', {
     contact_id: id('sess-landing'), session_id: sess,
     current_url: 'https://drshumardworkshop.com/register?utm_source=facebook&fbclid=abc123',
     attribution: { utm_source: 'facebook', fbclid: 'abc123' },
   }, '10.0.2.1');
-  await post('/api/track/lead', { contact_id: id('sess-iframe'), session_id: sess, email: `attendee-${run}@example.com` }, '10.0.2.2');
+  await post('/api/sg/lead', { contact_id: id('sess-iframe'), session_id: sess, email: `attendee-${run}@example.com` }, '10.0.2.2');
   assert(await resolve(id('sess-iframe')) === id('sess-landing'), 'identity-only contact merges into the attribution-rich one (same session)');
 
   // 3. IP iframe-companion — attribution-rich landing + anonymous companion on the SAME IP
   console.log('\n3️⃣  IP iframe-companion stitch (same IP, 30-min window)');
   const sharedIp = '10.0.3.1';
-  await post('/api/track/pageview', {
+  await post('/api/sg/pageview', {
     contact_id: id('ip-landing'),
     current_url: 'https://drshumardworkshop.com/register?utm_campaign=spring&fbclid=zzz999',
     attribution: { utm_campaign: 'spring', fbclid: 'zzz999' },
   }, sharedIp);
-  await post('/api/track/pageview', { contact_id: id('ip-anon'), current_url: 'https://joinnow.live/embed/abc?layout=styled-0', attribution: { layout: 'styled-0' } }, sharedIp);
+  await post('/api/sg/pageview', { contact_id: id('ip-anon'), current_url: 'https://joinnow.live/embed/abc?layout=styled-0', attribution: { layout: 'styled-0' } }, sharedIp);
   assert(await resolve(id('ip-anon')) === id('ip-landing'), 'anonymous iframe companion merges into the attribution-rich landing (shared IP)');
 
   // 4. Tag application + idempotency
   console.log('\n4️⃣  Tag application');
-  const t1 = await post('/api/track/tag', { contact_id: id('email-A'), tag: 'attended' }, '10.0.1.1');
+  const t1 = await post('/api/sg/tag', { contact_id: id('email-A'), tag: 'attended' }, '10.0.1.1');
   assert(t1.tag === 'attended' && t1.contact_id === id('email-A'), 'tag applied to contact');
-  await post('/api/track/tag', { contact_id: id('email-A'), tag: 'attended' }, '10.0.1.1');   // duplicate — no-op on the set
+  await post('/api/sg/tag', { contact_id: id('email-A'), tag: 'attended' }, '10.0.1.1');   // duplicate — no-op on the set
 
   console.log(`\n${failed === 0 ? '✅' : '❌'} ${passed} passed, ${failed} failed\n`);
   process.exit(failed === 0 ? 0 : 1);

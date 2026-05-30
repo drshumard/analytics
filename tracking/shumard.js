@@ -274,7 +274,7 @@
   function sendPageview() {
     if (store.processedData.pageSent) return;
     store.processedData.pageSent = true;
-    send('/track/pageview', buildPayload());
+    send('/sg/pageview', buildPayload());
   }
 
   function sendLead(fields) {
@@ -292,7 +292,7 @@
       if (phone) parts.push('phone: ' + phone);
       logger('ev');
     }
-    send('/track/lead', buildPayload(fields));
+    send('/sg/lead', buildPayload(fields));
   }
 
   function sendRegistration(fields) {
@@ -307,7 +307,7 @@
     if (fields && fields.phone) parts.push('phone: ' + fields.phone);
     if (fields && fields.name)  parts.push('name: ' + fields.name);
     if (parts.length) logger('ev');
-    send('/track/registration', buildPayload(fields));
+    send('/sg/registration', buildPayload(fields));
   }
 
   /* ─── Stitch is now backend-only -- function kept as no-op for public API compat ─── */
@@ -563,7 +563,7 @@
 
     /* ─── Auto-tag: fire when script was loaded with ?tag=... ─── */
     if (AUTO_TAG) {
-      send('/track/tag', {
+      send('/sg/tag', {
         contact_id: store.config.contactId,
         session_id: store.config.sessionId || null,
         tag:        AUTO_TAG

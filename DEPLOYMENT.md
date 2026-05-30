@@ -26,7 +26,7 @@ Production runs on a VPS as a **PM2** process behind **nginx**, deployed from `m
    TZ=America/Los_Angeles
    ```
    > `TRACKING_PUBLIC_URL` is baked into the served `shumard.js` as its callback URL. It **must be `https://`** — the script loads on https funnel pages, and an `http://` callback is blocked as mixed content.
-3. **nginx** — `nginx-analytics.conf` proxies `location /` to `127.0.0.1:5401` (so `/shumard.js`, `/api/track/*`, the dashboard, and the API all reach the app). Ensure **TLS is enabled** for `analytics.drshumard.com` (e.g. certbot adds the `:443` block + redirects `:80`). The script must be served over https.
+3. **nginx** — `nginx-analytics.conf` proxies `location /` to `127.0.0.1:5401` (so `/shumard.js`, `/api/sg/*`, the dashboard, and the API all reach the app). Ensure **TLS is enabled** for `analytics.drshumard.com` (e.g. certbot adds the `:443` block + redirects `:80`). The script must be served over https.
 4. **PM2 boot:** `pm2 start ecosystem.config.cjs && pm2 save && pm2 startup`.
 
 ---
@@ -73,7 +73,7 @@ The Zapier/Make/Stealth webhook integrations (→ `/api/metrics/*`) are unchange
 curl -s https://analytics.drshumard.com/api/health
 curl -s https://analytics.drshumard.com/shumard.js | head    # BACKEND_URL must be https://analytics.drshumard.com
 ```
-Then in a browser: load a funnel page → DevTools Network shows `POST /api/track/pageview → 200`, and the visitor appears in the dashboard **CRM** tab. Confirm **CRM**, **Email Report**, and **AI Insights** all load. `pm2 logs analytics` for server logs.
+Then in a browser: load a funnel page → DevTools Network shows `POST /api/sg/pageview → 200`, and the visitor appears in the dashboard **CRM** tab. Confirm **CRM**, **Email Report**, and **AI Insights** all load. `pm2 logs analytics` for server logs.
 
 ---
 
