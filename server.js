@@ -2811,6 +2811,17 @@ KEY METRICS:
 REMEMBERED FACTS:
 ${memoryBlock}
 
+TIMEZONE (critical):
+- The business operates in Pacific Time (America/Los_Angeles). ALWAYS report dates, hours, and day-of-week in Pacific time unless the user explicitly asks for UTC.
+- All timestamps in the database are stored in UTC. \`events.event_time\` is a timestamptz; convert it with \`event_time AT TIME ZONE 'America/Los_Angeles'\`.
+  • hour of day (PST):  \`EXTRACT(hour FROM event_time AT TIME ZONE 'America/Los_Angeles')\`
+  • day of week (PST):  \`to_char(event_time AT TIME ZONE 'America/Los_Angeles','Dy')\`
+  • date (PST):         \`(event_time AT TIME ZONE 'America/Los_Angeles')::date\`
+- \`events.metadata->>'webinar_datetime_utc'\` is a UTC *text* string like "April 11th 2026, 10:00:00 pm" (note ordinal suffixes). To use it as a PST time, strip the ordinal, parse, declare UTC, then convert — copy this exactly:
+  \`(to_timestamp(regexp_replace(metadata->>'webinar_datetime_utc','(\\\\d+)(st|nd|rd|th)','\\\\1','g'),'Month DD YYYY, HH12:MI:SS AM')::timestamp AT TIME ZONE 'UTC') AT TIME ZONE 'America/Los_Angeles'\`
+  e.g. busiest webinar SLOTS in PST: \`SELECT to_char(<that expression>,'Dy HH12:MI AM') AS slot_pst, count(*) FROM events WHERE event_type='registrations' GROUP BY 1 ORDER BY 2 DESC\`
+- Date-range filters: filter on the raw UTC \`event_time\` (e.g. \`event_time >= now() - interval '7 days'\`), then convert to PST for display/grouping. Don't wrap event_time in a timezone conversion inside the WHERE range bound — it's slower and unnecessary.
+
 INSTRUCTIONS:
 - Use tools to fetch only the data you need. Don't ask the user for date ranges — pick reasonable ones (last 7/14/30 days, last 3/6 months) based on the question.
 - For multi-week or multi-month trends, prefer \`get_metrics_rollup\` over \`get_metrics\` — fewer rows, cleaner trend.
@@ -2869,24 +2880,48 @@ FORMATTING:
         const allTools = [...INSIGHTS_TOOLS, ...SERVER_TOOLS];
 
         const MAX_ITERS = 10;
+        // Overall wall-clock budget for the whole tool loop. Kept under the nginx
+        // proxy_read_timeout so we return a clean answer instead of letting the
+        // gateway 504. On the last allowed iteration we drop tools and ask for a
+        // final text answer from whatever data was already gathered.
+        const DEADLINE_MS = 110_000;
+        const PER_CALL_MS = 60_000;   // abort a single hung Anthropic call
+        const startedAt = Date.now();
         let lastUsage = null;
         for (let iter = 0; iter < MAX_ITERS; iter++) {
-            const response = await fetch('https://api.anthropic.com/v1/messages', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': ANTHROPIC_API_KEY,
-                    'anthropic-version': '2023-06-01',
-                    'anthropic-beta': 'code-execution-2025-05-22',
-                },
-                body: JSON.stringify({
-                    model: 'claude-sonnet-4-6',
-                    max_tokens: 4096,
-                    system: systemPrompt,
-                    tools: allTools,
-                    messages: apiMessages,
-                }),
-            });
+            const outOfTime = Date.now() - startedAt > DEADLINE_MS;
+            const callCtrl = new AbortController();
+            const callTimer = setTimeout(() => callCtrl.abort(), PER_CALL_MS);
+            let response;
+            try {
+                response = await fetch('https://api.anthropic.com/v1/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': ANTHROPIC_API_KEY,
+                        'anthropic-version': '2023-06-01',
+                        'anthropic-beta': 'code-execution-2025-05-22',
+                    },
+                    body: JSON.stringify({
+                        model: 'claude-sonnet-4-6',
+                        max_tokens: 4096,
+                        system: systemPrompt,
+                        // Drop tools once the budget is spent so the model must answer
+                        // with text now (no further tool round-trips).
+                        tools: outOfTime ? undefined : allTools,
+                        messages: apiMessages,
+                    }),
+                    signal: callCtrl.signal,
+                });
+            } catch (e) {
+                clearTimeout(callTimer);
+                if (e.name === 'AbortError') {
+                    console.error(`❌ Chat[${funnel}]: Anthropic call aborted after ${PER_CALL_MS}ms (iter ${iter})`);
+                    return res.status(504).json({ error: 'The AI took too long to respond. Try a narrower question or a shorter date range.' });
+                }
+                throw e;
+            }
+            clearTimeout(callTimer);
 
             if (!response.ok) {
                 const errBody = await response.text();
