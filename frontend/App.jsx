@@ -50,10 +50,23 @@ const api = {
     if (!res.ok) throw new Error(`Failed to fetch funnels: ${res.status}`);
     return res.json();
   },
-  async getMetrics(limit = 90, offset = 0, variant = "all") {
-    const url = `${API_BASE}/api/metrics?limit=${limit}&offset=${offset}${variant && variant !== "all" ? `&variant=${encodeURIComponent(variant)}` : ""}`;
+  async getMetrics(limit = 90, offset = 0) {
+    // expand=variants embeds each day's A/B/undetected breakdown so the split-test
+    // toggle switches client-side (no refetch). Fetched once per load.
+    const url = `${API_BASE}/api/metrics?limit=${limit}&offset=${offset}&expand=variants`;
     const res = await fetch(url, { headers: getFunnelHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch metrics: ${res.status}`);
+    return res.json();
+  },
+  async getAbTestStart() {
+    const res = await fetch(`${API_BASE}/api/ab-test/start`, { headers: getFunnelHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch A/B start: ${res.status}`);
+    return res.json();
+  },
+  async setAbTestStart(body) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/ab-test/start`, { method: "PUT", headers, body: JSON.stringify(body) });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Failed: ${res.status}`); }
     return res.json();
   },
   async upsertMetric(entry) {
@@ -230,6 +243,16 @@ const SUMMARY_METRIC_OPTIONS = [
 const evalFormula = (f, row, ctx = {}) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(`\\b${k}\\b`, "gi"), String(Number(row[k]) || 0)); for (const [k, v] of Object.entries(ctx)) e = e.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi"), String(Number(v) || 0)); if (/[^0-9+\-*/().%\s]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
 const fmtVal = (v, fmt) => v === null ? "\u2014" : fmt === "percent" ? `${v}%` : fmt === "currency" ? `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
 
+// Fields that have no A/B dimension \u2014 FB reports spend and reg-page link clicks
+// at the account/day level, so they can't be attributed to a split-test variant.
+// In a single-variant view (A/B/undetected) we hide these columns and any custom
+// metric that depends on them, since a per-variant value would be misleading.
+// CRM contacts list page size (server paginates via limit/offset).
+const CRM_PAGE = 100;
+const UNSPLITTABLE_FIELDS = ["fb_spend", "fb_link_clicks"];
+const formulaUsesUnsplittable = (formula) =>
+  UNSPLITTABLE_FIELDS.some(k => new RegExp(`\\b${k}\\b`, "i").test(formula || ""));
+
 // Evaluate all custom metrics for a row in dependency order (topo-sort)
 const evalAllCustoms = (customs, row) => {
   const ctx = {};
@@ -286,7 +309,8 @@ export default function App() {
   const [userRole, setUserRole] = useState(null);
   const [activeFunnel, setActiveFunnelState] = useState(() => getActiveFunnel());
   const [allowedFunnels, setAllowedFunnels] = useState([activeFunnel]);
-  const [variantFilter, setVariantFilter] = useState("all"); // 'all' | 'A' | 'B' | 'undetected' — split-test toggle (native only)
+  const [variantFilter, setVariantFilter] = useState("all"); // 'all' | 'A' | 'B' | 'undetected' — split-test toggle (funnels with variant data)
+  const [abTestStart, setAbTestStartState] = useState(null); // ISO string or null — variants only count from here
   const [authLoading, setAuthLoading] = useState(true);
   const [authEmail, setAuthEmail] = useState("");
   const [authPass, setAuthPass] = useState("");
@@ -313,6 +337,7 @@ export default function App() {
   const [crmContacts, setCrmContacts] = useState([]);
   const [crmStats, setCrmStats] = useState(null);
   const [crmTotal, setCrmTotal] = useState(0);
+  const [crmOffset, setCrmOffset] = useState(0);
   const [crmSearch, setCrmSearch] = useState("");
   const [crmStage, setCrmStage] = useState("");
   const [crmLoading, setCrmLoading] = useState(false);
@@ -335,6 +360,24 @@ export default function App() {
     return found;
   })();
   const isColVisible = (col) => activeLens.metrics.includes(col);
+
+  // In a single-variant view, spend and reg-page clicks (and any custom metric
+  // built on them) have no A/B breakdown, so we drop them from the table/cards.
+  const inVariantView = variantFilter !== "all";
+  const isHiddenInVariant = (col) => {
+    if (!inVariantView) return false;
+    if (col.type === "base") return UNSPLITTABLE_FIELDS.includes(col.key);
+    if (col.type === "custom") return formulaUsesUnsplittable(col.cm?.formula);
+    return false;
+  };
+  const cardHiddenInVariant = (card) => {
+    if (!inVariantView) return false;
+    if (String(card.key).startsWith("cm:")) {
+      const cm = customs.find(c => `cm:${c.id}` === card.key);
+      return formulaUsesUnsplittable(cm?.formula);
+    }
+    return UNSPLITTABLE_FIELDS.includes(card.key);
+  };
 
   // ─── Column ordering ────────────────────────────────────────────
   const [colOrder, setColOrder] = useState(null);
@@ -417,7 +460,7 @@ export default function App() {
 
   const loadData = useCallback(async () => {
     try {
-      const [mRes, cRes] = await Promise.all([api.getMetrics(90, 0, variantFilter), api.getCustomMetrics()]);
+      const [mRes, cRes] = await Promise.all([api.getMetrics(90, 0), api.getCustomMetrics()]);
       setMetrics(mRes.data || []);
       setCustoms(cRes.data || []);
     } catch (e) {
@@ -426,7 +469,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [flash, variantFilter]);
+  }, [flash]);
 
   // ─── Auth ───────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -503,18 +546,25 @@ export default function App() {
   const loadCrm = useCallback(async () => {
     setCrmLoading(true);
     try {
-      const [list, stats] = await Promise.all([api.getCrmContacts(crmSearch, crmStage), api.getCrmStats()]);
+      const list = await api.getCrmContacts(crmSearch, crmStage, CRM_PAGE, crmOffset);
       setCrmContacts(list.data || []);
       setCrmTotal(list.total || 0);
-      setCrmStats(stats || null);
     } catch (e) { flash(e.message, "err"); }
     setCrmLoading(false);
-  }, [crmSearch, crmStage]);
+  }, [crmSearch, crmStage, crmOffset]);
+  // Stats scan the whole view, so fetch them once on entering CRM / changing
+  // filters — not on every page turn.
+  const loadCrmStats = useCallback(async () => {
+    try { setCrmStats((await api.getCrmStats()) || null); } catch { /* non-fatal */ }
+  }, []);
   useEffect(() => {
     if (view !== "crm") return;
     const t = setTimeout(loadCrm, 250);
     return () => clearTimeout(t);
   }, [view, loadCrm]);
+  useEffect(() => { if (view === "crm") loadCrmStats(); }, [view, loadCrmStats]);
+  // Reset to the first page whenever the search/stage filter changes.
+  useEffect(() => { setCrmOffset(0); }, [crmSearch, crmStage]);
   const openCrmContact = async (row) => {
     try {
       const data = await api.getCrmContact(row.contact_id || row.email);
@@ -549,6 +599,21 @@ export default function App() {
 
   useEffect(() => { loadData(); fetchLenses(); }, [loadData]);
   useEffect(() => { const i = setInterval(loadData, 30000); return () => clearInterval(i); }, [loadData]);
+  // A/B test start cutoff (per funnel) — refetch on mount + funnel switch.
+  useEffect(() => {
+    let cancelled = false;
+    api.getAbTestStart().then(r => { if (!cancelled) setAbTestStartState(r.start || null); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [activeFunnel]);
+  const startAbTestNow = async () => {
+    if (!window.confirm("Start the A/B test now?\n\nVariant data collected before this moment (your test traffic) will be excluded from the A/B reports — totals are unaffected. You can change or clear this anytime.")) return;
+    try { const r = await api.setAbTestStart({ now: true }); setAbTestStartState(r.start || null); await loadData(); flash("A/B test now counts from now"); }
+    catch (e) { flash(e.message, "err"); }
+  };
+  const clearAbTest = async () => {
+    try { const r = await api.setAbTestStart({ start: null }); setAbTestStartState(r.start || null); await loadData(); flash("Cleared — counting all variant data"); }
+    catch (e) { flash(e.message, "err"); }
+  };
 
   // When the active funnel changes (post-mount), refetch role + data + lenses.
   // The initial fetches above already run on mount with the persisted funnel.
@@ -661,7 +726,16 @@ export default function App() {
     catch (e) { flash(e.message, "err"); }
   }, [loadData, flash]);
 
-  const filtered = metrics.filter(m => {
+  // Resolve the active split-test variant CLIENT-SIDE: each row carries a
+  // `variants` breakdown (expand=variants), so toggling A/B/undetected merges
+  // that bucket's counts over the row — no refetch, no flicker. Custom metrics
+  // then evaluate against the selected variant's own numbers (e.g. attendance %
+  // = attended_A / registrations_A). 'all' uses the row as-is.
+  const viewMetrics = variantFilter === "all"
+    ? metrics
+    : metrics.map(m => (m.variants && m.variants[variantFilter]) ? { ...m, ...m.variants[variantFilter] } : m);
+
+  const filtered = viewMetrics.filter(m => {
     if (search) {
       const s = search.toLowerCase();
       if (!(m.date.includes(s) || (m.day || "").toLowerCase().includes(s) || fmtDateNice(m.date).toLowerCase().includes(s))) return false;
@@ -985,7 +1059,7 @@ export default function App() {
             })()}
 
             <div className="summary-strip" style={{ ...S.strip, position: "relative" }}>
-              {summaryCards.map((c, i) => {
+              {summaryCards.filter(c => !cardHiddenInVariant(c)).map((c, i) => {
                 const pct = selectedDates.size > 0 ? null : pctChange(c.key);
                 return (
                   <div key={i} style={S.stripCell}>
@@ -1008,7 +1082,7 @@ export default function App() {
               {/* Pad the last row with empty cells (white bg) so the grid lines stay
                   consistent for any card count. Pad to a multiple of 4 (desktop) so
                   4-col and 2-col layouts both end on a full row. */}
-              {Array.from({ length: (4 - (summaryCards.length % 4)) % 4 }).map((_, i) => (
+              {Array.from({ length: (4 - (summaryCards.filter(c => !cardHiddenInVariant(c)).length % 4)) % 4 }).map((_, i) => (
                 <div key={`pad-${i}`} className="strip-pad" style={S.stripCell} aria-hidden="true" />
               ))}
               <button
@@ -1029,7 +1103,7 @@ export default function App() {
                   <div style={viewMode === "list" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("list")}><I d="M4 6h16M4 12h16M4 18h16" size={14} /> List</div>
                   <div style={viewMode === "board" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("board")}><I d="M4 4h4v16H4zM10 4h4v16h-4zM16 4h4v16h-4z" size={14} /> Board</div>
                 </div>
-                {activeFunnel === "native" && (
+                {(activeFunnel === "native" || activeFunnel === "analytics") && (
                   <div className="variant-toggle" style={S.listBoardToggle} title="Split test variant filter">
                     {["all", "A", "B", "undetected"].map(v => (
                       <div
@@ -1040,6 +1114,13 @@ export default function App() {
                         {v === "all" ? "All" : v === "undetected" ? "Undetected" : v}
                       </div>
                     ))}
+                  </div>
+                )}
+                {isAdmin && (activeFunnel === "native" || activeFunnel === "analytics") && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#6B7280" }} title="Variants only count from this time — earlier (test) traffic is excluded from the A/B reports. Totals are unaffected.">
+                    <span style={{ whiteSpace: "nowrap" }}>A/B from: <strong style={{ color: "#374151", fontWeight: 600 }}>{abTestStart ? new Date(abTestStart).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "all time"}</strong></span>
+                    <button style={{ ...S.btnLight, padding: "4px 10px", fontSize: 12 }} onClick={startAbTestNow}>Start now</button>
+                    {abTestStart && <button style={{ ...S.btnLight, padding: "4px 10px", fontSize: 12 }} onClick={clearAbTest}>Clear</button>}
                   </div>
                 )}
                 <button style={S.btnLight} onClick={() => setColEditorOpen(true)}><I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" size={14} stroke="#6B7280" /> Edit Columns</button>
@@ -1078,7 +1159,7 @@ export default function App() {
                 <table style={S.table}>
                   <thead><tr>
                     <th className="sticky-col sticky-col-1" style={S.th}>Day</th><th className="sticky-col sticky-col-2" style={S.th}>Date</th>
-                    {orderedCols.filter(c => c.type === "base" ? isColVisible(c.key) : true).map(c => (
+                    {orderedCols.filter(c => (c.type === "base" ? isColVisible(c.key) : true) && !isHiddenInVariant(c)).map(c => (
                       <th key={c.key} style={{ ...S.th, ...(c.type === "custom" ? { color: "#12864A" } : {}), ...(c.key === "total_purchases" ? S.thHighlight : {}) }}>{c.label}</th>
                     ))}
                     <th style={{ ...S.th, width: 72 }}>Actions</th>
@@ -1103,7 +1184,7 @@ export default function App() {
                         >
                           <td className="sticky-col sticky-col-1" style={S.td}><span style={S.dayPill}>{getLADayShort(row.date)}</span></td>
                           <td className="sticky-col sticky-col-2" style={{ ...S.td, whiteSpace: "nowrap", minWidth: 90 }}><span style={{ color: "#1A1A1A", fontWeight: 500, fontSize: 14 }}>{fmtDateNice(row.date)}</span></td>
-                          {orderedCols.filter(c => c.type === "base" ? isColVisible(c.key) : true).map(c => {
+                          {orderedCols.filter(c => (c.type === "base" ? isColVisible(c.key) : true) && !isHiddenInVariant(c)).map(c => {
                             if (c.type === "custom") {
                               return <td key={c.key} style={{ ...S.tdNum, color: "#12864A", fontWeight: 600 }}>{fmtVal(ctx[c.cm.name], c.cm.format)}</td>;
                             }
@@ -1150,7 +1231,7 @@ export default function App() {
                         </div>
                       </div>
                       <div style={S.boardCardBody}>
-                        {orderedCols.filter(c => c.type === "base" ? isColVisible(c.key) : true).map(c => {
+                        {orderedCols.filter(c => (c.type === "base" ? isColVisible(c.key) : true) && !isHiddenInVariant(c)).map(c => {
                           if (c.type === "custom") {
                             return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={{ ...S.bcVal, color: "#10B981" }}>{fmtVal(boardCtx[c.cm.name], c.cm.format)}</span></div>;
                           }
@@ -1302,7 +1383,7 @@ export default function App() {
                       {crmContacts.map((c, i) => (
                         <tr key={c.contact_id || c.email || i} onClick={() => openCrmContact(c)} style={{ cursor: "pointer" }}>
                           <td style={{ ...S.td, textAlign: "left", fontWeight: 600, color: "#111827" }}>{c.name || <span style={{ color: "#9CA3AF", fontStyle: "italic", fontWeight: 400 }}>Unknown</span>}{c.is_shared_ip && <span title="Seen on a shared/NAT IP — identity not auto-merged" style={{ marginLeft: 6, fontSize: 9, fontWeight: 700, letterSpacing: "0.04em", color: "#B91C1C", background: "#FEE2E2", padding: "1px 5px", borderRadius: 4, verticalAlign: "middle" }}>SHARED IP</span>}</td>
-                          <td style={{ ...S.td, textAlign: "left", color: "#374151" }}>{c.email}</td>
+                          <td style={{ ...S.td, textAlign: "left", color: "#374151" }}>{c.email}{c.has_linked && <span title="Has linked identities — another email/phone was fused into this person (same browser/IP). Open to see the Linked tab." style={{ marginLeft: 6, fontSize: 9, fontWeight: 700, letterSpacing: "0.04em", color: "#3538CD", background: "#EEF4FF", padding: "1px 5px", borderRadius: 4, verticalAlign: "middle" }}>L</span>}</td>
                           <td style={{ ...S.td, textAlign: "left", color: "#6B7280" }}>{c.phone || "—"}</td>
                           <td style={{ ...S.td, textAlign: "left" }}><CrmStageBadge stage={c.stage} /></td>
                           <td style={{ ...S.td, textAlign: "left", color: "#6B7280" }}>{crmSourceLabel(c.attribution) || "—"}</td>
@@ -1312,6 +1393,15 @@ export default function App() {
                       ))}
                     </tbody>
                   </table>
+                </div>
+              )}
+              {!crmLoading && crmTotal > CRM_PAGE && (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingTop: 16, marginTop: 4, borderTop: "1px solid #F3F4F6", fontSize: 13, color: "#6B7280" }}>
+                  <span>{(crmOffset + 1).toLocaleString()}–{Math.min(crmOffset + CRM_PAGE, crmTotal).toLocaleString()} of {crmTotal.toLocaleString()}</span>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button style={{ ...S.btnLight, opacity: crmOffset === 0 ? 0.4 : 1, cursor: crmOffset === 0 ? "default" : "pointer" }} disabled={crmOffset === 0} onClick={() => setCrmOffset(Math.max(0, crmOffset - CRM_PAGE))}>← Prev</button>
+                    <button style={{ ...S.btnLight, opacity: crmOffset + CRM_PAGE >= crmTotal ? 0.4 : 1, cursor: crmOffset + CRM_PAGE >= crmTotal ? "default" : "pointer" }} disabled={crmOffset + CRM_PAGE >= crmTotal} onClick={() => setCrmOffset(crmOffset + CRM_PAGE)}>Next →</button>
+                  </div>
                 </div>
               )}
             </div>
@@ -1719,6 +1809,7 @@ function CrmContactModal({ contact, tab, setTab, onClose }) {
   const timeline = contact.timeline || [];
   const visits = contact.visits || [];
   const events = contact.events || [];
+  const linked = contact.linked || [];
   const attr = c.attribution || {};
   const title = c.name || c.email || "Contact";
   return (
@@ -1731,6 +1822,7 @@ function CrmContactModal({ contact, tab, setTab, onClose }) {
               <CrmStageBadge stage={c.stage} />
               {!c.is_tracked && <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", color: "#9CA3AF", background: "#F3F4F6", padding: "2px 7px", borderRadius: 4 }}>LEGACY</span>}
               {c.is_shared_ip && <span title="Seen on a shared/NAT IP — identity was not auto-merged to avoid fusing strangers" style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", color: "#B91C1C", background: "#FEE2E2", padding: "2px 7px", borderRadius: 4 }}>⚠ SHARED IP</span>}
+              {linked.length > 0 && <span title="Other emails/phones fused into this person" style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", color: "#3538CD", background: "#EEF4FF", padding: "2px 7px", borderRadius: 4, cursor: "pointer" }} onClick={() => setTab("linked")}>+{linked.length} LINKED</span>}
             </div>
             <div style={{ fontSize: 13, color: "#6B7280", display: "flex", gap: 12, flexWrap: "wrap" }}>
               {c.email && <span>{c.email}</span>}
@@ -1740,7 +1832,7 @@ function CrmContactModal({ contact, tab, setTab, onClose }) {
           <button style={S.btnGhost} onClick={onClose}><I d="M6 18L18 6M6 6l12 12" size={18} stroke="#6B7280" /></button>
         </div>
         <div style={{ display: "flex", gap: 4, padding: "0 24px", borderBottom: "1px solid #E5E7EB" }}>
-          {[["journey", `Journey (${timeline.length})`], ["clicks", `Clicks (${visits.length})`], ["details", "Details"]].map(([k, label]) => (
+          {[["journey", `Journey (${timeline.length})`], ["clicks", `Clicks (${visits.length})`], ["linked", `Linked (${linked.length})`], ["details", "Details"]].map(([k, label]) => (
             <button key={k} onClick={() => setTab(k)} style={{ padding: "12px 14px", fontSize: 13, fontWeight: 600, background: "transparent", border: "none", borderBottom: tab === k ? "2px solid #111827" : "2px solid transparent", color: tab === k ? "#111827" : "#6B7280", cursor: "pointer", marginBottom: -1 }}>{label}</button>
           ))}
         </div>
@@ -1780,6 +1872,22 @@ function CrmContactModal({ contact, tab, setTab, onClose }) {
                     <div style={{ fontSize: 13, fontWeight: 500, color: "#111827" }}>{v.page_title || "Page view"}</div>
                     <div style={{ fontSize: 12, color: "#6B7280", wordBreak: "break-all", marginTop: 2 }}>{v.current_url}</div>
                     <div style={{ fontSize: 11, color: "#9CA3AF", marginTop: 2 }}>{new Date(v.timestamp).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}{v.referrer_url ? ` · from ${v.referrer_url}` : ""}</div>
+                  </div>
+                ))}
+              </div>
+            )
+          )}
+          {tab === "linked" && (
+            linked.length === 0 ? <div style={{ textAlign: "center", padding: "32px 0", color: "#9CA3AF" }}>No other identities linked to this person.<div style={{ fontSize: 12, marginTop: 6 }}>Linked identities appear when the same person is seen under another email/phone on the same browser or IP (e.g. a purchase under a different checkout email).</div></div> : (
+              <div style={{ display: "flex", flexDirection: "column" }}>
+                <div style={{ fontSize: 12, color: "#6B7280", marginBottom: 12 }}>These identities were fused into this person by the tracker (same browser / IP). Their events and clicks are already merged into the Journey above.</div>
+                {linked.map((l, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "12px 0", borderBottom: i < linked.length - 1 ? "1px solid #F3F4F6" : "none" }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 500, color: "#111827", wordBreak: "break-all" }}>{l.email || l.phone || l.contact_id}</div>
+                      {l.email && l.phone && <div style={{ fontSize: 12, color: "#6B7280", marginTop: 2 }}>{l.phone}</div>}
+                    </div>
+                    <span style={{ flexShrink: 0, fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", padding: "2px 7px", borderRadius: 4, color: l.tracked ? "#3538CD" : "#9CA3AF", background: l.tracked ? "#EEF4FF" : "#F3F4F6" }}>{l.tracked ? "TRACKED" : "EVENT-ONLY"}</span>
                   </div>
                 ))}
               </div>
@@ -2350,6 +2458,7 @@ function QueryBuilder({ flash }) {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [eventType, setEventType] = useState("");
+  const [variant, setVariant] = useState("");
   const [search, setSearch] = useState("");
   const [limit, setLimit] = useState("500");
   const [results, setResults] = useState(null);
@@ -2361,7 +2470,7 @@ function QueryBuilder({ flash }) {
     setLoading(true);
     try {
       const headers = await getAuthHeaders();
-      const body = { table, dateFrom: dateFrom || undefined, dateTo: dateTo || undefined, eventType: eventType || undefined, search: search || undefined, sortBy: overrideSort || sortBy || undefined, sortDir: overrideDir || sortDir, limit: Number(limit) || 500 };
+      const body = { table, dateFrom: dateFrom || undefined, dateTo: dateTo || undefined, eventType: eventType || undefined, variant: variant || undefined, search: search || undefined, sortBy: overrideSort || sortBy || undefined, sortDir: overrideDir || sortDir, limit: Number(limit) || 500 };
       const res = await fetch(`${API_BASE}/api/admin/query`, { method: "POST", headers, body: JSON.stringify(body) });
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Query failed: ${res.status}`); }
       const data = await res.json();
@@ -2420,7 +2529,7 @@ function QueryBuilder({ flash }) {
       <div className="query-filters" style={QS.filters}>
         <div style={QS.filterGroup}>
           <span style={QS.filterLabel}>Table</span>
-          <select style={QS.filterSelect} value={table} onChange={e => { setTable(e.target.value); setResults(null); setEventType(""); setSortBy(""); }}>
+          <select style={QS.filterSelect} value={table} onChange={e => { setTable(e.target.value); setResults(null); setEventType(""); setVariant(""); setSortBy(""); }}>
             <option value="events">Events (Raw)</option>
             <option value="daily_metrics">Daily Metrics (Raw)</option>
             <option value="dashboard">Dashboard (Processed)</option>
@@ -2441,6 +2550,15 @@ function QueryBuilder({ flash }) {
               <select style={QS.filterSelect} value={eventType} onChange={e => setEventType(e.target.value)}>
                 <option value="">All</option>
                 {eventTypes.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <div style={QS.filterGroup}>
+              <span style={QS.filterLabel}>Variant {table === "dashboard" ? "(attributed)" : "(own tag)"}</span>
+              <select style={QS.filterSelect} value={variant} onChange={e => setVariant(e.target.value)}>
+                <option value="">All</option>
+                <option value="A">A</option>
+                <option value="B">B</option>
+                <option value="undetected">Undetected</option>
               </select>
             </div>
             <div style={QS.filterGroup}>

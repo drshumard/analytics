@@ -97,9 +97,13 @@ function getCacheBucket(funnel) {
             // Deduplicated event counts per day: { "2026-04-09": { registrations: 5, ... } }
             dedupCounts: {},
             dedupTimestamps: {},
-            // Full formatted GET /api/metrics response
+            // Full formatted GET /api/metrics response (default 'all' view)
             metricsResponse: null,
             metricsUpdatedAt: 0,
+            // Same, but with per-variant (A/B/undetected) breakdowns embedded
+            // (expand=variants) — powers the client-side split-test toggle
+            metricsResponseExpanded: null,
+            metricsExpandedUpdatedAt: 0,
             // AI insights context (metrics + event summaries)
             insightsContext: null,
             insightsUpdatedAt: 0,
@@ -116,6 +120,8 @@ function invalidateMetricsCache(funnel) {
     const b = getCacheBucket(funnel);
     b.metricsResponse = null;
     b.metricsUpdatedAt = 0;
+    b.metricsResponseExpanded = null;
+    b.metricsExpandedUpdatedAt = 0;
     b.invalidationEpoch++;
     console.log(`🗑️  Cache[${funnel}]: metrics response invalidated`);
 }
@@ -136,6 +142,22 @@ function invalidateInsightsCache(funnel) {
     b.dataDictionary = null;      // journey data dictionary refreshes too
     b.dataDictionaryAt = 0;
     b.invalidationEpoch++;
+}
+
+// A/B test start cutoff (ms epoch) for a funnel, or null = count all variant data.
+// Stored in app_settings.key='ab_test_start' (ISO string). Cached on the bucket;
+// the PUT endpoint updates the cache + clears dedup so counts recompute. Missing
+// table (migration not applied) degrades safely to null (no cutoff).
+async function getAbTestStart(funnel) {
+    const b = getCacheBucket(funnel);
+    if (b.abTestStart !== undefined) return b.abTestStart;
+    try {
+        const { data } = await clientFor(funnel).from('app_settings').select('value').eq('key', 'ab_test_start').maybeSingle();
+        const iso = data && (typeof data.value === 'string' ? data.value : data.value?.start);
+        const ms = iso ? new Date(iso).getTime() : null;
+        b.abTestStart = (ms && !isNaN(ms)) ? ms : null;
+    } catch { b.abTestStart = null; }
+    return b.abTestStart;
 }
 
 // ─── Express App ─────────────────────────────────────────────────────────────
@@ -1152,44 +1174,73 @@ const PURCHASE_DEDUP_MAP = {
 // Allowed variant buckets. 'all' is computed as the sum of the others.
 const VARIANT_BUCKETS = ['A', 'B', 'undetected'];
 
-// Returns: { 'YYYY-MM-DD': { event_type: { all, A, B, undetected } } }
-//
-// Variant attribution rules:
-//   - Registration events use their own metadata.variant if present
-//   - All other events (attended, viewedcta, ..., purchases) inherit the
-//     variant from the user's FIRST registration (by event_time), looked up
-//     via lowercased email
-//   - Events with no email or no matching registration → 'undetected'
-//
-// 'all' = A + B + undetected. This holds because first-registration-wins
-// guarantees each user is bucketed into exactly one variant.
-function computeDedupFromEvents(events) {
-    // ── Pass 1: build email → variant map from registrations (first wins) ──
+// Normalize a phone to a comparable key: digits only, last 10 (so "+1 (555)
+// 123-4567" and "5551234567" match). Returns '' for anything under 10 digits so
+// short/garbage values never become a join key. US-centric, which fits the practice.
+function normalizePhoneKey(phone) {
+    if (!phone) return '';
+    const digits = String(phone).replace(/\D/g, '');
+    return digits.length >= 10 ? digits.slice(-10) : '';
+}
+
+// Build the A/B variant resolver for a set of events — the SINGLE source of truth for
+// variant attribution, used by the dashboard dedup, the AI tools, and Query Data.
+// Returns variantOf(ev) → 'A' | 'B' | 'undetected':
+//   1) An event's OWN metadata.variant (A/B) wins — registrations AND downstream
+//      events (Stealth stamps the variant on attended/CTA/purchase webhooks too).
+//   2) An untagged registration is 'undetected' — it NEVER inherits (otherwise an
+//      untagged / pre-experiment registration gets retroactively painted a variant).
+//   3) An untagged downstream event inherits the registrant's variant via email then
+//      phone (last-10-digits) — but FORWARD-ONLY: only if the event occurs at/after the
+//      variant was assigned (the first tagged registration's time). Earlier events, and
+//      events with no matching tagged registration, are 'undetected'.
+function buildVariantResolver(events, cutoffMs = null) {
     const sortedRegs = events
-        .filter(ev => ev.event_type === 'registrations' && ev.email)
+        .filter(ev => ev.event_type === 'registrations' && (ev.email || ev.phone))
         .sort((a, b) => new Date(a.event_time) - new Date(b.event_time));
-    const emailToVariant = {};
+    const emailToVariant = {};   // email -> { v, since }
+    const phoneToVariant = {};   // phone -> { v, since }
     for (const ev of sortedRegs) {
+        // Ignore registrations before the A/B test went live — they're pre-launch test
+        // data and must not assign anyone a variant.
+        if (cutoffMs && new Date(ev.event_time).getTime() < cutoffMs) continue;
         const raw = ev.metadata?.variant;
         if (raw === undefined || raw === null || raw === '') continue;
         const v = String(raw).trim().toUpperCase();
-        if (v !== 'A' && v !== 'B') continue; // ignore unrecognized variants
-        const k = ev.email.toLowerCase();
-        if (!(k in emailToVariant)) emailToVariant[k] = v;
+        if (v !== 'A' && v !== 'B') continue;
+        const since = new Date(ev.event_time).getTime();
+        const ek = (ev.email || '').toLowerCase();
+        if (ek && !(ek in emailToVariant)) emailToVariant[ek] = { v, since };
+        const pk = normalizePhoneKey(ev.phone);
+        if (pk && !(pk in phoneToVariant)) phoneToVariant[pk] = { v, since };
     }
-
-    const variantOf = (ev) => {
-        if (ev.event_type === 'registrations') {
-            const raw = ev.metadata?.variant;
-            if (raw !== undefined && raw !== null && raw !== '') {
-                const v = String(raw).trim().toUpperCase();
-                if (v === 'A' || v === 'B') return v;
-            }
-        }
-        const k = (ev.email || '').toLowerCase();
-        if (k && emailToVariant[k]) return emailToVariant[k];
+    const ownVariant = (ev) => {
+        const raw = ev.metadata?.variant;
+        if (raw === undefined || raw === null || raw === '') return null;
+        const v = String(raw).trim().toUpperCase();
+        return (v === 'A' || v === 'B') ? v : null;
+    };
+    return (ev) => {
+        const t = new Date(ev.event_time).getTime();
+        // Before the test went live → not part of the experiment, tag or not.
+        if (cutoffMs && t < cutoffMs) return 'undetected';
+        const own = ownVariant(ev);
+        if (own) return own;
+        if (ev.event_type === 'registrations') return 'undetected';
+        const ek = (ev.email || '').toLowerCase();
+        const em = ek ? emailToVariant[ek] : null;
+        if (em && t >= em.since) return em.v;
+        const pk = normalizePhoneKey(ev.phone);
+        const pm = pk ? phoneToVariant[pk] : null;
+        if (pm && t >= pm.since) return pm.v;
         return 'undetected';
     };
+}
+
+// Returns: { 'YYYY-MM-DD': { event_type: { all, A, B, undetected } } }.
+// 'all' = A + B + undetected (each person resolves to exactly one bucket).
+function computeDedupFromEvents(events, cutoffMs = null) {
+    const variantOf = buildVariantResolver(events, cutoffMs);
 
     // ── Pass 2: bucket events into (date, event_type, variant) sets ──
     const sets = {}; // key: "YYYY-MM-DD|event_type|variant" → Set of user keys
@@ -1290,6 +1341,7 @@ async function fetchEventsForDateRange(funnel, minDate, maxDate) {
 async function getDedupCounts(funnel, dates) {
     if (dates.length === 0) return {};
     const bucket = getCacheBucket(funnel);
+    const abCutoff = await getAbTestStart(funnel); // null = count all variant data
     const today = dateToISO(getLADate());
 
     // Today's dedup expires after 3 seconds to handle concurrent webhook races (#14)
@@ -1336,7 +1388,7 @@ async function getDedupCounts(funnel, dates) {
         const computedByDate = {};
         for (const [minDate, maxDate] of ranges) {
             const events = await fetchEventsForDateRange(funnel, minDate, maxDate);
-            const computed = computeDedupFromEvents(events);
+            const computed = computeDedupFromEvents(events, abCutoff);
 
             // Log per-day breakdown for diagnostics
             const dayCounts = {};
@@ -1491,21 +1543,83 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
     return { date: isoDate, written };
 }
 
+// GET /api/ab-test/start — the funnel's A/B test start cutoff (null = count all)
+app.get('/api/ab-test/start', dashboardLimiter, async (req, res) => {
+    try {
+        const funnel = resolveFunnel(req, 'analytics');
+        const ms = await getAbTestStart(funnel);
+        res.json({ start: ms ? new Date(ms).toISOString() : null });
+    } catch (err) {
+        console.error('❌ GET /api/ab-test/start error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// PUT /api/ab-test/start — admin sets/clears the cutoff.
+// Body: { now: true } (set to current time) | { start: ISO } | { start: null } (clear).
+// Clears the dedup cache so per-variant counts recompute under the new cutoff.
+app.put('/api/ab-test/start', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const supabase = clientFor(req.funnel);
+        const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
+        let iso = null;
+        if (req.body?.now) iso = new Date().toISOString();
+        else if (req.body?.start) {
+            const d = new Date(req.body.start);
+            if (isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid start timestamp' });
+            iso = d.toISOString();
+        } // else → clear (no cutoff)
+
+        if (iso === null) {
+            await supabase.from('app_settings').delete().eq('key', 'ab_test_start');
+        } else {
+            const { error } = await supabase.from('app_settings')
+                .upsert({ key: 'ab_test_start', value: iso, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+            if (error) throw error;
+        }
+        // Refresh cached cutoff + force variant recompute on next read.
+        const b = getCacheBucket(req.funnel);
+        b.abTestStart = iso ? new Date(iso).getTime() : null;
+        b.dedupCounts = {}; b.dedupTimestamps = {};
+        invalidateMetricsCache(req.funnel);
+        invalidateInsightsCache(req.funnel);
+        console.log(`🅰️🅱️  [${req.funnel}] A/B test start set to ${iso || '(cleared)'}`);
+        res.json({ start: iso });
+    } catch (err) {
+        console.error('❌ PUT /api/ab-test/start error:', err.message);
+        res.status(500).json({ error: err.message || 'Internal server error' });
+    }
+});
+
 // GET /api/metrics — Fetch all daily metrics (with caching)
 app.get('/api/metrics', dashboardLimiter, async (req, res) => {
     try {
         const funnel = resolveFunnel(req, 'analytics');
         const supabase = clientFor(funnel);
         const bucket = getCacheBucket(funnel);
-        const { limit = 90, offset = 0, variant: variantRaw = 'all' } = req.query;
+        const { limit = 90, offset = 0, variant: variantRaw = 'all', expand } = req.query;
         const ALLOWED_VARIANTS = ['all', 'A', 'B', 'undetected'];
         const variant = ALLOWED_VARIANTS.includes(String(variantRaw)) ? String(variantRaw) : 'all';
+        // expand=variants embeds per-variant (A/B/undetected) breakdowns on every
+        // row so the dashboard can switch the split-test toggle CLIENT-SIDE with no
+        // refetch (kills the flicker + per-toggle latency). In this mode the
+        // top-level values stay the 'all' view (unchanged — canonical columns still
+        // back finalized days) and a `variants` object carries each bucket from live
+        // dedup. For NON-finalized days all === A+B+undetected by construction.
+        const expandVariants = String(expand) === 'variants';
+        const isDefaultPage = Number(limit) === 90 && Number(offset) === 0;
 
-        // ── Response cache: only used for variant='all' (default view) ────
+        // ── Response cache (default pagination only) — the plain 'all' view and
+        //    the expanded payload each get their own cache slot ──
         const now = Date.now();
-        if (variant === 'all' && bucket.metricsResponse && (now - bucket.metricsUpdatedAt) < cache.metricsTTL) {
-            // Only serve cache if request params match (default pagination)
-            if (Number(limit) === 90 && Number(offset) === 0) {
+        if (isDefaultPage) {
+            if (expandVariants && bucket.metricsResponseExpanded && (now - bucket.metricsExpandedUpdatedAt) < cache.metricsTTL) {
+                cache.hits++;
+                return res.json(bucket.metricsResponseExpanded);
+            }
+            if (!expandVariants && variant === 'all' && bucket.metricsResponse && (now - bucket.metricsUpdatedAt) < cache.metricsTTL) {
                 cache.hits++;
                 return res.json(bucket.metricsResponse);
             }
@@ -1525,88 +1639,106 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         if (error) throw error;
 
         // ── Dedup counts ──────────────────────────────────────────────────
-        // For variant='all', skip dedup on finalized rows (canonical columns
-        // hold the total). For variant filtering, ALWAYS run dedup since the
-        // canonical columns don't carry per-variant breakdowns.
+        // For the plain 'all' view, skip dedup on finalized rows (canonical columns
+        // hold the durable total — events may have aged out). For variant filtering
+        // OR the expanded payload, ALWAYS dedup since per-variant breakdowns aren't
+        // stored in the canonical columns.
+        const forceAllDedup = variant !== 'all' || expandVariants;
         const dates = (data || [])
-            .filter(r => variant !== 'all' || !r.finalized_at)
+            .filter(r => forceAllDedup || !r.finalized_at)
             .map(r => String(r.date).substring(0, 10));
         const dedupMap = await getDedupCounts(funnel, dates);
 
+        const DEDUP_COLS = new Set([
+            'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
+            'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa',
+            'stayed_45', 'stayed_60', 'stayed_80',
+        ]);
+        const PURCHASE_SUB = ['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa'];
+
         // Convert to frontend format (MM/DD/YYYY)
-        // Priority: manual override > deduped count > raw daily_metrics
         const formatted = (data || []).map(row => {
             const dateStr = String(row.date).substring(0, 10);
             const mmddyyyy = dateStr.replace(/(\d{4})-(\d{2})-(\d{2})/, '$2/$3/$1');
             const deduped = dedupMap[dateStr] || {};
             const hasDedup = Object.keys(deduped).length > 0;
             const ov = row.overrides || {};
-            // Once dedup has run for a date (hasDedup), it is authoritative for
-            // every event-type field. A missing key means 0 events — never fall
-            // through to the raw daily_metrics column, which can be ahead of
-            // dedup briefly (causing the today-row to flicker high → low) or
-            // contain stale/legacy values from batch upserts.
-            const DEDUP_COLS = new Set([
-                'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
-                'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_postwebinar', 'purchases_cpa',
-                'stayed_45', 'stayed_60', 'stayed_80',
-            ]);
-            const pick = (field) => {
-                // Overrides (admin manual edits) win — but only apply to the
-                // 'all' view since they're variant-blind totals.
-                if (variant === 'all' && ov[field] !== undefined) return ov[field];
+            const isFinalized = !!row.finalized_at;
+            // Resolve one event field for a given variant bucket.
+            //   - 'all' view: admin override wins; finalized days use the canonical
+            //     column (durable — survives event pruning); otherwise live dedup.
+            //   - A/B/undetected: always live dedup (canonical is variant-blind).
+            // Once dedup has run for a date, a missing key means 0 events — never
+            // fall through to the raw column (which can be briefly ahead of dedup).
+            const pickV = (field, vnt) => {
+                if (vnt === 'all') {
+                    if (ov[field] !== undefined) return ov[field];
+                    if (isFinalized && DEDUP_COLS.has(field)) return Number(row[field]) || 0;
+                }
                 const dd = deduped[field];
-                if (dd !== undefined) return dd[variant] ?? 0;
+                if (dd !== undefined) return dd[vnt] ?? 0;
                 if (hasDedup && DEDUP_COLS.has(field)) return 0;
-                // For variant filtering, canonical row values are totals across
-                // all variants — not meaningful for a single-variant view.
-                if (variant !== 'all' && DEDUP_COLS.has(field)) return 0;
+                if (vnt !== 'all' && DEDUP_COLS.has(field)) return 0;
                 return row[field];
             };
-            return {
+            // Build the per-bucket event-count fields incl. derived purchase totals.
+            const buildVals = (vnt) => {
+                const o = {
+                    registrations: pickV('registrations', vnt),
+                    replays: pickV('replays', vnt),
+                    viewedcta: pickV('viewedcta', vnt),
+                    clickedcta: pickV('clickedcta', vnt),
+                    purchases_fb: pickV('purchases_fb', vnt),
+                    purchases_native: pickV('purchases_native', vnt),
+                    purchases_youtube: pickV('purchases_youtube', vnt),
+                    purchases_aibot: pickV('purchases_aibot', vnt),
+                    purchases_postwebinar: pickV('purchases_postwebinar', vnt),
+                    purchases_cpa: pickV('purchases_cpa', vnt),
+                    stayed_45: pickV('stayed_45', vnt),
+                    stayed_60: pickV('stayed_60', vnt),
+                    stayed_80: pickV('stayed_80', vnt),
+                    attended: pickV('attended', vnt),
+                };
+                const tp = PURCHASE_SUB.reduce((s, k) => s + (o[k] || 0), 0);
+                o.total_purchases = tp;
+                o.purchases = tp; // alias for backward-compat custom formulas
+                return o;
+            };
+            // Non-expanded: top level reflects the requested `variant` (default 'all').
+            // Expanded: top level is 'all' and we attach the per-variant breakdown.
+            const topVariant = expandVariants ? 'all' : variant;
+            const out = {
                 date: mmddyyyy,
                 day: row.day_of_week,
+                // fb_spend & fb_link_clicks have no A/B dimension — always the day total.
                 fb_spend: ov.fb_spend !== undefined ? ov.fb_spend : Number(row.fb_spend),
                 fb_link_clicks: ov.fb_link_clicks !== undefined ? ov.fb_link_clicks : Number(row.fb_link_clicks || 0),
-                registrations: pick('registrations'),
-                replays: pick('replays'),
-                viewedcta: pick('viewedcta'),
-                clickedcta: pick('clickedcta'),
-                purchases_fb: pick('purchases_fb'),
-                purchases_native: pick('purchases_native'),
-                purchases_youtube: pick('purchases_youtube'),
-                purchases_aibot: pick('purchases_aibot'),
-                purchases_postwebinar: pick('purchases_postwebinar'),
-                purchases_cpa: pick('purchases_cpa'),
-                stayed_45: pick('stayed_45'),
-                stayed_60: pick('stayed_60'),
-                stayed_80: pick('stayed_80'),
-                total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
-                                 (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
-                                 (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0),
-                // 'purchases' is an alias for total_purchases (backward compat for custom formulas)
-                purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
-                           (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) +
-                           (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0),
-                attended: pick('attended'),
+                ...buildVals(topVariant),
                 created_at: row.created_at,
                 updated_at: row.updated_at,
             };
+            if (expandVariants) {
+                out.variants = { A: buildVals('A'), B: buildVals('B'), undetected: buildVals('undetected') };
+            }
+            return out;
         });
 
         const response = { data: formatted, total: count };
 
-        // ── Store in response cache (only for default pagination) ────────
+        // ── Store in response cache (default pagination only) ────────────
         // Skip the write if an invalidation ran mid-flight — the response
         // we just built reflects pre-invalidation Supabase state and would
         // mask the new data for up to metricsTTL.
-        if (variant === 'all' && Number(limit) === 90 && Number(offset) === 0) {
-            if (bucket.invalidationEpoch === epochAtStart) {
+        if (isDefaultPage && bucket.invalidationEpoch === epochAtStart) {
+            if (expandVariants) {
+                bucket.metricsResponseExpanded = response;
+                bucket.metricsExpandedUpdatedAt = now;
+            } else if (variant === 'all') {
                 bucket.metricsResponse = response;
                 bucket.metricsUpdatedAt = now;
-            } else {
-                console.log(`⚠️  Cache[${funnel}]: skipped metricsResponse write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${bucket.invalidationEpoch})`);
             }
+        } else if (isDefaultPage) {
+            console.log(`⚠️  Cache[${funnel}]: skipped metrics response write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${bucket.invalidationEpoch})`);
         }
 
         res.json(response);
@@ -2061,7 +2193,9 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
         const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
         if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
 
-        const { table = 'events', dateFrom, dateTo, eventType, search, sortBy, sortDir = 'desc', limit = 500 } = req.body;
+        const { table = 'events', dateFrom, dateTo, eventType, search, sortBy, sortDir = 'desc', limit = 500, variant: variantRaw } = req.body;
+        // Optional split-test variant filter: 'A' | 'B' | 'undetected' (else all)
+        const variantFilter = ['A', 'B', 'undetected'].includes(String(variantRaw)) ? String(variantRaw) : null;
 
         // Only allow querying safe tables
         const ALLOWED_TABLES = ['events', 'daily_metrics', 'dashboard'];
@@ -2073,6 +2207,9 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
             const fetchFrom = dateFrom || '2020-01-01';
             const fetchTo = dateTo || dateToISO(getLADate());
             const events = await fetchEventsForDateRange(req.funnel, fetchFrom, fetchTo);
+            // Same variant attribution the dashboard uses (incl. the A/B test start
+            // cutoff), so a variant filter here matches the dashboard's per-variant counts.
+            const variantOf = buildVariantResolver(events, await getAbTestStart(req.funnel));
 
             // Apply the same dedup logic as computeDedupFromEvents, but keep the winning rows
             const seen = {}; // key: "YYYY-MM-DD|eventKey|userKey" → first event
@@ -2113,9 +2250,14 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
                 if (seen[dedupKey]) continue;
                 seen[dedupKey] = true;
 
+                // Variant filter (matches the dashboard's per-variant attribution)
+                const variant = variantOf(ev);
+                if (variantFilter && variant !== variantFilter) continue;
+
                 dedupedEvents.push({
                     dashboard_date: dashDate,
                     event_type: ev.event_type,
+                    variant,
                     source: ev.event_type === 'purchases' ? (ev.metadata?.source || 'Paid Ads') : null,
                     name: ev.name,
                     email: ev.email,
@@ -2152,6 +2294,11 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
             if (dateFrom) query = query.gte('event_time', toLA_UTC(dateFrom, '00:00:00'));
             if (dateTo) query = query.lte('event_time', toLA_UTC(dateTo, '23:59:59'));
             if (eventType) query = query.eq('event_type', eventType);
+            // Raw events carry the variant they arrived with (own tag). 'undetected'
+            // here = no variant in the payload. (For dashboard-attributed variant —
+            // incl. forward-only inheritance — use the Dashboard table.)
+            if (variantFilter === 'A' || variantFilter === 'B') query = query.eq('metadata->>variant', variantFilter);
+            else if (variantFilter === 'undetected') query = query.is('metadata->>variant', null);
             if (search) query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
             query = query.order(sortBy || 'event_time', { ascending: sortDir === 'asc' });
         } else if (table === 'daily_metrics') {
@@ -2424,6 +2571,112 @@ async function getJourneyFunnel(funnel, from, to) {
     };
 }
 
+// A/B split-test funnel: distinct people per stage, broken down by variant
+// (A / B / undetected), with stage-to-stage conversion %. Attribution mirrors the
+// dashboard (buildVariantResolver): own-tag-first (registrations + Stealth-stamped
+// downstream), untagged registration → undetected, untagged downstream inherits the
+// registrant's variant forward-only (email→phone). Honors the A/B test start cutoff:
+// events before it (pre-launch test traffic) are 'undetected'. Optional date range
+// filters which EVENTS count.
+async function getVariantFunnel(funnel, from, to) {
+    const supabase = clientFor(funnel);
+    const abCutoff = await getAbTestStart(funnel);
+    const cutoffIso = abCutoff ? new Date(abCutoff).toISOString() : null;
+    const regCutoff = cutoffIso ? ` AND event_time >= '${cutoffIso}'` : '';
+    const evCutoffCase = cutoffIso ? `WHEN e.event_time < '${cutoffIso}' THEN 'undetected'\n                   ` : '';
+    let evWhere = '(e.email IS NOT NULL OR e.phone IS NOT NULL)';
+    if (from) evWhere += ` AND e.event_time >= '${String(from).replace(/'/g, '')}T00:00:00-08:00'`;
+    if (to)   evWhere += ` AND e.event_time < ('${String(to).replace(/'/g, '')}T00:00:00-08:00'::timestamptz + interval '1 day')`;
+    // last-10-digits phone key (NULL if <10 digits) — mirrors normalizePhoneKey()
+    const phoneKey = (col) => `(CASE WHEN length(regexp_replace(coalesce(${col},''),'[^0-9]','','g')) >= 10 THEN right(regexp_replace(coalesce(${col},''),'[^0-9]','','g'),10) END)`;
+    // Person key for distinct counting: email if present, else phone (matches the
+    // dashboard's email||phone dedup key so phone-only buyers are still counted).
+    const personKey = `coalesce(nullif(lower(e.email),''), ${phoneKey('e.phone')})`;
+    const sql = `WITH reg_v AS (
+        SELECT lower(email) AS email_key, ${phoneKey('phone')} AS phone_key,
+               upper(trim(metadata->>'variant')) AS variant, event_time
+        FROM events
+        WHERE event_type='registrations'
+          AND upper(trim(coalesce(metadata->>'variant',''))) IN ('A','B')${regCutoff}
+    ), email_map AS (
+        SELECT DISTINCT ON (email_key) email_key, variant, event_time AS since FROM reg_v
+        WHERE email_key IS NOT NULL AND email_key <> '' ORDER BY email_key, event_time ASC
+    ), phone_map AS (
+        SELECT DISTINCT ON (phone_key) phone_key, variant, event_time AS since FROM reg_v
+        WHERE phone_key IS NOT NULL ORDER BY phone_key, event_time ASC
+    ), ev AS (
+        SELECT e.event_type, ${personKey} AS person_key,
+               CASE
+                   ${evCutoffCase}-- 1) the event's OWN tag wins (any type — Stealth stamps downstream too)
+                   WHEN upper(trim(coalesce(e.metadata->>'variant',''))) IN ('A','B')
+                        THEN upper(trim(e.metadata->>'variant'))
+                   -- 2) an untagged registration never inherits
+                   WHEN e.event_type = 'registrations' THEN 'undetected'
+                   -- 3) untagged downstream: inherit via email then phone, FORWARD-ONLY
+                   --    (event must be at/after the variant was assigned)
+                   WHEN em.variant IS NOT NULL AND e.event_time >= em.since THEN em.variant
+                   WHEN pm.variant IS NOT NULL AND e.event_time >= pm.since THEN pm.variant
+                   ELSE 'undetected'
+               END AS variant
+        FROM events e
+        LEFT JOIN email_map em ON em.email_key = lower(e.email)
+        LEFT JOIN phone_map pm ON pm.phone_key = ${phoneKey('e.phone')}
+        WHERE ${evWhere}
+    )
+    SELECT variant,
+        count(DISTINCT person_key) FILTER (WHERE event_type='registrations') AS registered,
+        count(DISTINCT person_key) FILTER (WHERE event_type='attended')      AS attended,
+        count(DISTINCT person_key) FILTER (WHERE event_type='replays')       AS watched_replay,
+        count(DISTINCT person_key) FILTER (WHERE event_type='viewedcta')     AS saw_cta,
+        count(DISTINCT person_key) FILTER (WHERE event_type='clickedcta')    AS clicked_cta,
+        count(DISTINCT person_key) FILTER (WHERE event_type='purchases')     AS purchased
+      FROM ev GROUP BY variant`;
+    const { data } = await supabase.rpc('ai_run_sql', { query: sql });
+    const rows = Array.isArray(data) ? data : [];
+    const n = (v) => Number(v) || 0;
+    const pct = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : null);
+    const build = (row) => {
+        const reg = n(row.registered);
+        return {
+            stages: {
+                registered: reg, attended: n(row.attended), watched_replay: n(row.watched_replay),
+                saw_cta: n(row.saw_cta), clicked_cta: n(row.clicked_cta), purchased: n(row.purchased),
+            },
+            conversion_pct: {
+                registered_to_attended: pct(n(row.attended), reg),
+                attended_to_saw_cta: pct(n(row.saw_cta), n(row.attended)),
+                saw_to_clicked_cta: pct(n(row.clicked_cta), n(row.saw_cta)),
+                clicked_to_purchase: pct(n(row.purchased), n(row.clicked_cta)),
+                registered_to_purchase: pct(n(row.purchased), reg),
+            },
+        };
+    };
+    const variants = {};
+    for (const v of ['A', 'B', 'undetected']) {
+        variants[v] = build(rows.find(r => r.variant === v) || {});
+    }
+    // Headline A-vs-B comparison on the registered→purchase rate (the bottom-line
+    // metric for a split test). Only meaningful when both variants have registrants.
+    const aRate = variants.A.conversion_pct.registered_to_purchase;
+    const bRate = variants.B.conversion_pct.registered_to_purchase;
+    let comparison = null;
+    if (aRate !== null && bRate !== null) {
+        comparison = {
+            metric: 'registered_to_purchase_pct',
+            A: aRate, B: bRate,
+            absolute_diff_pts: Math.round((aRate - bRate) * 10) / 10,
+            relative_lift_pct: bRate > 0 ? Math.round(((aRate - bRate) / bRate) * 1000) / 10 : null,
+            leader: aRate === bRate ? 'tie' : (aRate > bRate ? 'A' : 'B'),
+        };
+    }
+    return {
+        date_from: from || null, date_to: to || null,
+        variants,
+        comparison,
+        note: "Attribution rules: (1) any event with its OWN metadata.variant ('A'/'B') uses it — registrations AND downstream events (Stealth stamps the variant on attended/CTA/purchase too). (2) An untagged registration is 'undetected' and is NEVER back-filled. (3) An untagged downstream event inherits the registrant's variant via email then phone (last-10-digits), but FORWARD-ONLY — only if it occurred at/after the variant was assigned; events predating the person's experiment entry, and purchases whose checkout email/phone never matched a tagged registration, are 'undetected'. FB spend and reg-page link clicks have NO variant dimension — do NOT compute cost-per-variant (cost/reg, CPA, ROAS) from a single variant's counts.",
+    };
+}
+
 // Live data dictionary so the AI knows the FULL shape of the journey data without
 // guessing: table columns, the inventory of events.metadata keys (+ sample values),
 // and the enum-ish values actually in use (event types, purchase sources, stages,
@@ -2458,6 +2711,11 @@ async function getJourneyDataDictionary(funnel) {
         crm_stages: stages,
         tracking_tags: tags,
         totals: totals[0] || {},
+        notes: [
+            "events.metadata.variant ('A' or 'B') is the split-test bucket. Attribution: (1) any event with its OWN variant tag uses it — registrations AND downstream events, since Stealth now stamps it on attended/CTA/purchase; (2) an untagged registration is 'undetected' and is NEVER back-filled; (3) an untagged downstream event inherits the registrant's variant via email then phone (last-10-digits), FORWARD-ONLY — only if it occurred at/after the variant was assigned. Pre-experiment events and unmatched purchases are 'undetected'.",
+            "For A/B counts/conversions use get_variant_funnel; for the LIST of people in a variant use get_journey_segment (variant:'A'). A naive `WHERE metadata->>'variant'='A'` is fine for registration ROWS but undercounts downstream events that were untagged and inherited.",
+            "FB spend (daily_metrics.fb_spend) and reg-page link clicks (fb_link_clicks) have NO variant dimension — FB reports them at account/day level — so cost-per-variant (cost/reg, CPA, ROAS) is NOT computable per A/B variant.",
+        ],
     };
     bucket.dataDictionary = dict;
     bucket.dataDictionaryAt = now;
@@ -2485,6 +2743,10 @@ async function getJourneySegment(funnel, params) {
     for (const s of (Array.isArray(p.not_reached_stages) ? p.not_reached_stages : [])) { const c = mapStage(s); if (c) conds.push(`NOT ${c}`); }
     if (p.webinar_slot) conds.push(`email_key IN (SELECT lower(email) FROM events WHERE event_type='registrations' AND metadata->>'webinar_datetime_utc' ILIKE '%${esc(p.webinar_slot)}%' AND email IS NOT NULL)`);
     if (p.purchase_source) conds.push(`email_key IN (SELECT lower(email) FROM events WHERE event_type='purchases' AND metadata->>'source' ILIKE '${esc(p.purchase_source)}' AND email IS NOT NULL)`);
+    if (p.variant && ['A', 'B'].includes(String(p.variant).toUpperCase())) {
+        const vv = String(p.variant).toUpperCase();
+        conds.push(`email_key IN (SELECT lower(email) FROM events WHERE event_type='registrations' AND upper(trim(coalesce(metadata->>'variant',''))) = '${vv}' AND email IS NOT NULL)`);
+    }
     const dfrom = /^\d{4}-\d{2}-\d{2}$/.test(p.registered_from || '') ? p.registered_from : null;
     const dto = /^\d{4}-\d{2}-\d{2}$/.test(p.registered_to || '') ? p.registered_to : null;
     if (dfrom || dto) {
@@ -2616,7 +2878,7 @@ const INSIGHTS_TOOLS = [
     },
     {
         name: 'run_sql',
-        description: 'Run a read-only SQL query against the funnel\'s schema. Use this as an escape hatch for analytical questions the other tools don\'t cover — joins, grouping by day-of-week, filtering by arbitrary event attributes, per-person journeys, etc. Tables/views: daily_metrics; events (one row per funnel action — columns id, event_type ∈ registrations/attended/replays/viewedcta/clickedcta/purchases/stayeduntil, name, email, phone, event_time, metadata jsonb); metadata holds webinar_datetime_utc (text like "April 11th 2026, 10:00:00 pm"), source (purchase source), stayeduntil; crm_people (ONE ROW PER PERSON by email, merging shumard.js tracking + events — columns email, name, phone, stage, is_tracked, has_registration/has_attended/has_replay/has_viewedcta/has_clickedcta/has_purchase, event_count, attribution jsonb, tags, first_seen, last_activity); tracking_contacts / tracking_page_visits / tracking_tag_events (per-person attribution, page journey, tag fires); custom_metrics; dashboard_lenses. Examples: busiest webinar slots → SELECT metadata->>\'webinar_datetime_utc\', count(*) FROM events WHERE event_type=\'registrations\' GROUP BY 1 ORDER BY 2 DESC; registrations by weekday → GROUP BY to_char(event_time AT TIME ZONE \'America/Los_Angeles\',\'Day\'). STRICT RULES: single SELECT or WITH statement; no INSERT/UPDATE/DELETE/DDL; results capped at 500 rows and 5-second timeout. Runs in the active funnel\'s schema (no need to prefix table names).',
+        description: 'Run a read-only SQL query against the funnel\'s schema. Use this as an escape hatch for analytical questions the other tools don\'t cover — joins, grouping by day-of-week, filtering by arbitrary event attributes, per-person journeys, etc. Tables/views: daily_metrics; events (one row per funnel action — columns id, event_type ∈ registrations/attended/replays/viewedcta/clickedcta/purchases/stayeduntil, name, email, phone, event_time, metadata jsonb); metadata holds webinar_datetime_utc (text like "April 11th 2026, 10:00:00 pm"), source (purchase source), stayeduntil, variant (A/B split-test bucket — present on registrations AND, going forward, on downstream events (Stealth-stamped); a registration counts under its OWN tag (untagged=undetected, never back-filled), and an untagged downstream event inherits the registrant\'s variant forward-only via email/phone; prefer the get_variant_funnel tool for A/B splits, or get_journey_segment with variant:"A" for the people list, rather than filtering metadata->>\'variant\' directly); crm_people (ONE ROW PER PERSON by email, merging shumard.js tracking + events — columns email, name, phone, stage, is_tracked, has_registration/has_attended/has_replay/has_viewedcta/has_clickedcta/has_purchase, event_count, attribution jsonb, tags, first_seen, last_activity); tracking_contacts / tracking_page_visits / tracking_tag_events (per-person attribution, page journey, tag fires); custom_metrics; dashboard_lenses. Examples: busiest webinar slots → SELECT metadata->>\'webinar_datetime_utc\', count(*) FROM events WHERE event_type=\'registrations\' GROUP BY 1 ORDER BY 2 DESC; registrations by weekday → GROUP BY to_char(event_time AT TIME ZONE \'America/Los_Angeles\',\'Day\'). STRICT RULES: single SELECT or WITH statement; no INSERT/UPDATE/DELETE/DDL; results capped at 500 rows and 5-second timeout. Runs in the active funnel\'s schema (no need to prefix table names).',
         input_schema: {
             type: 'object',
             properties: {
@@ -2658,6 +2920,17 @@ const INSIGHTS_TOOLS = [
         },
     },
     {
+        name: 'get_variant_funnel',
+        description: 'A/B SPLIT-TEST results: the funnel as distinct people per stage (registered → attended → watched_replay → saw_cta → clicked_cta → purchased) broken down by variant A, B, and undetected, plus per-variant stage-to-stage conversion % and a headline A-vs-B comparison on the registered→purchase rate (absolute point diff + relative lift + leader). Use for ANY split-test / A/B / "variant A vs B" question. It does the variant attribution correctly: a person\'s variant is their FIRST registration\'s metadata.variant, inherited by all their later events via email (or phone when the email doesn\'t match — e.g. a purchase under a different checkout email) — a naive WHERE metadata->>\'variant\'=\'A\' on purchases/attendance would undercount. NOTE: FB spend and reg-page link clicks cannot be split by variant, so this tool reports conversion rates only, not cost-per-variant.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                date_from: { type: 'string', description: 'Inclusive start date (YYYY-MM-DD), optional — filters which events count by event time (LA tz)' },
+                date_to:   { type: 'string', description: 'Inclusive end date (YYYY-MM-DD), optional' },
+            },
+        },
+    },
+    {
         name: 'get_contact_journey',
         description: 'One person\'s COMPLETE journey by email or contact_id: identity, attribution, current stage, and a single chronological timeline merging their page views, tag fires, and funnel events (registered/attended/CTA/purchase). Use for "show me what <email> did", sample buyer paths, or auditing a specific person. Returns PII (name/email/phone) for that one contact.',
         input_schema: {
@@ -2675,7 +2948,7 @@ const INSIGHTS_TOOLS = [
     },
     {
         name: 'get_journey_segment',
-        description: 'List the actual PEOPLE matching journey criteria — e.g. "registered but never attended" (reached_stages:["registration"], not_reached_stages:["attended"]), "buyers from the May 10 webinar" (reached_stages:["purchase"], webinar_slot:"May 10"), "attended but didn\'t buy". Returns a capped list with email, name, phone, and stage. Use when the user wants WHO matches a segment; for counts only, prefer get_journey_funnel. Returns PII for the matched people.',
+        description: 'List the actual PEOPLE matching journey criteria — e.g. "registered but never attended" (reached_stages:["registration"], not_reached_stages:["attended"]), "buyers from the May 10 webinar" (reached_stages:["purchase"], webinar_slot:"May 10"), "everyone who registered in split-test variant A" (reached_stages:["registration"], variant:"A"). Returns a capped list with email, name, phone, and stage. Use when the user wants WHO matches a segment (the people, not just counts) — including the full roster of registrants in a variant. For counts/conversions prefer get_journey_funnel or get_variant_funnel. Returns PII for the matched people.',
         input_schema: {
             type: 'object',
             properties: {
@@ -2683,6 +2956,7 @@ const INSIGHTS_TOOLS = [
                 not_reached_stages: { type: 'array', items: { type: 'string' }, description: 'Stages the person must NOT have reached (e.g. ["attended"] for registrants who were no-shows).' },
                 webinar_slot:       { type: 'string', description: 'Substring of the registration webinar datetime, e.g. "May 10" or "April 11th 2026, 10:00:00 pm".' },
                 purchase_source:    { type: 'string', description: 'Restrict to people who purchased from this source, e.g. "Paid Ads", "AI Bot".' },
+                variant:            { type: 'string', description: 'Restrict to people who REGISTERED in split-test variant "A" or "B" (by the registration\'s own variant tag). Combine with reached_stages:["registration"] for the registrant roster of a variant.' },
                 registered_from:    { type: 'string', description: 'Registration date range start (YYYY-MM-DD), optional.' },
                 registered_to:      { type: 'string', description: 'Registration date range end (YYYY-MM-DD), optional.' },
                 limit:              { type: 'number', description: 'Max people to return (default 100, max 500).' },
@@ -2719,6 +2993,8 @@ async function executeInsightsTool(name, input, ctx) {
                 return await runReadOnlySQL(funnel, input.query);
             case 'get_journey_funnel':
                 return await getJourneyFunnel(funnel, input.date_from, input.date_to);
+            case 'get_variant_funnel':
+                return await getVariantFunnel(funnel, input.date_from, input.date_to);
             case 'get_contact_journey':
                 if (!input.identifier) return { error: 'identifier (email or contact_id) required' };
                 return (await buildContactJourney(clientFor(funnel), String(input.identifier))) || { error: 'No contact found for that identifier' };
@@ -2829,6 +3105,7 @@ INSTRUCTIONS:
 - For analytical questions the named tools don't cover (day-of-week patterns, hour-of-day, joins, custom aggregations), use \`run_sql\` with a SELECT. Don't be shy about it — it's the escape hatch.
 - CUSTOMER JOURNEY — you can see the funnel end to end, per person:
   • \`get_journey_funnel\` — distinct-people funnel + stage-to-stage conversion/drop-off (optionally date-ranged). Use for funnel/conversion/drop-off questions.
+  • \`get_variant_funnel\` — A/B split-test breakdown: the funnel per variant (A / B / undetected) + per-variant conversion % + a headline A-vs-B comparison on the registered→purchase rate. Use for any split-test / "variant A vs B" question. Attribution (handled for you): an event's own variant tag wins (registrations + Stealth-stamped downstream); untagged registrations are undetected; untagged downstream events inherit the registrant's variant forward-only (email→phone). For the actual LIST of people in a variant (e.g. everyone who registered in A), use \`get_journey_segment\` with variant:"A". Note: spend can't be split by variant — compare CONVERSION RATES, not cost; if asked for cost-per-variant, explain spend has no A/B dimension.
   • \`get_contact_journey\` — one person's full chronological timeline by email or contact_id. Use for "what did <email> do" or sample buyer/non-buyer paths.
   • \`get_journey_segment\` — the LIST of people matching a segment (registered-but-not-attended, buyers from a given webinar slot, attended-but-didn't-buy, etc.). Use when the user wants WHO, not just how many.
   • \`get_email_report\` — email-marketing performance by source (clicks → people → buyers → conversion %, traffic_source=email). Use for "which emails convert best".
@@ -3569,6 +3846,27 @@ app.get('/api/crm/contacts', dashboardLimiter, requireAuth, async (req, res) => 
             for (const v of vrows || []) counts[v.contact_id] = (counts[v.contact_id] || 0) + 1;
         }
         for (const r of rows) r.visit_count = r.contact_id ? (counts[r.contact_id] || 0) : 0;
+        // Flag people who have LINKED identities — merged child contacts that carry an
+        // email or phone (a different identity fused into this person). One query for
+        // this page's contacts, same pattern as visit_count (keeps the view lean).
+        const linkedParents = new Set();
+        if (ids.length) {
+            const byId = {};
+            for (const r of rows) if (r.contact_id) byId[r.contact_id] = { email: (r.email || '').toLowerCase().trim(), phone: normalizePhoneKey(r.phone) };
+            const { data: krows } = await sb.from('tracking_contacts')
+                .select('merged_into, email, phone').in('merged_into', ids);
+            for (const k of krows || []) {
+                const p = byId[k.merged_into]; if (!p) continue;
+                const ce = (k.email || '').toLowerCase().trim();
+                const cp = normalizePhoneKey(k.phone);
+                // A real linked identity = a DIFFERENT EMAIL. Same email = same person
+                // (journey already merged), so it never counts — even if a duplicate
+                // contact carried a different phone. No-email child links only by phone.
+                const differs = ce ? (ce !== p.email) : (!!cp && cp !== p.phone);
+                if (differs) linkedParents.add(k.merged_into);
+            }
+        }
+        for (const r of rows) r.has_linked = r.contact_id ? linkedParents.has(r.contact_id) : false;
         res.json({ data: rows, total: count || 0 });
     } catch (err) {
         console.error('❌ GET /api/crm/contacts error:', err.message);
@@ -3622,27 +3920,87 @@ async function buildContactJourney(sb, raw) {
     }
     if (!contactId && !email) return null;
 
-    // Three timeline sources: page views + tag fires (by contact_id), funnel events (by email).
-    const [{ data: visits }, { data: tags }, { data: events }] = await Promise.all([
-        contactId ? sb.from('tracking_page_visits').select('*').eq('contact_id', contactId).order('timestamp', { ascending: true }).limit(1000) : Promise.resolve({ data: [] }),
-        contactId ? sb.from('tracking_tag_events').select('*').eq('contact_id', contactId).order('timestamp', { ascending: true }).limit(500) : Promise.resolve({ data: [] }),
-        email ? sb.from('events').select('*').ilike('email', email).order('event_time', { ascending: true }).limit(1000) : Promise.resolve({ data: [] }),
-    ]);
+    // ── Gather the full identity cluster: the root tracked contact + every contact
+    //    merged INTO it (the stitch engine fuses by session_id / email / IP-window).
+    //    This lets someone who registered under one email and purchased under another
+    //    — linked by same browser/IP — read as ONE person/journey. Note: an alias
+    //    email only links here if shumard.js actually captured it as a contact and the
+    //    stitch merged it; a purchase email never seen by the tracker still won't link.
+    let clusterContacts = contact ? [contact] : [];
+    if (contactId) {
+        const { data: kids } = await sb.from('tracking_contacts')
+            .select('*').eq('merged_into', contactId).limit(200);
+        clusterContacts = clusterContacts.concat(kids || []);
+    }
+    const clusterIds = [...new Set(clusterContacts.map(c => c.contact_id).filter(Boolean))];
+    const clusterEmails = [...new Set(
+        clusterContacts.map(c => (c.email || '').toLowerCase()).filter(Boolean)
+            .concat(email ? [email.toLowerCase()] : [])
+    )];
+
+    // Timeline sources: page views + tag fires for ALL cluster contact_ids; funnel
+    // events for ALL cluster emails (one ilike fetch per alias email, then merged).
+    const visitQ = clusterIds.length
+        ? sb.from('tracking_page_visits').select('*').in('contact_id', clusterIds).order('timestamp', { ascending: true }).limit(2000)
+        : Promise.resolve({ data: [] });
+    const tagQ = clusterIds.length
+        ? sb.from('tracking_tag_events').select('*').in('contact_id', clusterIds).order('timestamp', { ascending: true }).limit(1000)
+        : Promise.resolve({ data: [] });
+    const eventQ = clusterEmails.length
+        ? Promise.all(clusterEmails.map(e => sb.from('events').select('*').ilike('email', e).limit(1000)))
+            .then(rs => ({ data: rs.flatMap(r => r.data || []) }))
+        : Promise.resolve({ data: [] });
+    const [{ data: visits }, { data: tags }, { data: rawEvents }] = await Promise.all([visitQ, tagQ, eventQ]);
+
+    // De-dupe events (the same email could appear once; guards accidental overlap).
+    const seenEv = new Set();
+    const events = (rawEvents || []).filter(e => {
+        const k = e.id ?? `${e.event_type}|${(e.email || '').toLowerCase()}|${e.event_time}`;
+        if (seenEv.has(k)) return false; seenEv.add(k); return true;
+    }).sort((a, b) => new Date(a.event_time) - new Date(b.event_time));
 
     const timeline = [];
     for (const v of (visits || [])) timeline.push({ ts: v.timestamp, kind: 'pageview', label: v.page_title || 'Page view', url: v.current_url, referrer: v.referrer_url || null });
     for (const t of (tags || [])) timeline.push({ ts: t.timestamp, kind: 'tag', label: CRM_EVENT_LABELS[t.tag] || t.tag, tag: t.tag, url: t.current_url || null });
-    for (const e of (events || [])) {
+    for (const e of events) {
         let label = CRM_EVENT_LABELS[e.event_type] || e.event_type;
         if (e.event_type === 'stayeduntil' && e.metadata && e.metadata.stayeduntil) label = `Stayed ${e.metadata.stayeduntil}m`;
         if (e.event_type === 'purchases' && e.metadata && e.metadata.source) label = `Purchased (${e.metadata.source})`;
-        timeline.push({ ts: e.event_time, kind: 'event', event_type: e.event_type, label, source: (e.metadata && e.metadata.source) || null });
+        timeline.push({ ts: e.event_time, kind: 'event', event_type: e.event_type, label, source: (e.metadata && e.metadata.source) || null, email: e.email || null });
     }
     timeline.sort((a, b) => new Date(a.ts) - new Date(b.ts));
 
-    const types = new Set((events || []).map((e) => e.event_type));
-    const evName = (events || []).map((e) => e.name).find(Boolean) || null;
-    const evPhone = (events || []).map((e) => e.phone).find(Boolean) || null;
+    const types = new Set(events.map((e) => e.event_type));
+    const evName = events.map((e) => e.name).find(Boolean) || null;
+    const evPhone = events.map((e) => e.phone).find(Boolean) || null;
+
+    // Linked identities = the OTHER identities fused into this person: tracked alias
+    // contacts in the cluster, plus any distinct funnel-event email that isn't the
+    // primary (e.g. a purchase made under a different checkout email).
+    const primaryEmail = ((contact && contact.email) || email || '').toLowerCase().trim();
+    const primaryPhone = normalizePhoneKey((contact && contact.phone) || evPhone);
+    const linkedMap = new Map();
+    const addLinked = (em, ph, cid, tracked) => {
+        // A linked identity = a DIFFERENT EMAIL (a genuine second identity). Same email
+        // is the same person — their journey is already merged here — so never list it,
+        // even if a duplicate contact carried a different phone. A contact with NO email
+        // is linked only via a different phone.
+        const e = (em || '').toLowerCase().trim();
+        const p = normalizePhoneKey(ph);
+        const differs = e ? (e !== primaryEmail) : (!!p && p !== primaryPhone);
+        if (!differs) return;
+        const key = e || p;
+        if (!linkedMap.has(key)) linkedMap.set(key, { email: em || null, phone: ph || null, contact_id: cid || null, tracked: !!tracked });
+    };
+    for (const cc of clusterContacts) {
+        if (cc.contact_id === contactId) continue; // skip the primary/root
+        addLinked(cc.email, cc.phone, cc.contact_id, true);
+    }
+    for (const e of events) {
+        const le = (e.email || '').toLowerCase();
+        if (le && le !== primaryEmail) addLinked(e.email, e.phone, null, false);
+    }
+    const linked = [...linkedMap.values()];
 
     return {
         contact: {
@@ -3662,8 +4020,9 @@ async function buildContactJourney(sb, raw) {
         },
         timeline,
         visits: visits || [],
-        events: events || [],
-        stats: { visit_count: (visits || []).length, event_count: (events || []).length, tag_count: (tags || []).length },
+        events,
+        linked,
+        stats: { visit_count: (visits || []).length, event_count: events.length, tag_count: (tags || []).length, linked_count: linked.length },
     };
 }
 
