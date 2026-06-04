@@ -69,6 +69,12 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Failed: ${res.status}`); }
     return res.json();
   },
+  async linkIdentity(body) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/crm/link`, { method: "POST", headers, body: JSON.stringify(body) });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Failed: ${res.status}`); }
+    return res.json();
+  },
   async upsertMetric(entry) {
     const headers = await getAuthHeaders();
     const res = await fetch(`${API_BASE}/api/metrics`, {
@@ -613,6 +619,16 @@ export default function App() {
   const clearAbTest = async () => {
     try { const r = await api.setAbTestStart({ start: null }); setAbTestStartState(r.start || null); await loadData(); flash("Cleared — counting all variant data"); }
     catch (e) { flash(e.message, "err"); }
+  };
+  // Admin: link a sale/event (alias email) to its real registrant so it counts in the
+  // correct variant. Recomputes the dashboard afterward.
+  const linkSaleToRegistrant = async (aliasEmail, canonicalEmail) => {
+    try {
+      const r = await api.linkIdentity({ alias_email: aliasEmail, canonical_email: canonicalEmail });
+      flash(`Linked ${aliasEmail} → ${canonicalEmail}${r.variant ? ` · counts as variant ${r.variant}` : " (registrant has no variant yet)"}`);
+      loadData();
+      if (view === "crm") loadCrm();
+    } catch (e) { flash(e.message, "err"); }
   };
 
   // When the active funnel changes (post-mount), refetch role + data + lenses.
@@ -1469,7 +1485,7 @@ export default function App() {
       {delCM && <Modal title="Delete Custom Metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
       {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
       {colEditorOpen && <ColumnEditor columns={orderedCols.filter(c => c.type !== "base" || isColVisible(c.key))} isAdmin={isAdmin} onSave={(keys) => { saveColOrder(keys); setColEditorOpen(false); }} onCancel={() => setColEditorOpen(false)} />}
-      {crmContact && <CrmContactModal contact={crmContact} tab={crmContactTab} setTab={setCrmContactTab} onClose={() => setCrmContact(null)} />}
+      {crmContact && <CrmContactModal contact={crmContact} tab={crmContactTab} setTab={setCrmContactTab} onClose={() => setCrmContact(null)} isAdmin={isAdmin} onLink={linkSaleToRegistrant} />}
       {emailDrill && <EmailDrillModal drill={emailDrill} loading={emailDrillLoading} onClose={() => setEmailDrill(null)} onOpenContact={(idf) => { setEmailDrill(null); openCrmContact({ email: idf }); }} />}
       {summaryEditorOpen && <SummaryEditor cards={summaryCards} customs={customs} onSave={(cards) => { saveSummaryCards(cards); setSummaryEditorOpen(false); flash("Summary cards updated"); }} onCancel={() => setSummaryEditorOpen(false)} />}
       {toast && (<div className="fi" style={{ ...S.toast, borderLeft: `3px solid ${toast.type === "ok" ? "#12864A" : "#D92D20"}` }}><I d={toast.type === "ok" ? "M20 6L9 17l-5-5" : "M12 2a10 10 0 100 20 10 10 0 000-20zM12 8v4M12 16h.01"} size={16} stroke={toast.type === "ok" ? "#12864A" : "#D92D20"} sw={2.2} />{toast.msg}</div>)}
@@ -1804,7 +1820,7 @@ function CrmDetailRows({ rows }) {
     </div>
   );
 }
-function CrmContactModal({ contact, tab, setTab, onClose }) {
+function CrmContactModal({ contact, tab, setTab, onClose, isAdmin, onLink }) {
   const c = contact.contact || {};
   const timeline = contact.timeline || [];
   const visits = contact.visits || [];
@@ -1812,6 +1828,15 @@ function CrmContactModal({ contact, tab, setTab, onClose }) {
   const linked = contact.linked || [];
   const attr = c.attribution || {};
   const title = c.name || c.email || "Contact";
+  const hasPurchase = events.some(e => e.event_type === "purchases");
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [linkTo, setLinkTo] = useState("");
+  const submitLink = () => {
+    const canon = linkTo.trim().toLowerCase();
+    if (!canon || !c.email) return;
+    onLink(c.email, canon);
+    setLinkOpen(false); setLinkTo("");
+  };
   return (
     <div style={S.overlay} onClick={onClose}>
       <div style={{ ...S.modal, maxWidth: 720, width: "92%", maxHeight: "85vh", padding: 0, textAlign: "left", display: "flex", flexDirection: "column", overflow: "hidden" }} onClick={e => e.stopPropagation()}>
@@ -1828,6 +1853,19 @@ function CrmContactModal({ contact, tab, setTab, onClose }) {
               {c.email && <span>{c.email}</span>}
               {c.phone && <span>{c.phone}</span>}
             </div>
+            {isAdmin && c.email && (
+              <div style={{ marginTop: 10 }}>
+                {!linkOpen ? (
+                  <button style={{ ...S.btnLight, padding: "4px 10px", fontSize: 12 }} onClick={() => setLinkOpen(true)} title="Attribute this person's events (e.g. a sale that came in under a different email) to their real registrant, so it counts in the correct A/B variant.">🔗 Link to registrant</button>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                    <input autoFocus style={{ ...S.inp, padding: "6px 10px", fontSize: 12, minWidth: 240, width: "auto" }} placeholder="registrant email to attribute to…" value={linkTo} onChange={e => setLinkTo(e.target.value)} onKeyDown={e => { if (e.key === "Enter") submitLink(); }} />
+                    <button style={{ ...S.btnDark, padding: "6px 12px", fontSize: 12 }} onClick={submitLink} disabled={!linkTo.trim()}>Link</button>
+                    <button style={{ ...S.btnGhost, padding: "6px 8px", fontSize: 12 }} onClick={() => { setLinkOpen(false); setLinkTo(""); }}>Cancel</button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
           <button style={S.btnGhost} onClick={onClose}><I d="M6 18L18 6M6 6l12 12" size={18} stroke="#6B7280" /></button>
         </div>

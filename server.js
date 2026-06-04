@@ -160,6 +160,136 @@ async function getAbTestStart(funnel) {
     return b.abTestStart;
 }
 
+// Manual identity links for a funnel: { aliasEmailLower -> canonicalEmailLower }. Lets
+// an admin attribute a sale that arrived under a different email to the right
+// registrant (so it counts in the correct variant). Cached on the bucket; cleared when
+// a link changes. Missing table degrades to {} (no links).
+async function getIdentityLinks(funnel) {
+    const b = getCacheBucket(funnel);
+    if (b.identityLinks !== undefined) return b.identityLinks;
+    const map = {};
+    try {
+        const { data } = await clientFor(funnel).from('identity_links').select('alias_email, canonical_email');
+        for (const r of data || []) {
+            const a = (r.alias_email || '').toLowerCase().trim();
+            const c = (r.canonical_email || '').toLowerCase().trim();
+            if (a && c && a !== c) map[a] = c;
+        }
+    } catch { /* table missing → no links */ }
+    b.identityLinks = map;
+    return map;
+}
+
+// email (lowercased) → normalized phone, harvested from shumard tracking_contacts. Lets
+// variant matching use the phone WE TRACKED even when the funnel webhook event carried
+// none (e.g. a checkout that posted only email + name) — the whole point of tracking the
+// phone. Cached briefly on the bucket (refreshes on the metrics cadence).
+async function getTrackingPhones(funnel) {
+    const b = getCacheBucket(funnel);
+    const now = Date.now();
+    if (b.trackingPhones && (now - (b.trackingPhonesAt || 0)) < cache.metricsTTL) return b.trackingPhones;
+    const map = {};
+    try {
+        let from = 0; const page = 1000;
+        for (;;) {
+            const { data } = await clientFor(funnel).from('tracking_contacts')
+                .select('email, phone').not('phone', 'is', null).range(from, from + page - 1);
+            if (!data || !data.length) break;
+            for (const r of data) {
+                const e = (r.email || '').toLowerCase().trim();
+                const p = normalizePhoneKey(r.phone);
+                if (e && p && !(e in map)) map[e] = p;
+            }
+            if (data.length < page) break;
+            from += page;
+        }
+    } catch { /* table missing → no enrichment */ }
+    b.trackingPhones = map; b.trackingPhonesAt = now;
+    return map;
+}
+
+// Ambient-graph "variant-via-stitch": from the shumard identity graph, derive aliases
+// { otherEmail → canonicalRegistrantEmail } for emails that share a stitched identity
+// cluster (merged_into) with a tagged registrant but aren't registrants themselves.
+// This lets a purchase under a different email/phone inherit the registrant's variant
+// with NO per-funnel wiring — it rides the same cluster shumard already builds (session
+// → email → IP stitch, 3-hour window). Returns {} if the tables are absent.
+//
+// Guards against bad fan-out: only clusters that contain a tagged registrant produce
+// aliases; we map to the EARLIEST tagged registrant's email; manual links always win
+// (merged on top by getCombinedAliases). Cached on the metrics cadence.
+async function getStitchAliases(funnel) {
+    const b = getCacheBucket(funnel);
+    const now = Date.now();
+    if (b.stitchAliases && (now - (b.stitchAliasesAt || 0)) < cache.metricsTTL) return b.stitchAliases;
+    const aliases = {};
+    try {
+        const sb = clientFor(funnel);
+        // 1) Tagged registrants (small set) → earliest variant registration per email/phone.
+        const { data: regs } = await sb.from('events')
+            .select('email, phone, event_time, metadata')
+            .eq('event_type', 'registrations')
+            .or('metadata->>variant.eq.A,metadata->>variant.eq.B');
+        const regByEmail = {}, regByPhone = {};
+        for (const r of (regs || []).sort((a, c) => new Date(a.event_time) - new Date(c.event_time))) {
+            const e = (r.email || '').toLowerCase().trim();
+            const since = new Date(r.event_time).getTime();
+            if (e && !(e in regByEmail)) regByEmail[e] = { email: e, since };
+            const p = normalizePhoneKey(r.phone);
+            if (p && e && !(p in regByPhone)) regByPhone[p] = { email: e, since };
+        }
+        if (Object.keys(regByEmail).length === 0 && Object.keys(regByPhone).length === 0) {
+            b.stitchAliases = {}; b.stitchAliasesAt = now; return {};
+        }
+        // 2) Pull the contact graph and group emails/phones by merge-root.
+        const rows = [];
+        let from = 0; const page = 1000;
+        for (;;) {
+            const { data } = await sb.from('tracking_contacts')
+                .select('contact_id, email, phone, merged_into').range(from, from + page - 1);
+            if (!data || !data.length) break;
+            rows.push(...data);
+            if (data.length < page) break;
+            from += page;
+        }
+        const byId = {};
+        for (const r of rows) byId[r.contact_id] = r;
+        const rootOf = (id) => {
+            let cur = id; const guard = new Set();
+            while (cur && byId[cur] && byId[cur].merged_into && !guard.has(cur)) { guard.add(cur); cur = byId[cur].merged_into; }
+            return cur;
+        };
+        const clusters = {}; // rootId → { emails:Set, phones:Set }
+        for (const r of rows) {
+            const root = rootOf(r.contact_id) || r.contact_id;
+            const c = clusters[root] || (clusters[root] = { emails: new Set(), phones: new Set() });
+            const e = (r.email || '').toLowerCase().trim(); if (e) c.emails.add(e);
+            const p = normalizePhoneKey(r.phone); if (p) c.phones.add(p);
+        }
+        // 3) Per cluster: find the earliest tagged registrant member; alias the cluster's
+        //    OTHER (non-registrant) emails to that registrant's email.
+        for (const root in clusters) {
+            const c = clusters[root];
+            let best = null;
+            for (const e of c.emails) { const r = regByEmail[e]; if (r && (!best || r.since < best.since)) best = r; }
+            for (const p of c.phones) { const r = regByPhone[p]; if (r && (!best || r.since < best.since)) best = r; }
+            if (!best) continue;
+            for (const e of c.emails) {
+                if (e !== best.email && !(e in regByEmail) && !(e in aliases)) aliases[e] = best.email;
+            }
+        }
+    } catch { /* tables missing → no stitch aliases */ }
+    b.stitchAliases = aliases; b.stitchAliasesAt = now;
+    return aliases;
+}
+
+// Combined email-canonicalization map for variant attribution: ambient stitch aliases
+// (auto, from the identity graph) overlaid with manual admin links (deterministic, win).
+async function getCombinedAliases(funnel) {
+    const [stitch, manual] = await Promise.all([getStitchAliases(funnel), getIdentityLinks(funnel)]);
+    return { ...stitch, ...manual };
+}
+
 // ─── Express App ─────────────────────────────────────────────────────────────
 const app = express();
 
@@ -1194,7 +1324,7 @@ function normalizePhoneKey(phone) {
 //      phone (last-10-digits) — but FORWARD-ONLY: only if the event occurs at/after the
 //      variant was assigned (the first tagged registration's time). Earlier events, and
 //      events with no matching tagged registration, are 'undetected'.
-function buildVariantResolver(events, cutoffMs = null) {
+function buildVariantResolver(events, cutoffMs = null, aliasMap = null, emailPhones = null) {
     const sortedRegs = events
         .filter(ev => ev.event_type === 'registrations' && (ev.email || ev.phone))
         .sort((a, b) => new Date(a.event_time) - new Date(b.event_time));
@@ -1211,7 +1341,8 @@ function buildVariantResolver(events, cutoffMs = null) {
         const since = new Date(ev.event_time).getTime();
         const ek = (ev.email || '').toLowerCase();
         if (ek && !(ek in emailToVariant)) emailToVariant[ek] = { v, since };
-        const pk = normalizePhoneKey(ev.phone);
+        // Phone: the registration's own phone, else the phone we tracked for this email.
+        const pk = normalizePhoneKey(ev.phone) || (emailPhones && ek ? emailPhones[ek] : '');
         if (pk && !(pk in phoneToVariant)) phoneToVariant[pk] = { v, since };
     }
     const ownVariant = (ev) => {
@@ -1227,20 +1358,28 @@ function buildVariantResolver(events, cutoffMs = null) {
         const own = ownVariant(ev);
         if (own) return own;
         if (ev.event_type === 'registrations') return 'undetected';
-        const ek = (ev.email || '').toLowerCase();
+        // Canonicalize the email via a manual admin link (e.g. a sale under a different
+        // email mapped to its registrant) before looking up the variant.
+        const ekRaw = (ev.email || '').toLowerCase();
+        let ek = ekRaw;
+        if (aliasMap && ek && aliasMap[ek]) ek = aliasMap[ek];
         const em = ek ? emailToVariant[ek] : null;
         if (em && t >= em.since) return em.v;
-        const pk = normalizePhoneKey(ev.phone);
-        const pm = pk ? phoneToVariant[pk] : null;
-        if (pm && t >= pm.since) return pm.v;
+        // Phone candidates: the event's own phone, then the phone WE TRACKED for this
+        // email (shumard) — so a checkout that posted no phone still matches.
+        for (const pk of [normalizePhoneKey(ev.phone), emailPhones && ekRaw ? emailPhones[ekRaw] : null]) {
+            if (!pk) continue;
+            const pm = phoneToVariant[pk];
+            if (pm && t >= pm.since) return pm.v;
+        }
         return 'undetected';
     };
 }
 
 // Returns: { 'YYYY-MM-DD': { event_type: { all, A, B, undetected } } }.
 // 'all' = A + B + undetected (each person resolves to exactly one bucket).
-function computeDedupFromEvents(events, cutoffMs = null) {
-    const variantOf = buildVariantResolver(events, cutoffMs);
+function computeDedupFromEvents(events, cutoffMs = null, aliasMap = null, emailPhones = null) {
+    const variantOf = buildVariantResolver(events, cutoffMs, aliasMap, emailPhones);
 
     // ── Pass 2: bucket events into (date, event_type, variant) sets ──
     const sets = {}; // key: "YYYY-MM-DD|event_type|variant" → Set of user keys
@@ -1266,7 +1405,9 @@ function computeDedupFromEvents(events, cutoffMs = null) {
             if (!eventKey) continue; // skip events with invalid milestone
         }
 
-        const userKey = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
+        let userKey = (ev.email || '').toLowerCase();
+        if (aliasMap && userKey && aliasMap[userKey]) userKey = aliasMap[userKey]; // canonicalize linked identities
+        userKey = userKey || ev.phone || (ev.name || '').toLowerCase();
         if (!userKey) continue;
 
         const variant = variantOf(ev);
@@ -1342,6 +1483,8 @@ async function getDedupCounts(funnel, dates) {
     if (dates.length === 0) return {};
     const bucket = getCacheBucket(funnel);
     const abCutoff = await getAbTestStart(funnel); // null = count all variant data
+    const aliasMap = await getCombinedAliases(funnel); // ambient stitch + manual links
+    const emailPhones = await getTrackingPhones(funnel); // email→shumard phone enrichment
     const today = dateToISO(getLADate());
 
     // Today's dedup expires after 3 seconds to handle concurrent webhook races (#14)
@@ -1388,7 +1531,7 @@ async function getDedupCounts(funnel, dates) {
         const computedByDate = {};
         for (const [minDate, maxDate] of ranges) {
             const events = await fetchEventsForDateRange(funnel, minDate, maxDate);
-            const computed = computeDedupFromEvents(events, abCutoff);
+            const computed = computeDedupFromEvents(events, abCutoff, aliasMap, emailPhones);
 
             // Log per-day breakdown for diagnostics
             const dayCounts = {};
@@ -2207,9 +2350,10 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
             const fetchFrom = dateFrom || '2020-01-01';
             const fetchTo = dateTo || dateToISO(getLADate());
             const events = await fetchEventsForDateRange(req.funnel, fetchFrom, fetchTo);
-            // Same variant attribution the dashboard uses (incl. the A/B test start
-            // cutoff), so a variant filter here matches the dashboard's per-variant counts.
-            const variantOf = buildVariantResolver(events, await getAbTestStart(req.funnel));
+            // Same variant attribution the dashboard uses (A/B start cutoff + manual
+            // identity links), so a variant filter here matches the dashboard's counts.
+            const dashAlias = await getCombinedAliases(req.funnel);
+            const variantOf = buildVariantResolver(events, await getAbTestStart(req.funnel), dashAlias, await getTrackingPhones(req.funnel));
 
             // Apply the same dedup logic as computeDedupFromEvents, but keep the winning rows
             const seen = {}; // key: "YYYY-MM-DD|eventKey|userKey" → first event
@@ -2243,7 +2387,9 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
                 if (eventType && ev.event_type !== eventType) continue;
 
                 // Dedup: first unique user per date+eventKey wins
-                const userKey = (ev.email || '').toLowerCase() || ev.phone || (ev.name || '').toLowerCase();
+                let userKey = (ev.email || '').toLowerCase();
+                if (dashAlias && userKey && dashAlias[userKey]) userKey = dashAlias[userKey];
+                userKey = userKey || ev.phone || (ev.name || '').toLowerCase();
                 if (!userKey) continue; // anonymous events can't be deduped
 
                 const dedupKey = `${dashDate}|${eventKey}|${userKey}`;
@@ -2584,6 +2730,15 @@ async function getVariantFunnel(funnel, from, to) {
     const cutoffIso = abCutoff ? new Date(abCutoff).toISOString() : null;
     const regCutoff = cutoffIso ? ` AND event_time >= '${cutoffIso}'` : '';
     const evCutoffCase = cutoffIso ? `WHEN e.event_time < '${cutoffIso}' THEN 'undetected'\n                   ` : '';
+    // Manual sale→registrant links, inlined as a VALUES CTE (no dependency on the
+    // table existing) so an event's email canonicalizes to its linked registrant.
+    const aliasEntries = Object.entries(await getCombinedAliases(funnel));
+    const linksPrefix = aliasEntries.length
+        ? `links(alias, canon) AS (VALUES ${aliasEntries.map(([a, c]) => `('${a.replace(/'/g, "''")}','${c.replace(/'/g, "''")}')`).join(', ')}),\n    `
+        : '';
+    const canonEmail = aliasEntries.length
+        ? `coalesce((SELECT canon FROM links WHERE alias = lower(e.email)), lower(e.email))`
+        : `lower(e.email)`;
     let evWhere = '(e.email IS NOT NULL OR e.phone IS NOT NULL)';
     if (from) evWhere += ` AND e.event_time >= '${String(from).replace(/'/g, '')}T00:00:00-08:00'`;
     if (to)   evWhere += ` AND e.event_time < ('${String(to).replace(/'/g, '')}T00:00:00-08:00'::timestamptz + interval '1 day')`;
@@ -2591,13 +2746,21 @@ async function getVariantFunnel(funnel, from, to) {
     const phoneKey = (col) => `(CASE WHEN length(regexp_replace(coalesce(${col},''),'[^0-9]','','g')) >= 10 THEN right(regexp_replace(coalesce(${col},''),'[^0-9]','','g'),10) END)`;
     // Person key for distinct counting: email if present, else phone (matches the
     // dashboard's email||phone dedup key so phone-only buyers are still counted).
-    const personKey = `coalesce(nullif(lower(e.email),''), ${phoneKey('e.phone')})`;
-    const sql = `WITH reg_v AS (
-        SELECT lower(email) AS email_key, ${phoneKey('phone')} AS phone_key,
-               upper(trim(metadata->>'variant')) AS variant, event_time
-        FROM events
-        WHERE event_type='registrations'
-          AND upper(trim(coalesce(metadata->>'variant',''))) IN ('A','B')${regCutoff}
+    const personKey = `coalesce(nullif(${canonEmail},''), ${phoneKey('e.phone')})`;
+    const sql = `WITH ${linksPrefix}tc_phone AS (
+        -- email → a shumard-tracked phone (so events with no phone of their own still match)
+        SELECT DISTINCT ON (lower(email)) lower(email) AS email_key, ${phoneKey('phone')} AS phone_key
+        FROM tracking_contacts
+        WHERE email IS NOT NULL AND ${phoneKey('phone')} IS NOT NULL
+        ORDER BY lower(email)
+    ), reg_v AS (
+        SELECT lower(r.email) AS email_key,
+               coalesce(${phoneKey('r.phone')}, rtc.phone_key) AS phone_key,
+               upper(trim(r.metadata->>'variant')) AS variant, r.event_time
+        FROM events r
+        LEFT JOIN tc_phone rtc ON rtc.email_key = lower(r.email)
+        WHERE r.event_type='registrations'
+          AND upper(trim(coalesce(r.metadata->>'variant',''))) IN ('A','B')${regCutoff}
     ), email_map AS (
         SELECT DISTINCT ON (email_key) email_key, variant, event_time AS since FROM reg_v
         WHERE email_key IS NOT NULL AND email_key <> '' ORDER BY email_key, event_time ASC
@@ -2612,15 +2775,16 @@ async function getVariantFunnel(funnel, from, to) {
                         THEN upper(trim(e.metadata->>'variant'))
                    -- 2) an untagged registration never inherits
                    WHEN e.event_type = 'registrations' THEN 'undetected'
-                   -- 3) untagged downstream: inherit via email then phone, FORWARD-ONLY
-                   --    (event must be at/after the variant was assigned)
+                   -- 3) untagged downstream: inherit via email then phone (own, then the
+                   --    shumard-tracked phone for this email), FORWARD-ONLY
                    WHEN em.variant IS NOT NULL AND e.event_time >= em.since THEN em.variant
                    WHEN pm.variant IS NOT NULL AND e.event_time >= pm.since THEN pm.variant
                    ELSE 'undetected'
                END AS variant
         FROM events e
-        LEFT JOIN email_map em ON em.email_key = lower(e.email)
-        LEFT JOIN phone_map pm ON pm.phone_key = ${phoneKey('e.phone')}
+        LEFT JOIN email_map em ON em.email_key = ${canonEmail}
+        LEFT JOIN tc_phone etc ON etc.email_key = lower(e.email)
+        LEFT JOIN phone_map pm ON pm.phone_key = coalesce(${phoneKey('e.phone')}, etc.phone_key)
         WHERE ${evWhere}
     )
     SELECT variant,
@@ -3634,7 +3798,11 @@ async function ipAutoStitch(sb, contactId, clientIp, nowIso) {
             .eq('client_ip', clientIp).is('merged_into', null).eq('flagged_shared_ip', false);
         return;
     }
-    const windowStart = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    // 3-hour window: the funnel is register → ~2h webinar → checkout, so same-person
+    // sessions on one IP can be hours apart. (Still guarded by the >3-contacts shared-IP
+    // skip above and the same-user_agent check below, so strangers aren't fused.)
+    const IP_STITCH_WINDOW_MS = 3 * 60 * 60 * 1000;
+    const windowStart = new Date(Date.now() - IP_STITCH_WINDOW_MS).toISOString();
     const { data: candidates } = await sb.from('tracking_contacts')
         .select('*').eq('client_ip', clientIp).is('merged_into', null).neq('contact_id', contactId)
         .gte('created_at', windowStart).limit(10);
@@ -4034,6 +4202,96 @@ app.get('/api/crm/contacts/:id', dashboardLimiter, requireAuth, async (req, res)
     } catch (err) {
         console.error('❌ GET /api/crm/contacts/:id error:', err.message);
         res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// ─── Manual identity links (admin) — match a sale/event under one email to its
+//     real registrant so it counts in the correct A/B variant ──────────────────
+const variantOfRegistrantEmail = async (supabase, emailLower) => {
+    // The own-tag variant of this person's first tagged registration (A/B) or null.
+    const { data } = await supabase.from('events').select('event_time, metadata')
+        .eq('event_type', 'registrations').ilike('email', emailLower).order('event_time', { ascending: true });
+    for (const r of data || []) {
+        const v = String(r.metadata?.variant || '').trim().toUpperCase();
+        if (v === 'A' || v === 'B') return v;
+    }
+    return null;
+};
+
+// GET /api/crm/links — list all manual links (admin)
+app.get('/api/crm/links', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const supabase = clientFor(req.funnel);
+        const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+        const { data, error } = await supabase.from('identity_links').select('*').order('created_at', { ascending: false });
+        if (error) throw error;
+        res.json({ data: data || [] });
+    } catch (err) {
+        console.error('❌ GET /api/crm/links error:', err.message);
+        res.status(500).json({ error: 'Failed to list links (is the identity_links migration applied?)' });
+    }
+});
+
+// POST /api/crm/link — link alias_email → canonical_email (admin). The canonical must
+// be a registrant; we return its variant so the UI can confirm what the sale now counts as.
+app.post('/api/crm/link', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const supabase = clientFor(req.funnel);
+        const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
+        const alias = String(req.body?.alias_email || '').toLowerCase().trim();
+        const canonical = String(req.body?.canonical_email || '').toLowerCase().trim();
+        if (!alias || !canonical) return res.status(400).json({ error: 'alias_email and canonical_email are required' });
+        if (alias === canonical) return res.status(400).json({ error: 'alias and canonical email must differ' });
+
+        // The canonical must actually be a registrant (so it carries a variant to inherit).
+        const { count: regCount } = await supabase.from('events').select('*', { count: 'exact', head: true })
+            .eq('event_type', 'registrations').ilike('email', canonical);
+        if (!regCount) return res.status(400).json({ error: `No registration found for ${canonical} — link to the registrant's email.` });
+
+        const { error } = await supabase.from('identity_links').upsert(
+            { alias_email: alias, canonical_email: canonical, note: req.body?.note || null, created_by: req.user.id, created_at: new Date().toISOString() },
+            { onConflict: 'alias_email' });
+        if (error) throw error;
+
+        // Refresh cached links + force variant recompute.
+        const b = getCacheBucket(req.funnel);
+        b.identityLinks = undefined;
+        b.stitchAliases = undefined;
+        b.dedupCounts = {}; b.dedupTimestamps = {};
+        invalidateMetricsCache(req.funnel);
+        invalidateInsightsCache(req.funnel);
+        const variant = await variantOfRegistrantEmail(supabase, canonical);
+        console.log(`🔗 [${req.funnel}] linked ${alias} → ${canonical} (variant ${variant || 'undetected'})`);
+        res.json({ ok: true, alias_email: alias, canonical_email: canonical, variant });
+    } catch (err) {
+        console.error('❌ POST /api/crm/link error:', err.message);
+        res.status(500).json({ error: err.message || 'Failed to create link' });
+    }
+});
+
+// DELETE /api/crm/link?alias_email=... — remove a link (admin)
+app.delete('/api/crm/link', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const supabase = clientFor(req.funnel);
+        const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+        const alias = String(req.query.alias_email || '').toLowerCase().trim();
+        if (!alias) return res.status(400).json({ error: 'alias_email required' });
+        const { error } = await supabase.from('identity_links').delete().eq('alias_email', alias);
+        if (error) throw error;
+        const b = getCacheBucket(req.funnel);
+        b.identityLinks = undefined;
+        b.stitchAliases = undefined;
+        b.dedupCounts = {}; b.dedupTimestamps = {};
+        invalidateMetricsCache(req.funnel);
+        invalidateInsightsCache(req.funnel);
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('❌ DELETE /api/crm/link error:', err.message);
+        res.status(500).json({ error: err.message || 'Failed to delete link' });
     }
 });
 

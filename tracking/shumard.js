@@ -42,10 +42,29 @@
   var SESS_KEY = 'st_session_id';
   var ATTR_KEY = 'st_attribution';
 
+  /* Registrable-apex cookie domain so identity spans subdomains on OUR site
+     (e.g. drshumardworkshop.com ↔ webinar.drshumardworkshop.com ↔ /checkout).
+     Returns '' (host-only cookie, unchanged behavior) for: localhost, IPs,
+     single-label hosts, OR when running inside an iframe — third-party embeds
+     keep host scope; the parent page is the durable anchor they stitch onto.
+     Simple last-two-labels logic: correct for .com/.net-style domains (not
+     multi-part TLDs like .co.uk, which this practice doesn't use). */
+  function cookieDomainAttr() {
+    try {
+      if (store.config.isIframe) return '';
+      var h = (location.hostname || '').toLowerCase();
+      if (!h || h === 'localhost' || h.indexOf('.') === -1) return '';
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return ''; // IPv4
+      var parts = h.split('.');
+      if (parts.length < 2) return '';
+      return '; domain=.' + parts.slice(-2).join('.');
+    } catch (e) { return ''; }
+  }
+
   function setCookie(name, value, days) {
     try {
       var exp = new Date(Date.now() + days * 864e5).toUTCString();
-      document.cookie = name + '=' + encodeURIComponent(value) + '; expires=' + exp + '; path=/; SameSite=None; Secure';
+      document.cookie = name + '=' + encodeURIComponent(value) + '; expires=' + exp + '; path=/' + cookieDomainAttr() + '; SameSite=None; Secure';
     } catch (e) {}
   }
 
