@@ -227,7 +227,7 @@ const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); 
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
 const MK = ["fb_spend", "fb_link_clicks", "reg_page_visits", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "purchases_cpa", "stayed_45", "stayed_60", "stayed_80", "total_purchases", "attended"];
-const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", reg_page_visits: "Reg Page Visits", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", purchases_cpa: "CPA Traffic Funnel", stayed_45: "45 min", stayed_60: "60 min", stayed_80: "80 min", total_purchases: "Total Purchases" };
+const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", reg_page_visits: "Page Views", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", purchases_cpa: "CPA Traffic Funnel", stayed_45: "45 min", stayed_60: "60 min", stayed_80: "80 min", total_purchases: "Total Purchases" };
 const DEFAULT_HIDDEN = [];
 
 // Summary card defaults and metric options for the configurable summary strip
@@ -1162,11 +1162,11 @@ export default function App() {
                       {lenses.map(lens => (
                         <div key={lens.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 14px", cursor: "pointer", fontSize: 13, color: "#374151", fontWeight: activeLensId === lens.id ? 600 : 500, background: activeLensId === lens.id ? "#F3F4F6" : "transparent" }} onMouseEnter={e => { if (activeLensId !== lens.id) e.currentTarget.style.background = "#F9FAFB"; }} onMouseLeave={e => { if (activeLensId !== lens.id) e.currentTarget.style.background = "transparent"; }}>
                           <span style={{ flex: 1 }} onClick={() => { setActiveLensId(lens.id); setLensMenuOpen(false); }}>{lens.name}</span>
-                          {isAdmin && lens.id !== "default-all" && (
+                          {isAdmin && (
                             <>
-                              <span title="Set as default" style={{ cursor: "pointer", fontSize: 14 }} onClick={() => { setDefaultLens(lens.id); setActiveLensId(lens.id); }}>⭐</span>
-                              <span title="Edit" style={{ cursor: "pointer", fontSize: 12, color: "#6B7280" }} onClick={() => { setLensEditing({ id: lens.id, name: lens.name, metrics: [...lens.metrics] }); setLensMenuOpen(false); }}>✏️</span>
-                              <span title="Delete" style={{ cursor: "pointer", fontSize: 12, color: "#DC2626" }} onClick={() => { deleteLens(lens.id); }}>🗑️</span>
+                              {lens.id !== "default-all" && <span title="Set as default" style={{ cursor: "pointer", fontSize: 14 }} onClick={() => { setDefaultLens(lens.id); setActiveLensId(lens.id); }}>⭐</span>}
+                              <span title="Edit" style={{ cursor: "pointer", fontSize: 12, color: "#6B7280" }} onClick={() => { setLensEditing({ id: lens.id, name: lens.name, metrics: [...(lens.metrics || [])] }); setLensMenuOpen(false); }}>✏️</span>
+                              {lens.id !== "default-all" && <span title="Delete" style={{ cursor: "pointer", fontSize: 12, color: "#DC2626" }} onClick={() => { deleteLens(lens.id); }}>🗑️</span>}
                             </>
                           )}
                         </div>
@@ -1674,8 +1674,8 @@ function RegPageMapModal({ flash, onClose, onSaved }) {
               {rows.map((r, i) => (
                 <div key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
                   <input style={{ ...S.inp, flex: 1, fontSize: 13 }} placeholder="https://drshumardworkshop.com/webinar" value={r.url} onChange={e => update(i, "url", e.target.value)} />
-                  <select style={{ ...S.inp, width: 72, fontSize: 13 }} value={r.variant} onChange={e => update(i, "variant", e.target.value)}>
-                    <option value="A">A</option><option value="B">B</option>
+                  <select style={{ ...S.inp, width: 130, fontSize: 13 }} value={r.variant} onChange={e => update(i, "variant", e.target.value)}>
+                    <option value="A">A</option><option value="B">B</option><option value="undetected">Undetected</option>
                   </select>
                   <button style={{ ...S.btnGhost, padding: "6px 9px" }} onClick={() => remove(i)} title="Remove">✕</button>
                 </div>

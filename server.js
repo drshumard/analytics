@@ -290,14 +290,17 @@ async function getCombinedAliases(funnel) {
     return { ...stitch, ...manual };
 }
 
-// Landing-page → variant map (the A/B split is by URL). Keys = the reg-page URLs we
-// count for "Reg Page Visits"; values = the variant that page serves. Excludes the
-// /register entry redirect, the joinnow embed, webinar.* attendance pages, /checkout.
-// Editable per funnel via app_settings key 'reg_page_variants' (jsonb {url: "A"|"B"});
-// falls back to this default.
+// Landing-page → variant map. Keys = the reg-page URLs we COUNT for "Reg Page Visits";
+// values = "A" / "B" (that page's variant) or "undetected" (a reg page that counts in
+// 'all' but isn't part of the split, e.g. the pre-split /register entry). Excludes the
+// joinnow embed, webinar.* attendance pages, /checkout. Editable per funnel via
+// app_settings key 'reg_page_variants' (jsonb {url: "A"|"B"|"undetected"}); default below.
 const REG_PAGE_VARIANT_MAP_DEFAULT = {
     'https://drshumardworkshop.com/webinar': 'A',
     'https://drshumardworkshop.com/webinar-page': 'B',
+    // Non-variant reg page (the pre-split entry): its visitors COUNT in 'all' but land
+    // in 'undetected' (they didn't see a variant). Value 'undetected' = count-but-no-variant.
+    'https://drshumardworkshop.com/register': 'undetected',
 };
 async function getRegPageVariantMap(funnel) {
     const b = getCacheBucket(funnel);
@@ -312,9 +315,10 @@ async function getRegPageVariantMap(funnel) {
 }
 
 // Unique reg-page visitors per LA day per variant, from shumard pageviews. A person is
-// counted once per day, under the variant of the FIRST reg page they hit that day. The
-// A/B-test-start cutoff applies: a visit before it counts in the day's 'all' but as
-// 'undetected' (not a variant). Returns { 'YYYY-MM-DD': { all, A, B, undetected } }.
+// counted ONCE per day, attributed to the variant of the earliest A/B page they reached
+// that day; if they only hit a non-variant reg page (e.g. /register) or only visited
+// before the A/B-test-start cutoff, they're 'undetected' but still counted in 'all'. So
+// all = A + B + undetected (every reg-page visitor). Returns { 'YYYY-MM-DD': {all,A,B,undetected} }.
 // Independent of the FB-sourced fb_link_clicks.
 async function getRegPageVisits(funnel, dates) {
     const out = {};
@@ -328,21 +332,27 @@ async function getRegPageVisits(funnel, dates) {
     const esc = (s) => String(s).replace(/'/g, "''");
     const urlList = urls.map(u => `'${esc(u)}'`).join(',');
     const dateList = uniq.map(d => `'${esc(d)}'`).join(',');
-    const cutoffGate = cutoffIso ? `WHEN v0.ts_utc < '${cutoffIso}'::timestamptz THEN 'undetected' ` : '';
-    const variantCase = urls.map(u => `WHEN v0.url = '${esc(u)}' THEN '${map[u] === 'B' ? 'B' : 'A'}'`).join(' ');
+    // Per-visit variant: pre-cutoff → NULL (undetected); A/B pages → their variant; any
+    // other counted page (e.g. /register='undetected') → NULL. NULL = counts in 'all',
+    // bucketed undetected.
+    const cutoffGate = cutoffIso ? `WHEN timestamp < '${cutoffIso}'::timestamptz THEN NULL ` : '';
+    const variantCase = urls.filter(u => map[u] === 'A' || map[u] === 'B')
+        .map(u => `WHEN split_part(current_url,'?',1) = '${esc(u)}' THEN '${map[u]}'`).join(' ');
     const sql = `WITH v0 AS (
         SELECT (timestamp AT TIME ZONE 'America/Los_Angeles')::date AS day,
-               contact_id, timestamp AS ts_utc, split_part(current_url,'?',1) AS url
+               contact_id, timestamp AS ts_utc,
+               CASE ${cutoffGate}${variantCase} ELSE NULL END AS variant
         FROM tracking_page_visits
         WHERE contact_id IS NOT NULL
           AND split_part(current_url,'?',1) IN (${urlList})
           AND (timestamp AT TIME ZONE 'America/Los_Angeles')::date IN (${dateList})
-    ), v AS (
-        SELECT DISTINCT ON (day, contact_id) day,
-               CASE ${cutoffGate}${variantCase} ELSE 'undetected' END AS variant
-        FROM v0 ORDER BY day, contact_id, ts_utc ASC
+    ), picked AS (
+        -- one row per person/day: prefer their earliest A/B visit; else undetected
+        SELECT DISTINCT ON (day, contact_id) day, variant
+        FROM v0 ORDER BY day, contact_id, (variant IS NULL), ts_utc ASC
     )
-    SELECT day::text AS day, variant, count(*)::int AS visitors FROM v GROUP BY day, variant`;
+    SELECT day::text AS day, coalesce(variant,'undetected') AS variant, count(*)::int AS visitors
+    FROM picked GROUP BY day, variant`;
     try {
         const { data, error } = await clientFor(funnel).rpc('ai_run_sql', { query: sql });
         if (error) { console.warn(`⚠️  reg_page_visits query failed [${funnel}]:`, error.message); return out; }
@@ -1447,6 +1457,12 @@ function buildVariantResolver(events, cutoffMs = null, aliasMap = null, emailPho
 // 'all' = A + B + undetected (each person resolves to exactly one bucket).
 function computeDedupFromEvents(events, cutoffMs = null, aliasMap = null, emailPhones = null) {
     const variantOf = buildVariantResolver(events, cutoffMs, aliasMap, emailPhones);
+    // The A/B-test-start as an LA calendar date. Any event bucketed to a day BEFORE this
+    // is a pre-test row and never shows a variant — even if the event itself was recorded
+    // after the cutoff (e.g. a replay of a pre-test webinar watched during the test, which
+    // buckets to the old webinar's date). The cutoff DAY itself still uses variantOf's
+    // precise event_time gate.
+    const cutoffLADate = cutoffMs ? new Date(cutoffMs).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' }) : null;
 
     // ── Pass 2: bucket events into (date, event_type, variant) sets ──
     const sets = {}; // key: "YYYY-MM-DD|event_type|variant" → Set of user keys
@@ -1477,7 +1493,8 @@ function computeDedupFromEvents(events, cutoffMs = null, aliasMap = null, emailP
         userKey = userKey || ev.phone || (ev.name || '').toLowerCase();
         if (!userKey) continue;
 
-        const variant = variantOf(ev);
+        // Pre-test rows (bucket date before the cutoff's day) are never a variant.
+        const variant = (cutoffLADate && d < cutoffLADate) ? 'undetected' : variantOf(ev);
         const k = `${d}|${eventKey}|${variant}`;
         if (!sets[k]) sets[k] = new Set();
         sets[k].add(userKey);
@@ -1833,9 +1850,9 @@ app.put('/api/reg-page-variants', dashboardLimiter, requireAuth, async (req, res
                 const u = String(url || '').trim();
                 const v = String(variant || '').trim().toUpperCase();
                 if (!u) continue;
-                if (v !== 'A' && v !== 'B') return res.status(400).json({ error: `Variant for "${u}" must be A or B` });
+                if (v !== 'A' && v !== 'B' && v !== 'UNDETECTED') return res.status(400).json({ error: `Variant for "${u}" must be A, B, or Undetected` });
                 if (!/^https?:\/\/.+/i.test(u)) return res.status(400).json({ error: `"${u}" must be a full URL (https://…)` });
-                clean[u] = v;
+                clean[u] = (v === 'UNDETECTED') ? 'undetected' : v;
             }
         }
 
