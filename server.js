@@ -290,6 +290,73 @@ async function getCombinedAliases(funnel) {
     return { ...stitch, ...manual };
 }
 
+// Landing-page → variant map (the A/B split is by URL). Keys = the reg-page URLs we
+// count for "Reg Page Visits"; values = the variant that page serves. Excludes the
+// /register entry redirect, the joinnow embed, webinar.* attendance pages, /checkout.
+// Editable per funnel via app_settings key 'reg_page_variants' (jsonb {url: "A"|"B"});
+// falls back to this default.
+const REG_PAGE_VARIANT_MAP_DEFAULT = {
+    'https://drshumardworkshop.com/webinar': 'A',
+    'https://drshumardworkshop.com/webinar-page': 'B',
+};
+async function getRegPageVariantMap(funnel) {
+    const b = getCacheBucket(funnel);
+    if (b.regPageMap !== undefined) return b.regPageMap;
+    let map = { ...REG_PAGE_VARIANT_MAP_DEFAULT };
+    try {
+        const { data } = await clientFor(funnel).from('app_settings').select('value').eq('key', 'reg_page_variants').maybeSingle();
+        if (data && data.value && typeof data.value === 'object' && Object.keys(data.value).length) map = data.value;
+    } catch { /* no app_settings → default */ }
+    b.regPageMap = map;
+    return map;
+}
+
+// Unique reg-page visitors per LA day per variant, from shumard pageviews. A person is
+// counted once per day, under the variant of the FIRST reg page they hit that day. The
+// A/B-test-start cutoff applies: a visit before it counts in the day's 'all' but as
+// 'undetected' (not a variant). Returns { 'YYYY-MM-DD': { all, A, B, undetected } }.
+// Independent of the FB-sourced fb_link_clicks.
+async function getRegPageVisits(funnel, dates) {
+    const out = {};
+    const uniq = [...new Set((dates || []).filter(Boolean))];
+    if (!uniq.length) return out;
+    const map = await getRegPageVariantMap(funnel);
+    const urls = Object.keys(map);
+    if (!urls.length) return out;
+    const cutoff = await getAbTestStart(funnel);
+    const cutoffIso = cutoff ? new Date(cutoff).toISOString() : null;
+    const esc = (s) => String(s).replace(/'/g, "''");
+    const urlList = urls.map(u => `'${esc(u)}'`).join(',');
+    const dateList = uniq.map(d => `'${esc(d)}'`).join(',');
+    const cutoffGate = cutoffIso ? `WHEN v0.ts_utc < '${cutoffIso}'::timestamptz THEN 'undetected' ` : '';
+    const variantCase = urls.map(u => `WHEN v0.url = '${esc(u)}' THEN '${map[u] === 'B' ? 'B' : 'A'}'`).join(' ');
+    const sql = `WITH v0 AS (
+        SELECT (timestamp AT TIME ZONE 'America/Los_Angeles')::date AS day,
+               contact_id, timestamp AS ts_utc, split_part(current_url,'?',1) AS url
+        FROM tracking_page_visits
+        WHERE contact_id IS NOT NULL
+          AND split_part(current_url,'?',1) IN (${urlList})
+          AND (timestamp AT TIME ZONE 'America/Los_Angeles')::date IN (${dateList})
+    ), v AS (
+        SELECT DISTINCT ON (day, contact_id) day,
+               CASE ${cutoffGate}${variantCase} ELSE 'undetected' END AS variant
+        FROM v0 ORDER BY day, contact_id, ts_utc ASC
+    )
+    SELECT day::text AS day, variant, count(*)::int AS visitors FROM v GROUP BY day, variant`;
+    try {
+        const { data, error } = await clientFor(funnel).rpc('ai_run_sql', { query: sql });
+        if (error) { console.warn(`⚠️  reg_page_visits query failed [${funnel}]:`, error.message); return out; }
+        for (const r of (data || [])) {
+            const d = String(r.day).slice(0, 10);
+            if (!out[d]) out[d] = { all: 0, A: 0, B: 0, undetected: 0 };
+            const v = (r.variant === 'A' || r.variant === 'B') ? r.variant : 'undetected';
+            out[d][v] += Number(r.visitors) || 0;
+            out[d].all += Number(r.visitors) || 0;
+        }
+    } catch (e) { console.warn(`⚠️  reg_page_visits error [${funnel}]:`, e.message); }
+    return out;
+}
+
 // ─── Express App ─────────────────────────────────────────────────────────────
 const app = express();
 
@@ -1736,6 +1803,62 @@ app.put('/api/ab-test/start', dashboardLimiter, requireAuth, async (req, res) =>
     }
 });
 
+// GET /api/reg-page-variants — the effective landing-page → variant map (for the
+// "Reg Page Visits" metric), incl. whether it's the built-in default.
+app.get('/api/reg-page-variants', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const funnel = req.funnel;
+        const map = await getRegPageVariantMap(funnel);
+        const isDefault = JSON.stringify(map) === JSON.stringify(REG_PAGE_VARIANT_MAP_DEFAULT);
+        res.json({ map, isDefault, default: REG_PAGE_VARIANT_MAP_DEFAULT });
+    } catch (err) {
+        console.error('❌ GET /api/reg-page-variants error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// PUT /api/reg-page-variants — admin sets the landing-page → variant map.
+// Body: { map: { "<full reg-page URL>": "A"|"B", ... } }. Empty/omitted map clears the
+// override (reverts to the default). Recomputes the metric on next read.
+app.put('/api/reg-page-variants', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const supabase = clientFor(req.funnel);
+        const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
+        const raw = req.body?.map;
+        const clean = {};
+        if (raw && typeof raw === 'object') {
+            for (const [url, variant] of Object.entries(raw)) {
+                const u = String(url || '').trim();
+                const v = String(variant || '').trim().toUpperCase();
+                if (!u) continue;
+                if (v !== 'A' && v !== 'B') return res.status(400).json({ error: `Variant for "${u}" must be A or B` });
+                if (!/^https?:\/\/.+/i.test(u)) return res.status(400).json({ error: `"${u}" must be a full URL (https://…)` });
+                clean[u] = v;
+            }
+        }
+
+        if (Object.keys(clean).length === 0) {
+            await supabase.from('app_settings').delete().eq('key', 'reg_page_variants'); // revert to default
+        } else {
+            const { error } = await supabase.from('app_settings')
+                .upsert({ key: 'reg_page_variants', value: clean, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+            if (error) throw error;
+        }
+        // Refresh the cached map + force the metric to recompute.
+        const b = getCacheBucket(req.funnel);
+        b.regPageMap = undefined;
+        invalidateMetricsCache(req.funnel);
+        const effective = Object.keys(clean).length ? clean : { ...REG_PAGE_VARIANT_MAP_DEFAULT };
+        console.log(`🅰️🅱️  [${req.funnel}] reg-page-variant map set:`, JSON.stringify(effective));
+        res.json({ map: effective, isDefault: Object.keys(clean).length === 0 });
+    } catch (err) {
+        console.error('❌ PUT /api/reg-page-variants error:', err.message);
+        res.status(500).json({ error: err.message || 'Internal server error' });
+    }
+});
+
 // GET /api/metrics — Fetch all daily metrics (with caching)
 app.get('/api/metrics', dashboardLimiter, async (req, res) => {
     try {
@@ -1791,6 +1914,9 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             .filter(r => forceAllDedup || !r.finalized_at)
             .map(r => String(r.date).substring(0, 10));
         const dedupMap = await getDedupCounts(funnel, dates);
+        // Reg-page unique visitors per variant (shumard pageviews) — for ALL row dates,
+        // independent of the FB fb_link_clicks total.
+        const regVisits = await getRegPageVisits(funnel, (data || []).map(r => String(r.date).substring(0, 10)));
 
         const DEDUP_COLS = new Set([
             'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
@@ -1805,6 +1931,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             const mmddyyyy = dateStr.replace(/(\d{4})-(\d{2})-(\d{2})/, '$2/$3/$1');
             const deduped = dedupMap[dateStr] || {};
             const hasDedup = Object.keys(deduped).length > 0;
+            const rv = regVisits[dateStr] || {}; // reg-page visitors per variant for this day
             const ov = row.overrides || {};
             const isFinalized = !!row.finalized_at;
             // Resolve one event field for a given variant bucket.
@@ -1845,6 +1972,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 const tp = PURCHASE_SUB.reduce((s, k) => s + (o[k] || 0), 0);
                 o.total_purchases = tp;
                 o.purchases = tp; // alias for backward-compat custom formulas
+                o.reg_page_visits = rv[vnt] || 0; // unique tracked reg-page visitors
                 return o;
             };
             // Non-expanded: top level reflects the requested `variant` (default 'all').

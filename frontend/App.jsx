@@ -75,6 +75,18 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Failed: ${res.status}`); }
     return res.json();
   },
+  async getRegPageVariants() {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/reg-page-variants`, { headers });
+    if (!res.ok) throw new Error(`Failed: ${res.status}`);
+    return res.json();
+  },
+  async setRegPageVariants(map) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/reg-page-variants`, { method: "PUT", headers, body: JSON.stringify({ map }) });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Failed: ${res.status}`); }
+    return res.json();
+  },
   async upsertMetric(entry) {
     const headers = await getAuthHeaders();
     const res = await fetch(`${API_BASE}/api/metrics`, {
@@ -214,8 +226,8 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "fb_link_clicks", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "purchases_cpa", "stayed_45", "stayed_60", "stayed_80", "total_purchases", "attended"];
-const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", purchases_cpa: "CPA Traffic Funnel", stayed_45: "45 min", stayed_60: "60 min", stayed_80: "80 min", total_purchases: "Total Purchases" };
+const MK = ["fb_spend", "fb_link_clicks", "reg_page_visits", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "purchases_cpa", "stayed_45", "stayed_60", "stayed_80", "total_purchases", "attended"];
+const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", reg_page_visits: "Reg Page Visits", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", purchases_cpa: "CPA Traffic Funnel", stayed_45: "45 min", stayed_60: "60 min", stayed_80: "80 min", total_purchases: "Total Purchases" };
 const DEFAULT_HIDDEN = [];
 
 // Summary card defaults and metric options for the configurable summary strip
@@ -317,6 +329,7 @@ export default function App() {
   const [allowedFunnels, setAllowedFunnels] = useState([activeFunnel]);
   const [variantFilter, setVariantFilter] = useState("all"); // 'all' | 'A' | 'B' | 'undetected' — split-test toggle (funnels with variant data)
   const [abTestStart, setAbTestStartState] = useState(null); // ISO string or null — variants only count from here
+  const [regMapOpen, setRegMapOpen] = useState(false); // reg-page → variant map editor (admin)
   const [authLoading, setAuthLoading] = useState(true);
   const [authEmail, setAuthEmail] = useState("");
   const [authPass, setAuthPass] = useState("");
@@ -1137,6 +1150,7 @@ export default function App() {
                     <span style={{ whiteSpace: "nowrap" }}>A/B from: <strong style={{ color: "#374151", fontWeight: 600 }}>{abTestStart ? new Date(abTestStart).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "all time"}</strong></span>
                     <button style={{ ...S.btnLight, padding: "4px 10px", fontSize: 12 }} onClick={startAbTestNow}>Start now</button>
                     {abTestStart && <button style={{ ...S.btnLight, padding: "4px 10px", fontSize: 12 }} onClick={clearAbTest}>Clear</button>}
+                    <button style={{ ...S.btnLight, padding: "4px 10px", fontSize: 12 }} onClick={() => setRegMapOpen(true)} title="Map landing-page URLs to A/B variants for Reg Page Visits">Reg pages</button>
                   </div>
                 )}
                 <button style={S.btnLight} onClick={() => setColEditorOpen(true)}><I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" size={14} stroke="#6B7280" /> Edit Columns</button>
@@ -1484,6 +1498,7 @@ export default function App() {
       {delConfirm && <Modal title="Delete Entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
       {delCM && <Modal title="Delete Custom Metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
       {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
+      {regMapOpen && <RegPageMapModal flash={flash} onClose={() => setRegMapOpen(false)} onSaved={() => loadData()} />}
       {colEditorOpen && <ColumnEditor columns={orderedCols.filter(c => c.type !== "base" || isColVisible(c.key))} isAdmin={isAdmin} onSave={(keys) => { saveColOrder(keys); setColEditorOpen(false); }} onCancel={() => setColEditorOpen(false)} />}
       {crmContact && <CrmContactModal contact={crmContact} tab={crmContactTab} setTab={setCrmContactTab} onClose={() => setCrmContact(null)} isAdmin={isAdmin} onLink={linkSaleToRegistrant} />}
       {emailDrill && <EmailDrillModal drill={emailDrill} loading={emailDrillLoading} onClose={() => setEmailDrill(null)} onOpenContact={(idf) => { setEmailDrill(null); openCrmContact({ email: idf }); }} />}
@@ -1620,6 +1635,59 @@ function SummaryEditor({ cards: initialCards, customs, onSave, onCancel }) {
             <button style={{ ...S.btnLight, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
             <button style={{ ...S.btnDark, justifyContent: "center" }} onClick={() => onSave(cards)} disabled={cards.length === 0}>Save</button>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RegPageMapModal({ flash, onClose, onSaved }) {
+  const [rows, setRows] = useState(null); // [{ url, variant }]
+  const [isDefault, setIsDefault] = useState(false);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    api.getRegPageVariants()
+      .then(r => { setRows(Object.entries(r.map || {}).map(([url, variant]) => ({ url, variant }))); setIsDefault(!!r.isDefault); })
+      .catch(e => { flash(e.message, "err"); setRows([]); });
+  }, []);
+  const update = (i, k, v) => setRows(rs => rs.map((row, j) => j === i ? { ...row, [k]: v } : row));
+  const add = () => setRows(rs => [...(rs || []), { url: "", variant: "A" }]);
+  const remove = (i) => setRows(rs => rs.filter((_, j) => j !== i));
+  const save = async () => {
+    const map = {};
+    for (const r of (rows || [])) { const u = (r.url || "").trim(); if (u) map[u] = r.variant; }
+    setSaving(true);
+    try { await api.setRegPageVariants(map); flash(Object.keys(map).length ? "Reg-page map saved" : "Reverted to default"); onSaved && onSaved(); onClose(); }
+    catch (e) { flash(e.message, "err"); }
+    finally { setSaving(false); }
+  };
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div style={{ ...S.modal, maxWidth: 660, width: "92%", textAlign: "left", padding: 0, display: "flex", flexDirection: "column", maxHeight: "85vh" }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: "20px 24px", borderBottom: "1px solid #E5E7EB" }}>
+          <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0, color: "#111827" }}>Reg Page → Variant Map</h2>
+          <div style={{ fontSize: 13, color: "#6B7280", marginTop: 4 }}>Maps each landing-page URL to its split-test variant for the <strong>Reg Page Visits</strong> metric. Use the full URL with no query string (e.g. <code>https://drshumardworkshop.com/webinar</code>).{isDefault && <span style={{ color: "#9CA3AF" }}> · currently using the built-in default</span>}</div>
+        </div>
+        <div style={{ padding: 24, overflowY: "auto", flex: 1 }}>
+          {rows === null ? <div style={{ color: "#9CA3AF" }}>Loading…</div> : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {rows.map((r, i) => (
+                <div key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <input style={{ ...S.inp, flex: 1, fontSize: 13 }} placeholder="https://drshumardworkshop.com/webinar" value={r.url} onChange={e => update(i, "url", e.target.value)} />
+                  <select style={{ ...S.inp, width: 72, fontSize: 13 }} value={r.variant} onChange={e => update(i, "variant", e.target.value)}>
+                    <option value="A">A</option><option value="B">B</option>
+                  </select>
+                  <button style={{ ...S.btnGhost, padding: "6px 9px" }} onClick={() => remove(i)} title="Remove">✕</button>
+                </div>
+              ))}
+              <button style={{ ...S.btnLight, alignSelf: "flex-start", fontSize: 13 }} onClick={add}>+ Add page</button>
+              {rows.length === 0 && <div style={{ fontSize: 12, color: "#9CA3AF" }}>No pages mapped — saving empty reverts to the default (/webinar→A, /webinar-page→B).</div>}
+            </div>
+          )}
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, padding: "16px 24px", borderTop: "1px solid #E5E7EB" }}>
+          <button style={S.btnGhost} onClick={onClose}>Cancel</button>
+          <button style={{ ...S.btnDark, opacity: (saving || rows === null) ? 0.6 : 1 }} disabled={saving || rows === null} onClick={save}>{saving ? "Saving…" : "Save"}</button>
         </div>
       </div>
     </div>
