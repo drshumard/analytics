@@ -226,8 +226,8 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "fb_link_clicks", "reg_page_visits", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "purchases_cpa", "stayed_45", "stayed_60", "stayed_80", "total_purchases", "attended"];
-const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", reg_page_visits: "Page Views", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", purchases_cpa: "CPA Traffic Funnel", stayed_45: "45 min", stayed_60: "60 min", stayed_80: "80 min", total_purchases: "Total Purchases" };
+const MK = ["fb_spend", "fb_link_clicks", "reg_page_visits", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_postwebinar", "purchases_cpa", "purchases_sales_a", "purchases_sales_b", "stayed_45", "stayed_60", "stayed_80", "total_purchases", "attended"];
+const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", reg_page_visits: "Page Views", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube", purchases_aibot: "AI Chat Bot", purchases_postwebinar: "Post Webinar", purchases_cpa: "CPA Traffic Funnel", purchases_sales_a: "Sales A", purchases_sales_b: "Sales B", stayed_45: "45 min", stayed_60: "60 min", stayed_80: "80 min", total_purchases: "Total Purchases" };
 const DEFAULT_HIDDEN = [];
 
 // Summary card defaults and metric options for the configurable summary strip
@@ -253,6 +253,8 @@ const SUMMARY_METRIC_OPTIONS = [
   { key: "purchases_aibot", label: "AI Chat Bot", defaultFormat: "number" },
   { key: "purchases_postwebinar", label: "Post Webinar", defaultFormat: "number" },
   { key: "purchases_cpa", label: "CPA Traffic Funnel", defaultFormat: "number" },
+  { key: "purchases_sales_a", label: "Sales A", defaultFormat: "number" },
+  { key: "purchases_sales_b", label: "Sales B", defaultFormat: "number" },
   { key: "stayed_45", label: "45 min", defaultFormat: "number" },
   { key: "stayed_60", label: "60 min", defaultFormat: "number" },
   { key: "stayed_80", label: "80 min", defaultFormat: "number" },
@@ -367,6 +369,7 @@ export default function App() {
   const [emailDrill, setEmailDrill] = useState(null);        // { source, ...clicks } or null
   const [emailDrillLoading, setEmailDrillLoading] = useState(false);
   const [lenses, setLenses] = useState([]);
+  const [lensesLoaded, setLensesLoaded] = useState(false);
   const [activeLensId, setActiveLensId] = useState("default-all");
   const [lensMenuOpen, setLensMenuOpen] = useState(false);
   const [lensEditing, setLensEditing] = useState(null); // null | { id?, name, metrics }
@@ -375,8 +378,11 @@ export default function App() {
   const lensMenuRef = useRef(null);
   const activeLens = (() => {
     const found = lenses.find(l => l.id === activeLensId);
-    if (!found) return lenses[0] || { id: "default-all", name: "All Metrics", metrics: MK };
-    return found;
+    if (found) return found;
+    // Until lenses load, show NO metric columns rather than all of MK — otherwise
+    // columns the active lens hides (e.g. stayed_45/60/80) flash in, then vanish.
+    if (!lensesLoaded) return { id: activeLensId, name: "All Metrics", metrics: [] };
+    return lenses[0] || { id: "default-all", name: "All Metrics", metrics: MK };
   })();
   const isColVisible = (col) => activeLens.metrics.includes(col);
 
@@ -440,6 +446,7 @@ export default function App() {
       const data = await res.json();
       setLenses(data.data || []);
     } catch { /* silent */ }
+    finally { setLensesLoaded(true); }
   };
   const saveLens = async (lens) => {
     try {
@@ -2144,12 +2151,12 @@ function EmailDrillModal({ drill, loading, onClose, onOpenContact }) {
 function EntryForm({ initial, onSubmit, onCancel, isMobile }) {
   const today = getLADate();
   const defaults = initial
-    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, registrations: initial.registrations ?? 0, replays: initial.replays ?? 0, viewedcta: initial.viewedcta ?? 0, clickedcta: initial.clickedcta ?? 0, purchases_fb: initial.purchases_fb ?? 0, purchases_native: initial.purchases_native ?? 0, purchases_youtube: initial.purchases_youtube ?? 0, purchases_aibot: initial.purchases_aibot ?? 0, purchases_postwebinar: initial.purchases_postwebinar ?? 0, purchases_cpa: initial.purchases_cpa ?? 0, stayed_45: initial.stayed_45 ?? 0, stayed_60: initial.stayed_60 ?? 0, stayed_80: initial.stayed_80 ?? 0, attended: initial.attended ?? 0 }
-    : { fb_spend: "", fb_link_clicks: "", registrations: "", replays: "", viewedcta: "", clickedcta: "", purchases_fb: "", purchases_native: "", purchases_youtube: "", purchases_aibot: "", purchases_postwebinar: "", purchases_cpa: "", stayed_45: "", stayed_60: "", stayed_80: "", attended: "" };
+    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, registrations: initial.registrations ?? 0, replays: initial.replays ?? 0, viewedcta: initial.viewedcta ?? 0, clickedcta: initial.clickedcta ?? 0, purchases_fb: initial.purchases_fb ?? 0, purchases_native: initial.purchases_native ?? 0, purchases_youtube: initial.purchases_youtube ?? 0, purchases_aibot: initial.purchases_aibot ?? 0, purchases_postwebinar: initial.purchases_postwebinar ?? 0, purchases_cpa: initial.purchases_cpa ?? 0, purchases_sales_a: initial.purchases_sales_a ?? 0, purchases_sales_b: initial.purchases_sales_b ?? 0, stayed_45: initial.stayed_45 ?? 0, stayed_60: initial.stayed_60 ?? 0, stayed_80: initial.stayed_80 ?? 0, attended: initial.attended ?? 0 }
+    : { fb_spend: "", fb_link_clicks: "", registrations: "", replays: "", viewedcta: "", clickedcta: "", purchases_fb: "", purchases_native: "", purchases_youtube: "", purchases_aibot: "", purchases_postwebinar: "", purchases_cpa: "", purchases_sales_a: "", purchases_sales_b: "", stayed_45: "", stayed_60: "", stayed_80: "", attended: "" };
   const [f, setF] = useState({ date: initial?.date || today, ...defaults });
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
-  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases_fb: parseInt(f.purchases_fb) || 0, purchases_native: parseInt(f.purchases_native) || 0, purchases_youtube: parseInt(f.purchases_youtube) || 0, purchases_aibot: parseInt(f.purchases_aibot) || 0, purchases_postwebinar: parseInt(f.purchases_postwebinar) || 0, purchases_cpa: parseInt(f.purchases_cpa) || 0, stayed_45: parseInt(f.stayed_45) || 0, stayed_60: parseInt(f.stayed_60) || 0, stayed_80: parseInt(f.stayed_80) || 0, attended: parseInt(f.attended) || 0 });
-  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Total Reg. Page Visited", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases_fb", l: "FB Purchases", ph: "0" }, { k: "purchases_native", l: "Native Ads", ph: "0" }, { k: "purchases_youtube", l: "Youtube", ph: "0" }, { k: "purchases_aibot", l: "AI Chat Bot", ph: "0" }, { k: "purchases_postwebinar", l: "Post Webinar", ph: "0" }, { k: "purchases_cpa", l: "CPA Traffic Funnel", ph: "0" }, { k: "stayed_45", l: "45 min", ph: "0" }, { k: "stayed_60", l: "60 min", ph: "0" }, { k: "stayed_80", l: "80 min", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
+  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases_fb: parseInt(f.purchases_fb) || 0, purchases_native: parseInt(f.purchases_native) || 0, purchases_youtube: parseInt(f.purchases_youtube) || 0, purchases_aibot: parseInt(f.purchases_aibot) || 0, purchases_postwebinar: parseInt(f.purchases_postwebinar) || 0, purchases_cpa: parseInt(f.purchases_cpa) || 0, purchases_sales_a: parseInt(f.purchases_sales_a) || 0, purchases_sales_b: parseInt(f.purchases_sales_b) || 0, stayed_45: parseInt(f.stayed_45) || 0, stayed_60: parseInt(f.stayed_60) || 0, stayed_80: parseInt(f.stayed_80) || 0, attended: parseInt(f.attended) || 0 });
+  const fields = [{ k: "fb_spend", l: "Facebook Spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Total Reg. Page Visited", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }, { k: "purchases_fb", l: "FB Purchases", ph: "0" }, { k: "purchases_native", l: "Native Ads", ph: "0" }, { k: "purchases_youtube", l: "Youtube", ph: "0" }, { k: "purchases_aibot", l: "AI Chat Bot", ph: "0" }, { k: "purchases_postwebinar", l: "Post Webinar", ph: "0" }, { k: "purchases_cpa", l: "CPA Traffic Funnel", ph: "0" }, { k: "purchases_sales_a", l: "Sales A", ph: "0" }, { k: "purchases_sales_b", l: "Sales B", ph: "0" }, { k: "stayed_45", l: "45 min", ph: "0" }, { k: "stayed_60", l: "60 min", ph: "0" }, { k: "stayed_80", l: "80 min", ph: "0" }, { k: "attended", l: "Attended", ph: "0" }];
   return (
     <div className="fi form-container" style={S.fc}>
       <div style={S.fh}><div style={{ ...S.formBadge, background: initial ? "#EFF8FF" : "#ECFDF3", color: initial ? "#175CD3" : "#12864A" }}>{initial ? "EDIT ENTRY" : "NEW ENTRY"}</div><h2 style={S.ft}>{initial ? `Update ${fmtDateNice(initial.date)}` : "Add Daily Metrics"}</h2><p style={S.fs}>Enter metrics for the day. Fields default to 0 if empty.</p></div>

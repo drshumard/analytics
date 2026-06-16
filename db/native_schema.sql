@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
     purchases_aibot          INTEGER NOT NULL DEFAULT 0,
     purchases_postwebinar    INTEGER NOT NULL DEFAULT 0,
     purchases_cpa            INTEGER NOT NULL DEFAULT 0,
+    purchases_sales_a        INTEGER NOT NULL DEFAULT 0,
+    purchases_sales_b        INTEGER NOT NULL DEFAULT 0,
     stayed_45                INTEGER NOT NULL DEFAULT 0,
     stayed_60                INTEGER NOT NULL DEFAULT 0,
     stayed_80                INTEGER NOT NULL DEFAULT 0,
@@ -166,7 +168,7 @@ INSERT INTO dashboard_lenses (id, name, metrics, sort_order)
 VALUES (
     'default-all',
     'All Metrics',
-    '["fb_spend","fb_link_clicks","registrations","attended","replays","viewedcta","clickedcta","purchases_fb","purchases_native","purchases_youtube","purchases_aibot","purchases_postwebinar","purchases_cpa","total_purchases"]',
+    '["fb_spend","fb_link_clicks","registrations","attended","replays","viewedcta","clickedcta","purchases_fb","purchases_native","purchases_youtube","purchases_aibot","purchases_postwebinar","purchases_cpa","purchases_sales_a","purchases_sales_b","total_purchases"]',
     0
 ) ON CONFLICT (id) DO UPDATE SET metrics = EXCLUDED.metrics;
 
