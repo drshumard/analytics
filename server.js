@@ -911,23 +911,27 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             const rawSource = rest.source || 'Paid Ads'; // default to Paid Ads
             let sourceColumn = PURCHASE_SOURCE_MAP[rawSource] || 'purchases_fb';
 
-            // Post Webinar detection: if Paid Ads / Sales A / Sales B and buyer attended 12h+ ago
+            // Post Webinar detection: if Paid Ads / Sales A / Sales B and the buyer's MOST
+            // RECENT webinar engagement — attended OR replay — was 12h+ ago. Using the latest
+            // of attended/replays (not attended alone) means a fresh replay re-engagement
+            // counts as live (not post-webinar), and replay-only watchers who buy later are
+            // still caught.
             if (['Paid Ads', 'Sales A', 'Sales B'].includes(rawSource) && email) {
                 try {
-                    const { data: attendedEvt } = await supabase
+                    const { data: engagedEvt } = await supabase
                         .from('events')
-                        .select('event_time')
-                        .eq('event_type', 'attended')
+                        .select('event_time, event_type')
+                        .in('event_type', ['attended', 'replays'])
                         .ilike('email', email)
                         .order('event_time', { ascending: false })
                         .limit(1);
 
-                    if (attendedEvt?.length > 0) {
-                        const hoursSince = (Date.now() - new Date(attendedEvt[0].event_time).getTime()) / 3600000;
+                    if (engagedEvt?.length > 0) {
+                        const hoursSince = (Date.now() - new Date(engagedEvt[0].event_time).getTime()) / 3600000;
                         if (hoursSince >= 12) {
                             sourceColumn = 'purchases_postwebinar';
                             resolvedSource = 'Post Webinar';
-                            console.log(`🎯 Post Webinar purchase: ${email} attended ${Math.round(hoursSince)}h ago`);
+                            console.log(`🎯 Post Webinar purchase: ${email} ${engagedEvt[0].event_type} ${Math.round(hoursSince)}h ago`);
                         }
                     }
                 } catch (e) {
