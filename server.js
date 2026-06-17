@@ -314,6 +314,30 @@ async function getRegPageVariantMap(funnel) {
     return map;
 }
 
+// ─── Named sales pages (configurable, NOT hardcoded) ─────────────────────────
+// Maps a full sales/checkout-page URL → a human label. Used to (a) label these
+// pageviews on the CRM journey timeline, (b) drive the CRM "Sales Pages" column
+// + filter, and (c) let AI insights answer "how many people hit Sales Page B".
+// Overridable per-funnel via app_settings.key='sales_pages' (PUT /api/sales-pages)
+// so a new split test / funnel needs zero code changes. Matching is path-only
+// (query strings ignored) via split_part(current_url,'?',1), like the reg-page map.
+const SALES_PAGE_MAP_DEFAULT = {
+    'https://drshumardworkshop.com/checkout':  'Legacy',
+    'https://drshumardworkshop.com/checkout1': 'Sales A',
+    'https://drshumardworkshop.com/checkout2': 'Sales B',
+};
+async function getSalesPageMap(funnel) {
+    const b = getCacheBucket(funnel);
+    if (b.salesPageMap !== undefined) return b.salesPageMap;
+    let map = { ...SALES_PAGE_MAP_DEFAULT };
+    try {
+        const { data } = await clientFor(funnel).from('app_settings').select('value').eq('key', 'sales_pages').maybeSingle();
+        if (data && data.value && typeof data.value === 'object' && Object.keys(data.value).length) map = data.value;
+    } catch { /* no app_settings → default */ }
+    b.salesPageMap = map;
+    return map;
+}
+
 // Unique reg-page visitors per LA day per variant, from shumard pageviews. A person is
 // counted ONCE per day, attributed to the variant of the earliest A/B page they reached
 // that day; if they only hit a non-variant reg page (e.g. /register) or only visited
@@ -1882,6 +1906,61 @@ app.put('/api/reg-page-variants', dashboardLimiter, requireAuth, async (req, res
     }
 });
 
+// GET /api/sales-pages — the effective sales-page URL → label map, plus whether
+// it's the built-in default and what the default is (for the admin editor).
+app.get('/api/sales-pages', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const map = await getSalesPageMap(req.funnel);
+        const isDefault = JSON.stringify(map) === JSON.stringify(SALES_PAGE_MAP_DEFAULT);
+        res.json({ map, isDefault, default: SALES_PAGE_MAP_DEFAULT });
+    } catch (err) {
+        console.error('❌ GET /api/sales-pages error:', err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// PUT /api/sales-pages — admin sets the sales-page URL → label map.
+// Body: { map: { "<full sales-page URL>": "<label>", ... } }. Labels are free text
+// (e.g. "Sales A", "Sales B", "Legacy"). Empty/omitted map clears the override
+// (reverts to SALES_PAGE_MAP_DEFAULT). Recomputes on next read.
+app.put('/api/sales-pages', dashboardLimiter, requireAuth, async (req, res) => {
+    try {
+        const supabase = clientFor(req.funnel);
+        const { data: roleData } = await supabase.from('user_roles').select('role').eq('user_id', req.user.id).single();
+        if (roleData?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
+        const raw = req.body?.map;
+        const clean = {};
+        if (raw && typeof raw === 'object') {
+            for (const [url, label] of Object.entries(raw)) {
+                const u = String(url || '').trim();
+                const l = String(label || '').trim();
+                if (!u) continue;
+                if (!/^https?:\/\/.+/i.test(u)) return res.status(400).json({ error: `"${u}" must be a full URL (https://…)` });
+                if (!l) return res.status(400).json({ error: `Label for "${u}" cannot be empty` });
+                clean[u] = l;
+            }
+        }
+
+        if (Object.keys(clean).length === 0) {
+            await supabase.from('app_settings').delete().eq('key', 'sales_pages'); // revert to default
+        } else {
+            const { error } = await supabase.from('app_settings')
+                .upsert({ key: 'sales_pages', value: clean, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+            if (error) throw error;
+        }
+        // Refresh the cached map + force journey/insights context to recompute.
+        getCacheBucket(req.funnel).salesPageMap = undefined;
+        invalidateInsightsCache(req.funnel);
+        const effective = Object.keys(clean).length ? clean : { ...SALES_PAGE_MAP_DEFAULT };
+        console.log(`🛒 [${req.funnel}] sales-page map set:`, JSON.stringify(effective));
+        res.json({ map: effective, isDefault: Object.keys(clean).length === 0 });
+    } catch (err) {
+        console.error('❌ PUT /api/sales-pages error:', err.message);
+        res.status(500).json({ error: err.message || 'Internal server error' });
+    }
+});
+
 // GET /api/metrics — Fetch all daily metrics (with caching)
 app.get('/api/metrics', dashboardLimiter, async (req, res) => {
     try {
@@ -3017,6 +3096,7 @@ async function getJourneyDataDictionary(funnel) {
         q("SELECT t AS tag, count(*)::int AS contacts FROM tracking_contacts, unnest(tags) AS t GROUP BY 1 ORDER BY contacts DESC LIMIT 50"),
         q("SELECT (SELECT count(*) FROM events)::int AS total_events, (SELECT count(*) FROM crm_people)::int AS total_people, (SELECT count(*) FROM crm_people WHERE is_tracked)::int AS tracked_people, (SELECT count(*) FROM crm_people WHERE NOT is_tracked)::int AS legacy_people, (SELECT min(event_time) FROM events) AS earliest_event, (SELECT max(event_time) FROM events) AS latest_event"),
     ]);
+    const salesPages = await getSalesPageMap(funnel); // { "<url>": "<label>" }
     const dict = {
         tables: {
             events: 'id, event_type, name, email, phone, metadata (jsonb), event_time, created_at — one row per funnel action',
@@ -3030,11 +3110,13 @@ async function getJourneyDataDictionary(funnel) {
         purchase_sources: purchaseSources,
         crm_stages: stages,
         tracking_tags: tags,
+        sales_pages: salesPages,
         totals: totals[0] || {},
         notes: [
             "events.metadata.variant ('A' or 'B') is the split-test bucket. Attribution: (1) any event with its OWN variant tag uses it — registrations AND downstream events, since Stealth now stamps it on attended/CTA/purchase; (2) an untagged registration is 'undetected' and is NEVER back-filled; (3) an untagged downstream event inherits the registrant's variant via email then phone (last-10-digits), FORWARD-ONLY — only if it occurred at/after the variant was assigned. Pre-experiment events and unmatched purchases are 'undetected'.",
             "For A/B counts/conversions use get_variant_funnel; for the LIST of people in a variant use get_journey_segment (variant:'A'). A naive `WHERE metadata->>'variant'='A'` is fine for registration ROWS but undercounts downstream events that were untagged and inherited.",
             "FB spend (daily_metrics.fb_spend) and reg-page link clicks (fb_link_clicks) have NO variant dimension — FB reports them at account/day level — so cost-per-variant (cost/reg, CPA, ROAS) is NOT computable per A/B variant.",
+            "sales_pages maps each named sales/checkout page to the URL where its visits land in tracking_page_visits.current_url. To count how many people hit a sales page, use get_sales_page_visits (it collapses stitched identities to distinct people) rather than a raw COUNT — a naive count of tracking_page_visits would double-count stitched contacts and miss the page→label naming.",
         ],
     };
     bucket.dataDictionary = dict;
@@ -3081,6 +3163,58 @@ async function getJourneySegment(funnel, params) {
     if (result.error) return result;
     const rows = result.rows || [];
     return { count: rows.length, truncated: rows.length >= limit, filters: p, people: rows };
+}
+
+// Sales/checkout-page visits per NAMED page, from shumard pageviews. `people` counts
+// DISTINCT STITCHED people (a stitched person's merged children point at the root via
+// merged_into, so coalesce(merged_into, contact_id) collapses them to one). `visits` is
+// raw rows. Page matching is path-only (query strings stripped). Optional date range
+// (LA calendar days, inclusive) and optional `page` filter (a label like "Sales B" or a
+// full URL). Returns { pages:[{label,url,people,visits}], date_range }.
+async function getSalesPageVisits(funnel, params = {}) {
+    const map = await getSalesPageMap(funnel);
+    const entries = Object.entries(map); // [url, label]
+    // Optional page filter: match a label (case-insensitive) or an exact URL.
+    let chosen = entries;
+    if (params.page) {
+        const want = String(params.page).trim().toLowerCase();
+        chosen = entries.filter(([url, label]) => label.toLowerCase() === want || url.toLowerCase() === want);
+        if (!chosen.length) return { error: `No configured sales page matches "${params.page}". Known: ${entries.map(([, l]) => l).join(', ')}` };
+    }
+    const esc = (s) => String(s).replace(/'/g, "''");
+    const urlList = chosen.map(([url]) => `'${esc(url)}'`).join(',');
+    const conds = [`split_part(v.current_url,'?',1) IN (${urlList})`];
+    if (params.date_from) conds.push(`(v.timestamp AT TIME ZONE 'America/Los_Angeles')::date >= '${esc(params.date_from)}'`);
+    if (params.date_to)   conds.push(`(v.timestamp AT TIME ZONE 'America/Los_Angeles')::date <= '${esc(params.date_to)}'`);
+    // `people` = all distinct tracked visitors (incl. anonymous contacts with no email).
+    // `identified` = those whose person (root contact) carries an email — i.e. the ones
+    // that appear as a row in the CRM people list (crm_people is keyed by email). The two
+    // differ when anonymous visitors reach the page without ever identifying themselves.
+    const sql = `WITH visits AS (
+        SELECT split_part(v.current_url,'?',1) AS url,
+               coalesce(c.merged_into, v.contact_id) AS person
+        FROM tracking_page_visits v
+        LEFT JOIN tracking_contacts c ON c.contact_id = v.contact_id
+        WHERE v.contact_id IS NOT NULL AND ${conds.join(' AND ')}
+    )
+    SELECT vi.url,
+           count(*)::int AS visits,
+           count(DISTINCT vi.person)::int AS people,
+           count(DISTINCT vi.person) FILTER (WHERE rc.email IS NOT NULL)::int AS identified
+    FROM visits vi
+    LEFT JOIN tracking_contacts rc ON rc.contact_id = vi.person
+    GROUP BY vi.url`;
+    const result = await runReadOnlySQL(funnel, sql);
+    if (result.error) return result;
+    const byUrl = {};
+    for (const r of (result.rows || [])) byUrl[r.url] = r;
+    const pages = chosen.map(([url, label]) => ({
+        label, url,
+        people: byUrl[url]?.people || 0,
+        identified: byUrl[url]?.identified || 0,
+        visits: byUrl[url]?.visits || 0,
+    })).sort((a, b) => b.people - a.people);
+    return { pages, date_range: { from: params.date_from || null, to: params.date_to || null } };
 }
 
 // Strict read-only SQL guard. Allows a single SELECT or WITH ... SELECT, no
@@ -3293,6 +3427,18 @@ const INSIGHTS_TOOLS = [
             },
         },
     },
+    {
+        name: 'get_sales_page_visits',
+        description: 'How many people hit each NAMED sales/checkout page (e.g. "Sales Page A" = /checkout1, "Sales Page B" = /checkout2, "Legacy" = /checkout). For each configured page returns `people` (DISTINCT tracked visitors, with stitched/merged identities collapsed to one person — INCLUDING anonymous visitors who never gave an email), `identified` (the subset who have an email — i.e. the ones that show up as rows in the CRM people list / are filterable there), and `visits` (raw pageview count). Use for "how many people hit Sales Page B", "visits to checkout2", sales-page traffic comparisons, etc. When the count here is higher than what the CRM list shows, it is because anonymous-but-tracked visitors hit the page without identifying — cite `people` vs `identified` to explain. The page→URL mapping is configurable (admin-editable); call describe_journey_data for the current labels/URLs. A buyer never seen by the tracker is not counted here.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                page:      { type: 'string', description: 'Optional: restrict to one page by its label (e.g. "Sales B") or full URL. Omit to get all configured sales pages.' },
+                date_from: { type: 'string', description: 'Optional start date (YYYY-MM-DD, LA timezone, inclusive).' },
+                date_to:   { type: 'string', description: 'Optional end date (YYYY-MM-DD, LA timezone, inclusive).' },
+            },
+        },
+    },
 ];
 
 async function executeInsightsTool(name, input, ctx) {
@@ -3317,11 +3463,13 @@ async function executeInsightsTool(name, input, ctx) {
                 return await getVariantFunnel(funnel, input.date_from, input.date_to);
             case 'get_contact_journey':
                 if (!input.identifier) return { error: 'identifier (email or contact_id) required' };
-                return (await buildContactJourney(clientFor(funnel), String(input.identifier))) || { error: 'No contact found for that identifier' };
+                return (await buildContactJourney(clientFor(funnel), String(input.identifier), funnel)) || { error: 'No contact found for that identifier' };
             case 'describe_journey_data':
                 return await getJourneyDataDictionary(funnel);
             case 'get_journey_segment':
                 return await getJourneySegment(funnel, input || {});
+            case 'get_sales_page_visits':
+                return await getSalesPageVisits(funnel, input || {});
             case 'get_email_report':
                 return await getEmailReportData(funnel, input && input.window_days);
             case 'remember':
@@ -3431,6 +3579,7 @@ INSTRUCTIONS:
   • \`get_contact_journey\` — one person's full chronological timeline by email or contact_id. Use for "what did <email> do" or sample buyer/non-buyer paths.
   • \`get_journey_segment\` — the LIST of people matching a segment (registered-but-not-attended, buyers from a given webinar slot, attended-but-didn't-buy, etc.). Use when the user wants WHO, not just how many.
   • \`get_email_report\` — email-marketing performance by source (clicks → people → buyers → conversion %, traffic_source=email). Use for "which emails convert best".
+  • \`get_sales_page_visits\` — how many people hit each NAMED sales/checkout page (e.g. "Sales Page B" = /checkout2): distinct stitched people + raw visits per page, optional date range. Use for "how many people hit Sales Page B / checkout2", sales-page traffic. Labels are admin-configurable (see describe_journey_data → sales_pages).
   • \`describe_journey_data\` — live schema + every \`events.metadata\` key (with samples) + enum values. Call it FIRST when unsure what's queryable, so you never guess a column or metadata key.
   • \`run_sql\` against \`crm_people\` / \`events.metadata\` for anything else (webinar-slot popularity, attribution, cohorts). The journey snapshot above already answers the most common ones — cite it directly when it suffices.
 - For statistical work (forecasts, regressions, anomaly detection, t-tests), use the code execution tool. The data you've fetched is available as variables.
@@ -4150,19 +4299,55 @@ function crmStageFromTypes(types) {
 app.get('/api/crm/contacts', dashboardLimiter, requireAuth, async (req, res) => {
     try {
         const sb = clientFor(req.funnel);
-        const { search = '', stage = '', limit = 100, offset = 0 } = req.query;
-        let q = sb.from('crm_people').select('*', { count: 'exact' });
-        if (stage) q = q.eq('stage', stage);
-        if (search) {
-            // Strip PostgREST or()-breaking chars (commas separate conditions; % is a wildcard)
-            const s = String(search).replace(/[%,()]/g, ' ').trim();
-            if (s) q = q.or(`email.ilike.%${s}%,name.ilike.%${s}%,phone.ilike.%${s}%`);
+        const { search = '', stage = '', sales_page = '' } = req.query;
+        const sqlEsc = (s) => String(s).replace(/'/g, "''");
+        const lim = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 200);
+        const off = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+        const salesMap = await getSalesPageMap(req.funnel);
+
+        let rows, count;
+        if (sales_page) {
+            // Sales-page filter: people (root contact) who — themselves or via a stitched
+            // child — hit the named page. Done entirely in SQL via an EXISTS subquery so the
+            // candidate set is never marshalled into a PostgREST .in() (URL-length safe).
+            const want = String(sales_page).trim().toLowerCase();
+            const urls = Object.entries(salesMap)
+                .filter(([url, label]) => label.toLowerCase() === want || url.toLowerCase() === want)
+                .map(([url]) => url);
+            if (!urls.length) return res.json({ data: [], total: 0 });
+            const urlList = urls.map((u) => `'${sqlEsc(u)}'`).join(',');
+            const conds = [
+                `p.contact_id IS NOT NULL`,
+                `EXISTS (SELECT 1 FROM tracking_page_visits v LEFT JOIN tracking_contacts c ON c.contact_id = v.contact_id
+                         WHERE coalesce(c.merged_into, v.contact_id) = p.contact_id
+                           AND split_part(v.current_url,'?',1) IN (${urlList}))`,
+            ];
+            if (stage) conds.push(`p.stage = '${sqlEsc(stage)}'`);
+            if (search) {
+                const s = sqlEsc(String(search).replace(/[%,()]/g, ' ').trim());
+                if (s) conds.push(`(p.email ILIKE '%${s}%' OR p.name ILIKE '%${s}%' OR p.phone ILIKE '%${s}%')`);
+            }
+            const where = conds.join(' AND ');
+            const cRes = await sb.rpc('ai_run_sql', { query: `SELECT count(*)::int AS n FROM crm_people p WHERE ${where}` });
+            if (cRes.error) throw new Error(cRes.error.message);
+            count = (Array.isArray(cRes.data) && cRes.data[0]?.n) || 0;
+            const pRes = await sb.rpc('ai_run_sql', { query: `SELECT p.* FROM crm_people p WHERE ${where} ORDER BY p.last_activity DESC NULLS LAST LIMIT ${lim} OFFSET ${off}` });
+            if (pRes.error) throw new Error(pRes.error.message);
+            rows = pRes.data || [];
+        } else {
+            let q = sb.from('crm_people').select('*', { count: 'exact' });
+            if (stage) q = q.eq('stage', stage);
+            if (search) {
+                // Strip PostgREST or()-breaking chars (commas separate conditions; % is a wildcard)
+                const s = String(search).replace(/[%,()]/g, ' ').trim();
+                if (s) q = q.or(`email.ilike.%${s}%,name.ilike.%${s}%,phone.ilike.%${s}%`);
+            }
+            q = q.order('last_activity', { ascending: false, nullsFirst: false }).range(off, off + lim - 1);
+            const { data, error, count: c } = await q;
+            if (error) throw error;
+            rows = data || [];
+            count = c || 0;
         }
-        q = q.order('last_activity', { ascending: false, nullsFirst: false })
-            .range(Number(offset), Number(offset) + Number(limit) - 1);
-        const { data, error, count } = await q;
-        if (error) throw error;
-        const rows = data || [];
         // Attach visit_count for just this page's tracked contacts (one query;
         // keeps the view free of a per-row subquery across all ~13k people).
         const ids = rows.filter((r) => r.contact_id).map((r) => r.contact_id);
@@ -4193,6 +4378,26 @@ app.get('/api/crm/contacts', dashboardLimiter, requireAuth, async (req, res) => 
             }
         }
         for (const r of rows) r.has_linked = r.contact_id ? linkedParents.has(r.contact_id) : false;
+        // Attach sales_pages_hit: the named sales/checkout pages each person (root contact,
+        // including stitched children) has visited. One aggregated query for this page's
+        // contacts, matched against the configured sales-page map.
+        const salesByRoot = {};
+        if (ids.length && Object.keys(salesMap).length) {
+            const idList = ids.map((i) => `'${sqlEsc(i)}'`).join(',');
+            const urlList = Object.keys(salesMap).map((u) => `'${sqlEsc(u)}'`).join(',');
+            const { data: sprows } = await sb.rpc('ai_run_sql', {
+                query: `SELECT DISTINCT coalesce(c.merged_into, v.contact_id) AS root, split_part(v.current_url,'?',1) AS url
+                        FROM tracking_page_visits v
+                        LEFT JOIN tracking_contacts c ON c.contact_id = v.contact_id
+                        WHERE split_part(v.current_url,'?',1) IN (${urlList})
+                          AND coalesce(c.merged_into, v.contact_id) IN (${idList})`,
+            });
+            for (const sr of sprows || []) {
+                const label = salesMap[sr.url]; if (!label) continue;
+                (salesByRoot[sr.root] || (salesByRoot[sr.root] = new Set())).add(label);
+            }
+        }
+        for (const r of rows) r.sales_pages_hit = r.contact_id && salesByRoot[r.contact_id] ? [...salesByRoot[r.contact_id]] : [];
         res.json({ data: rows, total: count || 0 });
     } catch (err) {
         console.error('❌ GET /api/crm/contacts error:', err.message);
@@ -4233,7 +4438,7 @@ app.get('/api/crm/stats', dashboardLimiter, requireAuth, async (req, res) => {
 // merging page views, tag fires (by contact_id) and funnel events (by email). Returns
 // null when no such contact/email exists. Shared by the CRM detail endpoint and the
 // get_contact_journey AI tool.
-async function buildContactJourney(sb, raw) {
+async function buildContactJourney(sb, raw, funnel = null) {
     let contactId = null, email = null, contact = null;
     if (raw.includes('@')) {
         email = normEmail(raw);
@@ -4285,8 +4490,16 @@ async function buildContactJourney(sb, raw) {
         if (seenEv.has(k)) return false; seenEv.add(k); return true;
     }).sort((a, b) => new Date(a.event_time) - new Date(b.event_time));
 
+    // Named sales/checkout pages → label a matching pageview "Visited <label>" (path-only
+    // match, query strings ignored) so /checkout2 reads as "Visited Sales B" on the timeline.
+    const salesMap = funnel ? await getSalesPageMap(funnel) : {};
+    const salesLabelFor = (u) => (u ? (salesMap[String(u).split('?')[0]] || null) : null);
+
     const timeline = [];
-    for (const v of (visits || [])) timeline.push({ ts: v.timestamp, kind: 'pageview', label: v.page_title || 'Page view', url: v.current_url, referrer: v.referrer_url || null });
+    for (const v of (visits || [])) {
+        const sp = salesLabelFor(v.current_url);
+        timeline.push({ ts: v.timestamp, kind: 'pageview', label: sp ? `Visited ${sp}` : (v.page_title || 'Page view'), url: v.current_url, referrer: v.referrer_url || null, sales_page: sp });
+    }
     for (const t of (tags || [])) timeline.push({ ts: t.timestamp, kind: 'tag', label: CRM_EVENT_LABELS[t.tag] || t.tag, tag: t.tag, url: t.current_url || null });
     for (const e of events) {
         let label = CRM_EVENT_LABELS[e.event_type] || e.event_type;
@@ -4345,7 +4558,7 @@ async function buildContactJourney(sb, raw) {
             stage: crmStageFromTypes(types),
         },
         timeline,
-        visits: visits || [],
+        visits: (visits || []).map((v) => ({ ...v, sales_page: salesLabelFor(v.current_url) })),
         events,
         linked,
         stats: { visit_count: (visits || []).length, event_count: events.length, tag_count: (tags || []).length, linked_count: linked.length },
@@ -4354,7 +4567,7 @@ async function buildContactJourney(sb, raw) {
 
 app.get('/api/crm/contacts/:id', dashboardLimiter, requireAuth, async (req, res) => {
     try {
-        const journey = await buildContactJourney(clientFor(req.funnel), decodeURIComponent(req.params.id));
+        const journey = await buildContactJourney(clientFor(req.funnel), decodeURIComponent(req.params.id), req.funnel);
         if (!journey) return res.status(404).json({ error: 'Contact not found' });
         res.json(journey);
     } catch (err) {

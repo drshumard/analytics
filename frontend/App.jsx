@@ -87,6 +87,18 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Failed: ${res.status}`); }
     return res.json();
   },
+  async getSalesPages() {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/sales-pages`, { headers });
+    if (!res.ok) throw new Error(`Failed: ${res.status}`);
+    return res.json();
+  },
+  async setSalesPages(map) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/sales-pages`, { method: "PUT", headers, body: JSON.stringify({ map }) });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Failed: ${res.status}`); }
+    return res.json();
+  },
   async upsertMetric(entry) {
     const headers = await getAuthHeaders();
     const res = await fetch(`${API_BASE}/api/metrics`, {
@@ -180,11 +192,12 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Finalize failed: ${res.status}`); }
     return res.json();
   },
-  async getCrmContacts(search = "", stage = "", limit = 100, offset = 0) {
+  async getCrmContacts(search = "", stage = "", limit = 100, offset = 0, salesPage = "") {
     const headers = await getAuthHeaders();
     const qs = new URLSearchParams({ limit, offset });
     if (search) qs.set("search", search);
     if (stage) qs.set("stage", stage);
+    if (salesPage) qs.set("sales_page", salesPage);
     const res = await fetch(`${API_BASE}/api/crm/contacts?${qs}`, { headers });
     if (!res.ok) throw new Error(`Failed to fetch contacts: ${res.status}`);
     return res.json();
@@ -361,6 +374,9 @@ export default function App() {
   const [crmOffset, setCrmOffset] = useState(0);
   const [crmSearch, setCrmSearch] = useState("");
   const [crmStage, setCrmStage] = useState("");
+  const [crmSalesPage, setCrmSalesPage] = useState("");   // sales-page filter (label) or ""
+  const [salesPages, setSalesPages] = useState(null);     // { map, isDefault, default } or null
+  const [salesEditorOpen, setSalesEditorOpen] = useState(false);
   const [crmLoading, setCrmLoading] = useState(false);
   const [crmContact, setCrmContact] = useState(null);
   const [crmContactTab, setCrmContactTab] = useState("journey");
@@ -572,12 +588,12 @@ export default function App() {
   const loadCrm = useCallback(async () => {
     setCrmLoading(true);
     try {
-      const list = await api.getCrmContacts(crmSearch, crmStage, CRM_PAGE, crmOffset);
+      const list = await api.getCrmContacts(crmSearch, crmStage, CRM_PAGE, crmOffset, crmSalesPage);
       setCrmContacts(list.data || []);
       setCrmTotal(list.total || 0);
     } catch (e) { flash(e.message, "err"); }
     setCrmLoading(false);
-  }, [crmSearch, crmStage, crmOffset]);
+  }, [crmSearch, crmStage, crmOffset, crmSalesPage]);
   // Stats scan the whole view, so fetch them once on entering CRM / changing
   // filters — not on every page turn.
   const loadCrmStats = useCallback(async () => {
@@ -589,8 +605,10 @@ export default function App() {
     return () => clearTimeout(t);
   }, [view, loadCrm]);
   useEffect(() => { if (view === "crm") loadCrmStats(); }, [view, loadCrmStats]);
-  // Reset to the first page whenever the search/stage filter changes.
-  useEffect(() => { setCrmOffset(0); }, [crmSearch, crmStage]);
+  // Load the configured sales pages once on entering CRM (for the filter + badges + editor).
+  useEffect(() => { if (view === "crm" && !salesPages) api.getSalesPages().then(setSalesPages).catch(() => {}); }, [view, salesPages]);
+  // Reset to the first page whenever the search/stage/sales-page filter changes.
+  useEffect(() => { setCrmOffset(0); }, [crmSearch, crmStage, crmSalesPage]);
   const openCrmContact = async (row) => {
     try {
       const data = await api.getCrmContact(row.contact_id || row.email);
@@ -1377,9 +1395,26 @@ export default function App() {
           <div className="fi">
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24, gap: 16, flexWrap: "wrap" }}>
               <div><h1 style={S.pageTitle}>CRM</h1><div style={{ fontSize: 13, color: "#6B7280", marginTop: 4 }}>{crmTotal.toLocaleString()} people · click anyone to see their full journey</div></div>
-              <div style={{ ...S.searchWrap, width: "auto", minWidth: 240, padding: "6px 12px" }}>
-                <I d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z" size={14} stroke="#6B7280" />
-                <input style={S.searchInput} placeholder="Search name, email, phone…" value={crmSearch} onChange={e => setCrmSearch(e.target.value)} />
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                {/* Sales-page filter — only when pages are configured */}
+                {salesPages && Object.keys(salesPages.map || {}).length > 0 && (
+                  <select
+                    value={crmSalesPage}
+                    onChange={e => setCrmSalesPage(e.target.value)}
+                    style={{ ...S.btnLight, padding: "8px 12px", borderRadius: 8, cursor: "pointer", fontFamily: "Inter, sans-serif" }}
+                    title="Filter to people who hit a sales page"
+                  >
+                    <option value="">All sales pages</option>
+                    {[...new Set(Object.values(salesPages.map))].map(label => (
+                      <option key={label} value={label}>Hit: {label}</option>
+                    ))}
+                  </select>
+                )}
+                {isAdmin && <button style={{ ...S.btnLight, padding: "8px 12px", borderRadius: 8 }} onClick={() => setSalesEditorOpen(true)} title="Configure sales pages">⚙ Sales pages</button>}
+                <div style={{ ...S.searchWrap, width: "auto", minWidth: 240, padding: "6px 12px" }}>
+                  <I d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z" size={14} stroke="#6B7280" />
+                  <input style={S.searchInput} placeholder="Search name, email, phone…" value={crmSearch} onChange={e => setCrmSearch(e.target.value)} />
+                </div>
               </div>
             </div>
 
@@ -1414,7 +1449,7 @@ export default function App() {
                 <div style={{ overflowX: "auto" }}>
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                     <thead>
-                      <tr>{["Name", "Email", "Phone", "Stage", "Source", "Visits", "Last seen"].map(h => <th key={h} style={{ ...S.th, textAlign: "left" }}>{h}</th>)}</tr>
+                      <tr>{["Name", "Email", "Phone", "Stage", "Source", "Visits", "Sales pages", "Last seen"].map(h => <th key={h} style={{ ...S.th, textAlign: "left" }}>{h}</th>)}</tr>
                     </thead>
                     <tbody>
                       {crmContacts.map((c, i) => (
@@ -1425,6 +1460,7 @@ export default function App() {
                           <td style={{ ...S.td, textAlign: "left" }}><CrmStageBadge stage={c.stage} /></td>
                           <td style={{ ...S.td, textAlign: "left", color: "#6B7280" }}>{crmSourceLabel(c.attribution) || "—"}</td>
                           <td style={{ ...S.td, textAlign: "left", color: c.is_tracked ? "#374151" : "#9CA3AF" }}>{c.is_tracked ? c.visit_count : "LEGACY"}</td>
+                          <td style={{ ...S.td, textAlign: "left" }}>{(c.sales_pages_hit && c.sales_pages_hit.length) ? <span style={{ display: "inline-flex", gap: 4, flexWrap: "wrap" }}>{c.sales_pages_hit.map(l => <span key={l} title={`Hit ${l}`} style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.03em", color: "#065F46", background: "#D1FAE5", padding: "2px 6px", borderRadius: 4, whiteSpace: "nowrap" }}>{l}</span>)}</span> : <span style={{ color: "#D1D5DB" }}>—</span>}</td>
                           <td style={{ ...S.td, textAlign: "left", color: "#9CA3AF", whiteSpace: "nowrap" }}>{c.last_activity ? crmRelTime(c.last_activity) : "—"}</td>
                         </tr>
                       ))}
@@ -1510,6 +1546,7 @@ export default function App() {
       {crmContact && <CrmContactModal contact={crmContact} tab={crmContactTab} setTab={setCrmContactTab} onClose={() => setCrmContact(null)} isAdmin={isAdmin} onLink={linkSaleToRegistrant} />}
       {emailDrill && <EmailDrillModal drill={emailDrill} loading={emailDrillLoading} onClose={() => setEmailDrill(null)} onOpenContact={(idf) => { setEmailDrill(null); openCrmContact({ email: idf }); }} />}
       {summaryEditorOpen && <SummaryEditor cards={summaryCards} customs={customs} onSave={(cards) => { saveSummaryCards(cards); setSummaryEditorOpen(false); flash("Summary cards updated"); }} onCancel={() => setSummaryEditorOpen(false)} />}
+      {salesEditorOpen && <SalesPagesModal flash={flash} onClose={() => setSalesEditorOpen(false)} onSaved={() => { setSalesPages(null); setCrmSalesPage(""); }} />}
       {toast && (<div className="fi" style={{ ...S.toast, borderLeft: `3px solid ${toast.type === "ok" ? "#12864A" : "#D92D20"}` }}><I d={toast.type === "ok" ? "M20 6L9 17l-5-5" : "M12 2a10 10 0 100 20 10 10 0 000-20zM12 8v4M12 16h.01"} size={16} stroke={toast.type === "ok" ? "#12864A" : "#D92D20"} sw={2.2} />{toast.msg}</div>)}
     </div>
   );
@@ -1701,6 +1738,57 @@ function RegPageMapModal({ flash, onClose, onSaved }) {
   );
 }
 
+function SalesPagesModal({ flash, onClose, onSaved }) {
+  const [rows, setRows] = useState(null); // [{ url, label }]
+  const [isDefault, setIsDefault] = useState(false);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    api.getSalesPages()
+      .then(r => { setRows(Object.entries(r.map || {}).map(([url, label]) => ({ url, label }))); setIsDefault(!!r.isDefault); })
+      .catch(e => { flash(e.message, "err"); setRows([]); });
+  }, []);
+  const update = (i, k, v) => setRows(rs => rs.map((row, j) => j === i ? { ...row, [k]: v } : row));
+  const add = () => setRows(rs => [...(rs || []), { url: "", label: "" }]);
+  const remove = (i) => setRows(rs => rs.filter((_, j) => j !== i));
+  const save = async () => {
+    const map = {};
+    for (const r of (rows || [])) { const u = (r.url || "").trim(); const l = (r.label || "").trim(); if (u && l) map[u] = l; }
+    setSaving(true);
+    try { await api.setSalesPages(map); flash(Object.keys(map).length ? "Sales pages saved" : "Reverted to default"); onSaved && onSaved(); onClose(); }
+    catch (e) { flash(e.message, "err"); }
+    finally { setSaving(false); }
+  };
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div style={{ ...S.modal, maxWidth: 660, width: "92%", textAlign: "left", padding: 0, display: "flex", flexDirection: "column", maxHeight: "85vh" }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: "20px 24px", borderBottom: "1px solid #E5E7EB" }}>
+          <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0, color: "#111827" }}>Sales Pages</h2>
+          <div style={{ fontSize: 13, color: "#6B7280", marginTop: 4 }}>Name each sales/checkout page by its full URL (no query string, e.g. <code>https://drshumardworkshop.com/checkout2</code>). These labels drive the CRM journey, the <strong>Sales pages</strong> column/filter, and AI Insights questions like “how many people hit Sales B”.{isDefault && <span style={{ color: "#9CA3AF" }}> · currently using the built-in default</span>}</div>
+        </div>
+        <div style={{ padding: 24, overflowY: "auto", flex: 1 }}>
+          {rows === null ? <div style={{ color: "#9CA3AF" }}>Loading…</div> : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {rows.map((r, i) => (
+                <div key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <input style={{ ...S.inp, flex: 1, fontSize: 13 }} placeholder="https://drshumardworkshop.com/checkout2" value={r.url} onChange={e => update(i, "url", e.target.value)} />
+                  <input style={{ ...S.inp, width: 150, fontSize: 13 }} placeholder="Sales B" value={r.label} onChange={e => update(i, "label", e.target.value)} />
+                  <button style={{ ...S.btnGhost, padding: "6px 9px" }} onClick={() => remove(i)} title="Remove">✕</button>
+                </div>
+              ))}
+              <button style={{ ...S.btnLight, alignSelf: "flex-start", fontSize: 13 }} onClick={add}>+ Add page</button>
+              {rows.length === 0 && <div style={{ fontSize: 12, color: "#9CA3AF" }}>No pages mapped — saving empty reverts to the default (/checkout→Legacy, /checkout1→Sales A, /checkout2→Sales B).</div>}
+            </div>
+          )}
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, padding: "16px 24px", borderTop: "1px solid #E5E7EB" }}>
+          <button style={S.btnGhost} onClick={onClose}>Cancel</button>
+          <button style={{ ...S.btnDark, opacity: (saving || rows === null) ? 0.6 : 1 }} disabled={saving || rows === null} onClick={save}>{saving ? "Saving…" : "Save"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LensEditor({ lens, onSave, onCancel }) {
   const [name, setName] = useState(lens.name || "");
   const [metrics, setMetrics] = useState((lens.metrics || MK).filter(k => COL_LABELS[k]));
@@ -1863,7 +1951,7 @@ const CRM_STAGE_META = {
   purchase:     { label: "Purchased",   color: "#EF4444" },
 };
 const crmTimelineColor = (item) => {
-  if (item.kind === "pageview") return "#9CA3AF";
+  if (item.kind === "pageview") return item.sales_page ? "#059669" : "#9CA3AF";
   if (item.kind === "tag") return "#14B8A6";
   const ec = { registrations: "#3B82F6", attended: "#0EA5E9", replays: "#8B5CF6", viewedcta: "#F59E0B", clickedcta: "#10B981", purchases: "#EF4444", stayeduntil: "#6366F1" };
   return ec[item.event_type] || "#6B7280";
@@ -1982,7 +2070,7 @@ function CrmContactModal({ contact, tab, setTab, onClose, isAdmin, onLink }) {
               <div style={{ display: "flex", flexDirection: "column" }}>
                 {visits.map((v, i) => (
                   <div key={v.id || i} style={{ padding: "12px 0", borderBottom: i < visits.length - 1 ? "1px solid #F3F4F6" : "none" }}>
-                    <div style={{ fontSize: 13, fontWeight: 500, color: "#111827" }}>{v.page_title || "Page view"}</div>
+                    <div style={{ fontSize: 13, fontWeight: 500, color: "#111827", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>{v.sales_page ? `Visited ${v.sales_page}` : (v.page_title || "Page view")}{v.sales_page && <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.03em", color: "#065F46", background: "#D1FAE5", padding: "2px 6px", borderRadius: 4 }}>SALES PAGE</span>}</div>
                     <div style={{ fontSize: 12, color: "#6B7280", wordBreak: "break-all", marginTop: 2 }}>{v.current_url}</div>
                     <div style={{ fontSize: 11, color: "#9CA3AF", marginTop: 2 }}>{new Date(v.timestamp).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}{v.referrer_url ? ` · from ${v.referrer_url}` : ""}</div>
                   </div>
