@@ -424,10 +424,26 @@
     for (var i = 0; i < names.length; i++) { var nm = names[i].toLowerCase(); if (n===nm||id===nm||ph.indexOf(nm)!==-1||da===nm) return true; }
     return false;
   }
+  /* Never capture payment / card / sensitive fields. Critical now that we read
+     values at bind time, on every input, on flush, AND inside shadow DOM — a numeric
+     card/CVV field must never be sent (PCI/privacy). Card iframes (e.g. Stripe) are
+     cross-origin and unreadable anyway; this guards same-origin/shadow card fields. */
+  function isSensitiveField(el) {
+    try {
+      var ac = ((el.getAttribute && el.getAttribute('autocomplete')) || '').toLowerCase();
+      if (ac.indexOf('cc-') === 0 || ac === 'one-time-code') return true;
+      if ((el.type || '').toLowerCase() === 'password') return true;
+      var s = ((el.name||'') + ' ' + (el.id||'') + ' ' + (el.placeholder||'') + ' ' +
+               ((el.getAttribute && el.getAttribute('data-field'))||'')).toLowerCase();
+      return /(card|cardnum|cc-?num|ccnumber|cvv|cvc|csc|security\s*code|expir|\brouting\b|account\s*number|\bssn\b|\biban\b)/.test(s);
+    } catch (e) { return false; }
+  }
+
   function classifyInput(el) {
     if (!el || !el.tagName) return null;
     var tag = el.tagName.toUpperCase(), type = (el.type||'').toLowerCase(), im = (el.getAttribute('inputmode')||'').toLowerCase();
     if (tag!=='INPUT'&&tag!=='TEXTAREA'&&tag!=='SELECT') return null;
+    if (isSensitiveField(el)) return null;
     if (hasClass(el, CLASSES.email))     return 'email';
     if (hasClass(el, CLASSES.firstName)) return 'firstName';
     if (hasClass(el, CLASSES.lastName))  return 'lastName';
@@ -502,47 +518,113 @@
     sendRegistration({ email:store.lead.email||null, phone:store.lead.phone||null, name:fullName, first_name:store.lead.firstName||null, last_name:store.lead.lastName||null });
   }
 
+  /* ─── Deep DOM traversal (incl. open Shadow DOM) ─── */
+  /* GHL / payment widgets often render fields inside web-component shadow roots,
+     which document.querySelectorAll cannot see. Gather the document + every OPEN
+     shadow root (recursively) so we bind & read those inputs too. (Closed shadow
+     roots are inaccessible to any script — the same limit every tracker has.) */
+  function collectRoots(root) {
+    var roots = [root];
+    try {
+      var hosts = root.querySelectorAll('*');
+      for (var i = 0; i < hosts.length; i++) {
+        if (hosts[i].shadowRoot) {
+          var sub = collectRoots(hosts[i].shadowRoot);
+          for (var j = 0; j < sub.length; j++) roots.push(sub[j]);
+        }
+      }
+    } catch (e) {}
+    return roots;
+  }
+  function queryAllDeep(selector) {
+    var out = [], roots = collectRoots(document);
+    for (var i = 0; i < roots.length; i++) {
+      try {
+        var found = roots[i].querySelectorAll(selector);
+        for (var j = 0; j < found.length; j++) out.push(found[j]);
+      } catch (e) {}
+    }
+    return out;
+  }
+
   /* ─── Form binding ─── */
+  /* Bind one input: change + blur + (debounced) input, AND read its CURRENT value
+     immediately — so prefilled / browser-autofilled values (which fire no change/blur)
+     are captured the moment we see the field. */
+  function bindOneInput(el) {
+    if (!el || el._st_bound) return; el._st_bound=true;
+    el.addEventListener('change', function(){handleFieldChange(el);}, true);
+    el.addEventListener('blur',   function(){handleFieldChange(el);}, true);
+    el.addEventListener('input',  function(){
+      if (el._st_fc_t) clearTimeout(el._st_fc_t);
+      el._st_fc_t = setTimeout(function(){handleFieldChange(el);}, 300);
+    }, true);
+    handleFieldChange(el); /* capture prefilled / autofilled value at bind time */
+  }
   function bindInputListeners(form) {
     if (!form||form._st_inputs_bound) return; form._st_inputs_bound=true;
-    form.querySelectorAll('input, textarea, select').forEach(function (el) {
-      if (el._st_bound) return; el._st_bound=true;
-      el.addEventListener('change', function(){handleFieldChange(el);}, true);
-      el.addEventListener('blur',   function(){handleFieldChange(el);}, true);
-    });
+    form.querySelectorAll('input, textarea, select').forEach(bindOneInput);
   }
   function bindSubmitListener(form) {
     if (!form||form._st_submit_bound) return; form._st_submit_bound=true;
     form.addEventListener('submit', function(){setTimeout(function(){handleFormSubmit(form);},0);}, true);
   }
-  function bindForms() { document.querySelectorAll('form').forEach(function(f){bindInputListeners(f);bindSubmitListener(f);}); }
+  function bindForms() { queryAllDeep('form').forEach(function(f){bindInputListeners(f);bindSubmitListener(f);}); }
   function bindLooseInputs() {
-    document.querySelectorAll('input, textarea').forEach(function(el){
-      if (el.form||el._st_bound) return; el._st_bound=true;
-      el.addEventListener('change', function(){handleFieldChange(el);}, true);
-      el.addEventListener('blur',   function(){handleFieldChange(el);}, true);
+    queryAllDeep('input, textarea').forEach(function(el){
+      if (el.form||el._st_bound) return; bindOneInput(el);
     });
   }
+  /* Bind everything across document + shadow roots, and make sure each shadow root
+     is observed for later mutations. */
+  function bindAll() {
+    bindForms();
+    bindLooseInputs();
+    var roots = collectRoots(document);
+    for (var i = 0; i < roots.length; i++) if (roots[i] !== document) ensureObserver(roots[i]);
+  }
+  /* Final-chance capture: re-read every identity field (incl. shadow DOM) and fire a
+     lead for anything not yet sent. Used on page hide / unload (e.g. the redirect to
+     the portal after purchase), where change/blur may never have fired. send() uses
+     fetch keepalive so it survives the navigation. */
+  function flushCapture() {
+    try { queryAllDeep('input, textarea').forEach(function(el){ handleFieldChange(el); }); } catch (e) {}
+  }
 
-  /* ─── Click capture for SPA submit buttons ─── */
+  /* ─── Click capture for submit/pay buttons (Shadow-DOM aware via composedPath) ─── */
   document.addEventListener('click', function(e) {
-    var el=e.target;
-    for (var i=0;i<5&&el;i++,el=el.parentElement) {
+    var chain = (e.composedPath && e.composedPath()) || null;
+    var el = (chain && chain.length) ? chain[0] : e.target;
+    for (var i=0; i<6 && el; i++) {
       var tag=(el.tagName||'').toUpperCase(), type=(el.type||'').toLowerCase();
       if ((tag==='BUTTON'&&(type==='submit'||!el.type||type==='button'))||(tag==='INPUT'&&type==='submit')) {
-        var form=el.closest('form');
-        if (form) { setTimeout(function(){handleFormSubmit(form);},100); } break;
+        var form = el.closest ? el.closest('form') : null;
+        if (form) { setTimeout(function(){handleFormSubmit(form);},100); }
+        else { setTimeout(flushCapture, 100); } /* formless pay button: scan all fields anyway */
+        break;
       }
+      el = (chain && chain.length) ? chain[i+1] : el.parentElement;
     }
   }, {capture:true, passive:true});
 
-  /* ─── MutationObserver ─── */
-  var _obs=null;
-  function watchDOM() {
-    if (_obs||!window.MutationObserver) return;
-    _obs=new MutationObserver(function(){bindForms();bindLooseInputs();});
-    _obs.observe(document.body,{childList:true,subtree:true});
+  /* ─── MutationObserver (document body + each shadow root) ─── */
+  var _bindT=null;
+  function scheduleBind(){ if (_bindT) return; _bindT=setTimeout(function(){ _bindT=null; bindAll(); }, 150); }
+  function ensureObserver(root) {
+    if (!root || root._st_observed || !window.MutationObserver) return;
+    root._st_observed = true;
+    try {
+      var target = (root === document) ? document.body : root;
+      if (target) new MutationObserver(scheduleBind).observe(target, {childList:true, subtree:true});
+    } catch (e) {}
   }
+  function watchDOM() { ensureObserver(document); }
+
+  /* ─── Final-chance capture on tab hide / navigation (e.g. redirect to portal) ─── */
+  document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState === 'hidden') flushCapture();
+  }, true);
+  window.addEventListener('pagehide', flushCapture, true);
 
   /* ─── Custom event ─── */
   window.addEventListener('stealthtrack_email', function(e){
@@ -560,7 +642,7 @@
        #anchor jump (e.g. #final-cta) is the same page, not a new pageview. */
     if (urlNoHash(cur)!==urlNoHash(_spaLastUrl)){
       _spaLastUrl=cur; store.config.prevUrl=store.config.currentUrl; store.config.currentUrl=cur;
-      store.processedData.pageSent=false; captureClickParams(); sendPageview(); bindForms(); bindLooseInputs();
+      store.processedData.pageSent=false; captureClickParams(); sendPageview(); bindAll();
     } else {
       _spaLastUrl=cur;  /* keep baseline current so a later real change is detected once */
     }
@@ -572,8 +654,7 @@
     store.config.sessionId = initSessionId();
     captureAttribution();
     captureClickParams();
-    bindForms();
-    bindLooseInputs();
+    bindAll();
     watchDOM();
     sendPageview();
 

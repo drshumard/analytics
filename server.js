@@ -4439,9 +4439,10 @@ app.get('/api/crm/stats', dashboardLimiter, requireAuth, async (req, res) => {
 });
 
 // Assemble one person's complete journey: identity + a single chronological timeline
-// merging page views, tag fires (by contact_id) and funnel events (by email). Returns
-// null when no such contact/email exists. Shared by the CRM detail endpoint and the
-// get_contact_journey AI tool.
+// merging page views, tag fires (by contact_id) and funnel events (by email AND by
+// matching phone — so a sale under a different email but same phone still attaches).
+// Returns null when no such contact/email exists. Shared by the CRM detail endpoint and
+// the get_contact_journey AI tool.
 async function buildContactJourney(sb, raw, funnel = null) {
     let contactId = null, email = null, contact = null;
     if (raw.includes('@')) {
@@ -4487,9 +4488,29 @@ async function buildContactJourney(sb, raw, funnel = null) {
         : Promise.resolve({ data: [] });
     const [{ data: visits }, { data: tags }, { data: rawEvents }] = await Promise.all([visitQ, tagQ, eventQ]);
 
-    // De-dupe events (the same email could appear once; guards accidental overlap).
+    // ── Phone-based gather ──────────────────────────────────────────────────
+    // Email-only matching orphans a sale made under a DIFFERENT email. Also pull events
+    // whose phone (normalized to the last 10 digits) matches this person's phone —
+    // anchored on the tracked contacts' phones AND the email-matched events' phones — so
+    // a same-person purchase under another checkout email still attaches to the journey.
+    const normPhone = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.length >= 10 ? d.slice(-10) : ''; };
+    const clusterPhones = [...new Set(
+        clusterContacts.map(c => normPhone(c.phone))
+            .concat((rawEvents || []).map(e => normPhone(e.phone)))
+            .filter(Boolean)
+    )];
+    let phoneEvents = [];
+    if (clusterPhones.length) {
+        const list = clusterPhones.map(p => `'${p}'`).join(','); // 10-digit strings only — safe
+        const { data } = await sb.rpc('ai_run_sql', {
+            query: `SELECT * FROM events WHERE phone IS NOT NULL AND right(regexp_replace(phone, '\\D', '', 'g'), 10) IN (${list}) LIMIT 1000`,
+        });
+        phoneEvents = data || [];
+    }
+
+    // De-dupe by id (the email- and phone-matched sets overlap; id collapses them).
     const seenEv = new Set();
-    const events = (rawEvents || []).filter(e => {
+    const events = [...(rawEvents || []), ...phoneEvents].filter(e => {
         const k = e.id ?? `${e.event_type}|${(e.email || '').toLowerCase()}|${e.event_time}`;
         if (seenEv.has(k)) return false; seenEv.add(k); return true;
     }).sort((a, b) => new Date(a.event_time) - new Date(b.event_time));
