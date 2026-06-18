@@ -1595,112 +1595,104 @@ async function fetchEventsForDateRange(funnel, minDate, maxDate) {
     return allEvents;
 }
 
-async function getDedupCounts(funnel, dates) {
-    if (dates.length === 0) return {};
-    const bucket = getCacheBucket(funnel);
-    const abCutoff = await getAbTestStart(funnel); // null = count all variant data
+// Single-flight registry: funnel → in-flight dedup compute promise. Collapses concurrent
+// cold-cache recomputes (e.g. a burst of dashboard polls right after a restart) so the
+// expensive event-history fetch runs ONCE instead of N times — which is what caused the
+// 20s+ pile-ups and "fetch failed" Supabase pressure (current-day showing 0 then filling).
+const _dedupInflight = {};
+
+// Heavy path: fetch + dedup the uncached dates, write to cache (epoch-guarded), prune.
+// Returns the freshly computed values by date (so the caller still gets accurate numbers
+// even when a mid-flight invalidation skips the cache write).
+async function computeAndCacheUncached(funnel, bucket, uncachedDates, today) {
+    cache.misses++;
+    const abCutoff = await getAbTestStart(funnel);     // null = count all variant data
     const aliasMap = await getCombinedAliases(funnel); // ambient stitch + manual links
     const emailPhones = await getTrackingPhones(funnel); // email→shumard phone enrichment
-    const today = dateToISO(getLADate());
 
-    // Today's dedup expires after 3 seconds to handle concurrent webhook races (#14)
-    // Past days are cached forever (their counts can't change)
-    if (bucket.dedupCounts[today] && bucket.dedupTimestamps[today]) {
-        if (Date.now() - bucket.dedupTimestamps[today] > 3000) {
-            delete bucket.dedupCounts[today];
+    // Split uncached dates into contiguous ranges to avoid refetching cached gaps (#9)
+    const sorted = [...uncachedDates].sort();
+    const ranges = [];
+    let rangeStart = sorted[0], rangePrev = sorted[0];
+    for (let i = 1; i < sorted.length; i++) {
+        const gapDays = (new Date(sorted[i] + 'T00:00:00Z') - new Date(rangePrev + 'T00:00:00Z')) / 86400000;
+        if (gapDays > 3) { ranges.push([rangeStart, rangePrev]); rangeStart = sorted[i]; }
+        rangePrev = sorted[i];
+    }
+    ranges.push([rangeStart, rangePrev]);
+    console.log(`📊 Cache[${funnel}] MISS: ${uncachedDates.length} uncached date(s) across ${ranges.length} range(s)`);
+
+    // Snapshot the epoch; if an invalidation lands mid-fetch, don't write stale results.
+    const epochAtStart = bucket.invalidationEpoch;
+    const computedByDate = {};
+    for (const [minDate, maxDate] of ranges) {
+        const events = await fetchEventsForDateRange(funnel, minDate, maxDate);
+        const computed = computeDedupFromEvents(events, abCutoff, aliasMap, emailPhones);
+        const dayCounts = {};
+        for (const [d, counts] of Object.entries(computed)) {
+            dayCounts[d] = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(', ');
+        }
+        if (Object.keys(dayCounts).length > 0) {
+            console.log(`📊 Dedup[${funnel}] [${minDate}→${maxDate}]:`, JSON.stringify(dayCounts));
+        }
+        for (const d of uncachedDates) {
+            if (d >= minDate && d <= maxDate) computedByDate[d] = computed[d] || {};
         }
     }
 
-    // Find dates that are NOT in the cache
-    const uncachedDates = dates.filter(d => !(d in bucket.dedupCounts));
+    if (bucket.invalidationEpoch === epochAtStart) {
+        for (const [d, counts] of Object.entries(computedByDate)) {
+            bucket.dedupCounts[d] = counts;
+            if (d === today) bucket.dedupTimestamps[d] = Date.now();
+        }
+    } else {
+        console.log(`⚠️  Cache[${funnel}]: skipped dedup write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${bucket.invalidationEpoch})`);
+    }
 
+    // Prune dedup cache: drop dates older than 120 days to bound growth (#5)
+    const pruneCutoff = new Date();
+    pruneCutoff.setDate(pruneCutoff.getDate() - 120);
+    const pruneISO = pruneCutoff.toISOString().slice(0, 10);
+    for (const d of Object.keys(bucket.dedupCounts)) {
+        if (d < pruneISO) delete bucket.dedupCounts[d];
+    }
+    return computedByDate;
+}
+
+async function getDedupCounts(funnel, dates) {
+    if (dates.length === 0) return {};
+    const bucket = getCacheBucket(funnel);
+    const today = dateToISO(getLADate());
+
+    // Today's dedup expires after 3 seconds to handle concurrent webhook races (#14).
+    // Past days are cached forever (their counts can't change).
+    if (bucket.dedupCounts[today] && bucket.dedupTimestamps[today] && Date.now() - bucket.dedupTimestamps[today] > 3000) {
+        delete bucket.dedupCounts[today];
+    }
+
+    let uncachedDates = dates.filter(d => !(d in bucket.dedupCounts));
+    let computed = {};
     if (uncachedDates.length > 0) {
-        cache.misses++;
-
-        // Split uncached dates into contiguous ranges to avoid fetching
-        // already-cached intermediate dates (#9)
-        const sorted = [...uncachedDates].sort();
-        const ranges = [];
-        let rangeStart = sorted[0];
-        let rangePrev = sorted[0];
-        for (let i = 1; i < sorted.length; i++) {
-            const prevDate = new Date(rangePrev + 'T00:00:00Z');
-            const currDate = new Date(sorted[i] + 'T00:00:00Z');
-            const gapDays = (currDate - prevDate) / 86400000;
-            if (gapDays > 3) {
-                // Gap too large — start a new range
-                ranges.push([rangeStart, rangePrev]);
-                rangeStart = sorted[i];
-            }
-            rangePrev = sorted[i];
+        // Single-flight: if a compute is already running for this funnel, await it and
+        // recheck — usually the dates we need were just filled in, so we skip a duplicate
+        // full fetch. (No await before this check, so the assignment below is atomic.)
+        if (_dedupInflight[funnel]) {
+            await _dedupInflight[funnel].catch(() => {});
+            uncachedDates = dates.filter(d => !(d in bucket.dedupCounts));
         }
-        ranges.push([rangeStart, rangePrev]);
-
-        console.log(`📊 Cache[${funnel}] MISS: ${uncachedDates.length} uncached date(s) across ${ranges.length} range(s)`);
-
-        // Snapshot the epoch before the fetch. If an invalidation runs while
-        // we're awaiting Supabase, the epoch will change and we must NOT
-        // write the now-stale results back into the cache.
-        const epochAtStart = bucket.invalidationEpoch;
-
-        // Fetch each range, log, and cache in a single pass
-        const computedByDate = {};
-        for (const [minDate, maxDate] of ranges) {
-            const events = await fetchEventsForDateRange(funnel, minDate, maxDate);
-            const computed = computeDedupFromEvents(events, abCutoff, aliasMap, emailPhones);
-
-            // Log per-day breakdown for diagnostics
-            const dayCounts = {};
-            for (const [d, counts] of Object.entries(computed)) {
-                dayCounts[d] = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(', ');
-            }
-            if (Object.keys(dayCounts).length > 0) {
-                console.log(`📊 Dedup[${funnel}] [${minDate}→${maxDate}]:`, JSON.stringify(dayCounts));
-            }
-
-            // Collect computed results so we can return them even if we
-            // skip the cache write below.
-            for (const d of uncachedDates) {
-                if (d >= minDate && d <= maxDate) {
-                    computedByDate[d] = computed[d] || {};
-                }
-            }
+        if (uncachedDates.length > 0) {
+            const p = computeAndCacheUncached(funnel, bucket, uncachedDates, today);
+            _dedupInflight[funnel] = p;
+            try { computed = await p; } finally { if (_dedupInflight[funnel] === p) delete _dedupInflight[funnel]; }
         }
-
-        if (bucket.invalidationEpoch === epochAtStart) {
-            for (const [d, counts] of Object.entries(computedByDate)) {
-                bucket.dedupCounts[d] = counts;
-                if (d === today) bucket.dedupTimestamps[d] = Date.now();
-            }
-        } else {
-            console.log(`⚠️  Cache[${funnel}]: skipped dedup write — invalidation occurred mid-fetch (epoch ${epochAtStart} → ${bucket.invalidationEpoch})`);
-        }
-
-        // Prune dedup cache: drop dates older than 120 days to prevent unbounded growth (#5)
-        const pruneCutoff = new Date();
-        pruneCutoff.setDate(pruneCutoff.getDate() - 120);
-        const pruneISO = pruneCutoff.toISOString().slice(0, 10);
-        for (const d of Object.keys(bucket.dedupCounts)) {
-            if (d < pruneISO) delete bucket.dedupCounts[d];
-        }
-
-        // Caller gets accurate numbers regardless of whether we wrote them
-        // to the cache. Merge freshly computed values into the result first,
-        // then layer cache reads for dates we didn't refetch.
-        const result = {};
-        for (const d of dates) {
-            if (computedByDate[d]) result[d] = computedByDate[d];
-            else if (bucket.dedupCounts[d]) result[d] = bucket.dedupCounts[d];
-        }
-        return result;
     } else {
         cache.hits++;
     }
 
-    // Build result from cache
     const result = {};
     for (const d of dates) {
-        if (bucket.dedupCounts[d]) result[d] = bucket.dedupCounts[d];
+        if (computed[d]) result[d] = computed[d];
+        else if (bucket.dedupCounts[d]) result[d] = bucket.dedupCounts[d];
     }
     return result;
 }
@@ -1772,13 +1764,16 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
 
     const updates = { finalized_at: new Date().toISOString() };
     const written = {};
+    const splits = {}; // per-field { A, B, undetected } — read by the expanded dashboard view
     for (const f of FIELDS) {
         // counts[f] is the per-variant breakdown; canonical columns store the total
-        const v = Number(counts[f]?.all) || 0;
+        const c = counts[f];
+        const v = Number(c?.all) || 0;
         const parentAuthoritative = eventTypesOnDate.has(FIELD_PARENT[f]);
         if (v > 0 || parentAuthoritative) {
             updates[f] = v;
             written[f] = v;
+            splits[f] = { A: Number(c?.A) || 0, B: Number(c?.B) || 0, undetected: Number(c?.undetected) || 0 };
         }
     }
 
@@ -1796,6 +1791,17 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
     const { error } = await supabase.from('daily_metrics')
         .update(updates).eq('date', isoDate);
     if (error) throw error;
+
+    // Persist per-variant splits separately + best-effort: if the variant_splits column
+    // hasn't been migrated yet, this no-ops and finalize still succeeds (the expanded
+    // view simply keeps deduping that day until the column exists and is backfilled).
+    try {
+        const { error: vsErr } = await supabase.from('daily_metrics')
+            .update({ variant_splits: splits }).eq('date', isoDate);
+        if (vsErr && !/variant_splits/.test(vsErr.message || '')) {
+            console.warn(`⚠️ variant_splits write failed [${funnel} ${isoDate}]:`, vsErr.message);
+        }
+    } catch (e) { /* column not migrated yet — safe to ignore */ }
 
     invalidateMetricsCache(funnel);
     invalidateInsightsCache(funnel);
@@ -2011,13 +2017,15 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         if (error) throw error;
 
         // ── Dedup counts ──────────────────────────────────────────────────
-        // For the plain 'all' view, skip dedup on finalized rows (canonical columns
-        // hold the durable total — events may have aged out). For variant filtering
-        // OR the expanded payload, ALWAYS dedup since per-variant breakdowns aren't
-        // stored in the canonical columns.
+        // Plain 'all' view: skip dedup on finalized rows (canonical columns hold the
+        // durable total). Variant/expanded view: needs the A/B/undetected split — read it
+        // from the persisted variant_splits column for finalized days, and only dedup days
+        // that lack it (today + any finalized day not yet backfilled). This is what stops
+        // the ~20s full-history recompute on a cold cache.
         const forceAllDedup = variant !== 'all' || expandVariants;
+        const hasStoredSplits = (r) => r.variant_splits && typeof r.variant_splits === 'object' && Object.keys(r.variant_splits).length > 0;
         const dates = (data || [])
-            .filter(r => forceAllDedup || !r.finalized_at)
+            .filter(r => !r.finalized_at || (forceAllDedup && !hasStoredSplits(r)))
             .map(r => String(r.date).substring(0, 10));
         const dedupMap = await getDedupCounts(funnel, dates);
         // Reg-page unique visitors per variant (shumard pageviews) — for ALL row dates,
@@ -2040,16 +2048,20 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             const rv = regVisits[dateStr] || {}; // reg-page visitors per variant for this day
             const ov = row.overrides || {};
             const isFinalized = !!row.finalized_at;
+            const splits = (row.variant_splits && typeof row.variant_splits === 'object') ? row.variant_splits : null;
             // Resolve one event field for a given variant bucket.
             //   - 'all' view: admin override wins; finalized days use the canonical
             //     column (durable — survives event pruning); otherwise live dedup.
-            //   - A/B/undetected: always live dedup (canonical is variant-blind).
+            //   - A/B/undetected: finalized days use the persisted variant_splits column
+            //     (no dedup); otherwise live dedup. Canonical columns are variant-blind.
             // Once dedup has run for a date, a missing key means 0 events — never
             // fall through to the raw column (which can be briefly ahead of dedup).
             const pickV = (field, vnt) => {
                 if (vnt === 'all') {
                     if (ov[field] !== undefined) return ov[field];
                     if (isFinalized && DEDUP_COLS.has(field)) return Number(row[field]) || 0;
+                } else if (isFinalized && splits && DEDUP_COLS.has(field)) {
+                    return (splits[field] && splits[field][vnt]) || 0;
                 }
                 const dd = deduped[field];
                 if (dd !== undefined) return dd[vnt] ?? 0;
@@ -2408,6 +2420,74 @@ app.post('/api/admin/finalize-past-days', requireAuth, requireAdmin, async (req,
         res.json({ total: results.length, finalized: okCount, results });
     } catch (err) {
         console.error('❌ POST /api/admin/finalize-past-days error:', err.message);
+        res.status(500).json({ error: 'Backfill failed', detail: err.message });
+    }
+});
+
+// POST /api/admin/backfill-variant-splits — populate daily_metrics.variant_splits for
+// already-finalized past days that lack it, so the expanded dashboard view stops re-deduping
+// the whole event history on a cold cache. Writes ONLY variant_splits — canonical totals and
+// finalized_at are left untouched (so historical numbers can't shift). Computes the whole
+// span in one dedup pass. Idempotent: skips days that already have splits. Run once after the
+// variant_splits migration is applied. Optional body: { force:true } to recompute all days.
+app.post('/api/admin/backfill-variant-splits', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const funnel = req.funnel;
+        const sb = clientFor(funnel);
+        const force = !!(req.body && req.body.force);
+        const todayISO = dateToISO(getLADate());
+
+        const { data: rows, error } = await sb.from('daily_metrics')
+            .select('date, finalized_at, variant_splits')
+            .not('finalized_at', 'is', null)
+            .lt('date', todayISO)
+            .order('date', { ascending: true });
+        if (error) {
+            if (/variant_splits/.test(error.message || '')) {
+                return res.status(400).json({ error: 'variant_splits column not found — run db/migrate_variant_splits.sql first' });
+            }
+            throw error;
+        }
+        const has = (r) => r.variant_splits && typeof r.variant_splits === 'object' && Object.keys(r.variant_splits).length > 0;
+        const targets = (rows || []).filter(r => force || !has(r));
+        if (!targets.length) {
+            return res.json({ ok: true, finalized_days: (rows || []).length, backfilled: 0, message: 'nothing to backfill' });
+        }
+
+        // One wide dedup pass over the full span (+60-day lookback for early registrations).
+        const minDate = String(targets[0].date).substring(0, 10);
+        const from = new Date(minDate + 'T12:00:00Z'); from.setUTCDate(from.getUTCDate() - 60);
+        const fromISO = from.toISOString().slice(0, 10);
+        const abCutoff = await getAbTestStart(funnel);
+        const aliasMap = await getCombinedAliases(funnel);
+        const emailPhones = await getTrackingPhones(funnel);
+        const events = await fetchEventsForDateRange(funnel, fromISO, todayISO);
+        const dedupMap = computeDedupFromEvents(events, abCutoff, aliasMap, emailPhones);
+
+        const FIELDS = [
+            'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
+            'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot',
+            'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b',
+            'stayed_45', 'stayed_60', 'stayed_80',
+        ];
+        let updated = 0;
+        for (const t of targets) {
+            const d = String(t.date).substring(0, 10);
+            const counts = dedupMap[d] || {};
+            const splits = {};
+            for (const f of FIELDS) {
+                const c = counts[f];
+                if (c) splits[f] = { A: Number(c.A) || 0, B: Number(c.B) || 0, undetected: Number(c.undetected) || 0 };
+            }
+            const { error: upErr } = await sb.from('daily_metrics').update({ variant_splits: splits }).eq('date', d);
+            if (!upErr) updated++;
+            else console.warn(`⚠️ backfill splits failed [${funnel} ${d}]:`, upErr.message);
+        }
+        invalidateMetricsCache(funnel);
+        console.log(`🧬 Backfill variant_splits[${funnel}]: ${updated}/${targets.length} day(s) by ${req.user.email}`);
+        res.json({ ok: true, finalized_days: (rows || []).length, backfilled: updated, of: targets.length });
+    } catch (err) {
+        console.error('❌ POST /api/admin/backfill-variant-splits error:', err.message);
         res.status(500).json({ error: 'Backfill failed', detail: err.message });
     }
 });
@@ -4839,6 +4919,20 @@ app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// Catch-all error handler. A malformed percent-encoding (e.g. /%c0) makes Express throw a
+// URIError while decoding the path — return a clean 400 instead of letting it surface as an
+// unhandled error (log noise, and a guard against anything that could crash → restart,
+// since every restart cold-starts the in-memory cache).
+app.use((err, req, res, next) => {
+    if (err instanceof URIError) {
+        if (!res.headersSent) res.status(400).json({ error: 'Bad request URL' });
+        return;
+    }
+    console.error('❌ Unhandled request error:', err && err.message);
+    if (res.headersSent) return next(err);
+    res.status(500).json({ error: 'Internal server error' });
+});
+
 
 // =============================================================================
 // START
@@ -4862,7 +4956,26 @@ const server = app.listen(PORT, () => {
 
     // Signal PM2 that this process is ready to accept traffic
     if (process.send) process.send('ready');
+
+    // Warm the metrics caches in the background so the FIRST dashboard load after a
+    // (re)start isn't a cold ~20s recompute that shows the current day as 0. Hits the
+    // same open /api/metrics endpoint the dashboard uses (plain + expanded, per funnel),
+    // populating both the dedup cache and the assembled-response cache. Best-effort.
+    warmCaches();
 });
+
+async function warmCaches() {
+    const base = `http://127.0.0.1:${PORT}`;
+    for (const funnel of ALLOWED_FUNNELS) {
+        for (const qs of ['limit=90&offset=0', 'limit=90&offset=0&expand=variants']) {
+            try {
+                const r = await fetch(`${base}/api/metrics?${qs}`, { headers: { 'x-funnel': funnel } });
+                await r.text();
+            } catch (e) { /* best-effort: a failed warm just means the first user request pays the cost */ }
+        }
+    }
+    console.log('🔥 Cache warm complete (metrics primed for', ALLOWED_FUNNELS.join(', '), ')');
+}
 
 // ─── Graceful Shutdown ───────────────────────────────────────────────────────
 // PM2 sends SIGINT during reload — finish in-flight requests, then exit cleanly
