@@ -851,6 +851,27 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
                         return res.json({ success: true, duplicate: true, message: 'Duplicate registration skipped (same webinar day)' });
                     }
                 }
+            } else if (field === 'purchases') {
+                // Purchases: ONE per email per LA calendar day. A buyer purchases once;
+                // re-sends / retries across the day — even hours apart, and regardless of
+                // source — are duplicates (the 5-min window missed 15–20 min retries). We
+                // compare the LA day of any existing purchase for this email (36h lookback
+                // covers the timezone boundary). NOTE: this also blocks a genuine second
+                // same-day purchase by the same email — accepted tradeoff for this funnel.
+                const dayLookback = new Date(Date.now() - 36 * 60 * 60 * 1000).toISOString();
+                const { data: recent } = await supabase
+                    .from('events')
+                    .select('id, event_time')
+                    .eq('event_type', 'purchases')
+                    .eq('email', email)
+                    .gte('event_time', dayLookback);
+                const todayLA = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+                const isDup = (recent || []).some(ev =>
+                    new Date(ev.event_time).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' }) === todayLA);
+                if (isDup) {
+                    console.log(`⏭️  Dedup skip: purchase for ${email} (already purchased today ${todayLA})`);
+                    return res.json({ success: true, duplicate: true, message: 'Duplicate purchase skipped (one per email per day)' });
+                }
             } else {
                 // All other event types: 5-minute dedup window (webhook retry protection).
                 // For stayeduntil, the milestone (45/60/80) is part of the dedup key —
