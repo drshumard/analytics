@@ -152,7 +152,7 @@ Conversations persist per user (`/api/insights/conversations`).
 Full reference in **[APIs.md](APIs.md)**. Summary:
 
 - **Webhooks** (`X-API-Key`): `/api/metrics`, `/api/metrics/batch`, `/api/metrics/increment`, `/api/metrics/set`, `/api/fb-sync`.
-- **AI Tools API** (`X-API-Key`): `GET /api/ai/tools` + `POST /api/ai/tools/<tool_name>` (or `GET /api/ai/tools/<email>` for one contact's full journey) — lets an external AI app call the analyst's read‑only tools; deny‑by‑default per‑key `scopes` in `public.api_keys` (env webhook keys get no AI access).
+- **AI Tools API** (`X-API-Key`): `GET /api/ai/tools` + `POST /api/ai/tools/<tool_name>` (or `GET /api/ai/tools/<email>` for one contact's journey, condensed: pageviews rolled up, timeline newest‑first) — lets an external AI app call the analyst's read‑only tools; deny‑by‑default per‑key `scopes` in `public.api_keys` (env webhook keys get no AI access).
 - **Tracking** (public, permissive CORS): `GET /shumard.js`, `POST /api/sg/{pageview,lead,registration,tag}`.
 - **Dashboard** (Supabase JWT; `X-Funnel`): metrics, custom‑metrics, events, CRM (`/api/crm/*`), insights (`/api/insights/*`), lenses, admin.
 

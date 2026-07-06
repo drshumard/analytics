@@ -3958,7 +3958,7 @@ app.get('/api/ai/tools', webhookLimiter, authenticateWebhook, (req, res) => {
     });
 });
 
-async function handleExternalTool(req, res, name, input) {
+async function handleExternalTool(req, res, name, input, transform) {
     if (!EXTERNAL_TOOL_NAMES.has(name)) {
         return res.status(404).json({ error: `Unknown tool: ${name}` });
     }
@@ -3967,7 +3967,8 @@ async function handleExternalTool(req, res, name, input) {
     }
     try {
         // userId is only consumed by remember/forget, which aren't exposed here.
-        const result = await executeInsightsTool(name, input, { funnel: req.funnel, userId: null });
+        let result = await executeInsightsTool(name, input, { funnel: req.funnel, userId: null });
+        if (transform) result = transform(result);
         res.json({ tool: name, funnel: req.funnel, result });
     } catch (err) {
         console.error(`❌ ${req.method} /api/ai/tools/${name} error:`, err.message);
@@ -3975,12 +3976,50 @@ async function handleExternalTool(req, res, name, input) {
     }
 }
 
+// The full journey easily runs to hundreds of KB — the same page re-visited
+// over and over, replay-heartbeat events every 5 minutes — which overflows
+// downstream bots' message-size caps and cuts off the NEWEST entries. So the
+// email shortcut returns a CONDENSED journey: contact + linked identities in
+// full; pageviews rolled up per page and repeat events rolled up per label
+// (count + first/last seen, entry sits at its LAST occurrence); timeline
+// newest-first so the freshest signal survives any client-side truncation;
+// the raw `visits`/`events` arrays (full duplicate rows of the timeline)
+// replaced by an events_by_type count. The raw tool —
+// POST /api/ai/tools/get_contact_journey — still returns the full object.
+function condenseJourney(j) {
+    if (!j || j.error || !Array.isArray(j.timeline)) return j;
+    const roll = new Map();
+    const rest = []; // tags pass through untouched — they're rare and each one is signal
+    for (const t of j.timeline) {
+        let key, entry;
+        if (t.kind === 'pageview') {
+            const path = String(t.url || '').split('?')[0] || t.label; // query strings collapse together
+            key = `pv|${path}`;
+            entry = { ts: t.ts, kind: 'pageviews', label: t.label, url: path, sales_page: t.sales_page || null };
+        } else if (t.kind === 'event') {
+            key = `ev|${t.label}|${t.email || ''}`; // per-label; distinct labels (Stayed 60m, Purchased (Sales A)) stay apart
+            entry = { ts: t.ts, kind: 'event', event_type: t.event_type, label: t.label, source: t.source || null, email: t.email || null };
+        } else { rest.push(t); continue; }
+        let p = roll.get(key);
+        if (!p) { p = { ...entry, count: 0, first: t.ts, last: t.ts }; roll.set(key, p); }
+        p.count++;
+        if (new Date(t.ts) < new Date(p.first)) p.first = t.ts;
+        if (new Date(t.ts) > new Date(p.last)) { p.last = t.ts; p.ts = t.ts; }
+    }
+    const timeline = rest.concat([...roll.values()])
+        .sort((a, b) => new Date(b.ts) - new Date(a.ts)); // newest first
+    const events_by_type = {};
+    for (const e of (j.events || [])) events_by_type[e.event_type] = (events_by_type[e.event_type] || 0) + 1;
+    const { visits, events, ...keep } = j;
+    return { ...keep, timeline, events_by_type, condensed: true, timeline_order: 'newest_first' };
+}
+
 // An '@' in the path segment means it's a contact EMAIL, not a tool name —
-// /api/ai/tools/jane@example.com (GET or POST) returns that person's full
-// journey via get_contact_journey, so the common lookup needs no body at all.
+// /api/ai/tools/jane@example.com (GET or POST) returns that person's journey
+// via get_contact_journey (condensed — see above), no body needed.
 app.post('/api/ai/tools/:name', webhookLimiter, authenticateWebhook, async (req, res) => {
     const { name } = req.params;
-    if (name.includes('@')) return handleExternalTool(req, res, 'get_contact_journey', { identifier: name });
+    if (name.includes('@')) return handleExternalTool(req, res, 'get_contact_journey', { identifier: name }, condenseJourney);
     return handleExternalTool(req, res, name, req.body || {});
 });
 
@@ -3989,7 +4028,7 @@ app.get('/api/ai/tools/:identifier', webhookLimiter, authenticateWebhook, async 
     if (!id.includes('@')) {
         return res.status(404).json({ error: `Not an email: ${id}. GET /api/ai/tools/<email> looks up a contact; tools are executed with POST /api/ai/tools/<tool_name>.` });
     }
-    return handleExternalTool(req, res, 'get_contact_journey', { identifier: id });
+    return handleExternalTool(req, res, 'get_contact_journey', { identifier: id }, condenseJourney);
 });
 
 
