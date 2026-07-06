@@ -507,14 +507,17 @@ async function authenticateWebhook(req, res, next) {
     // Slow path: check public.api_keys table (single source of truth across funnels)
     try {
         const hash = crypto.createHash('sha256').update(key).digest('hex');
+        // select('*') rather than naming columns so the lookup still works on a
+        // DB where migrate_api_key_scopes.sql hasn't run yet (no scopes column).
         const { data: dbKey } = await supabasePublic
             .from('api_keys')
-            .select('id, is_active, funnel')
+            .select('*')
             .eq('key_hash', hash)
             .single();
         if (dbKey && dbKey.is_active && ALLOWED_FUNNELS.includes(dbKey.funnel)) {
             await supabasePublic.from('api_keys').update({ last_used_at: new Date().toISOString() }).eq('id', dbKey.id);
             req.funnel = dbKey.funnel;
+            req.apiKeyScopes = dbKey.scopes || []; // TEXT[] of allowed AI tool names; empty = none, ['*'] = all
             return next();
         }
     } catch { /* DB key lookup failed, fall through */ }
@@ -3923,6 +3926,70 @@ app.delete('/api/insights/conversations/:id', dashboardLimiter, requireAuth, asy
         console.error('❌ DELETE /api/insights/conversations error:', err.message);
         res.status(500).json({ error: 'Internal server error' });
     }
+});
+
+// ─── AI Tools API — external tool-calling access (X-API-Key) ─────────────────
+// Exposes the same INSIGHTS_TOOLS the built-in analyst uses, so an external AI
+// app can drive them from its own LLM loop: GET the definitions, hand them to
+// its model, POST each tool_use here, feed the JSON back as the tool_result.
+// remember/forget are excluded — they personalize the in-app chat per dashboard
+// user — so this surface is strictly read-only. Access is DENY BY DEFAULT:
+// a key must carry an explicit scopes TEXT[] in public.api_keys naming the
+// tools it may call ('*' = all). Keys without scopes — including the env keys
+// API_KEY/NATIVE_API_KEY, which live in third-party webhook configs — get
+// nothing, so shipping this feature grants no existing credential access to
+// PII tools like run_sql. The key picks the funnel.
+
+const EXTERNAL_TOOL_NAMES = new Set(
+    INSIGHTS_TOOLS.map(t => t.name).filter(n => n !== 'remember' && n !== 'forget')
+);
+
+function allowedExternalTools(req) {
+    const scopes = req.apiKeyScopes || []; // env keys never set scopes → no access
+    if (scopes.includes('*')) return EXTERNAL_TOOL_NAMES;
+    return new Set([...EXTERNAL_TOOL_NAMES].filter(n => scopes.includes(n)));
+}
+
+app.get('/api/ai/tools', webhookLimiter, authenticateWebhook, (req, res) => {
+    const allowed = allowedExternalTools(req);
+    res.json({
+        funnel: req.funnel,
+        tools: INSIGHTS_TOOLS.filter(t => allowed.has(t.name)),
+    });
+});
+
+async function handleExternalTool(req, res, name, input) {
+    if (!EXTERNAL_TOOL_NAMES.has(name)) {
+        return res.status(404).json({ error: `Unknown tool: ${name}` });
+    }
+    if (!allowedExternalTools(req).has(name)) {
+        return res.status(403).json({ error: `This API key has no access to tool: ${name}` });
+    }
+    try {
+        // userId is only consumed by remember/forget, which aren't exposed here.
+        const result = await executeInsightsTool(name, input, { funnel: req.funnel, userId: null });
+        res.json({ tool: name, funnel: req.funnel, result });
+    } catch (err) {
+        console.error(`❌ ${req.method} /api/ai/tools/${name} error:`, err.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+}
+
+// An '@' in the path segment means it's a contact EMAIL, not a tool name —
+// /api/ai/tools/jane@example.com (GET or POST) returns that person's full
+// journey via get_contact_journey, so the common lookup needs no body at all.
+app.post('/api/ai/tools/:name', webhookLimiter, authenticateWebhook, async (req, res) => {
+    const { name } = req.params;
+    if (name.includes('@')) return handleExternalTool(req, res, 'get_contact_journey', { identifier: name });
+    return handleExternalTool(req, res, name, req.body || {});
+});
+
+app.get('/api/ai/tools/:identifier', webhookLimiter, authenticateWebhook, async (req, res) => {
+    const id = req.params.identifier;
+    if (!id.includes('@')) {
+        return res.status(404).json({ error: `Not an email: ${id}. GET /api/ai/tools/<email> looks up a contact; tools are executed with POST /api/ai/tools/<tool_name>.` });
+    }
+    return handleExternalTool(req, res, 'get_contact_journey', { identifier: id });
 });
 
 

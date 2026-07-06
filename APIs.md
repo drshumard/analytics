@@ -60,7 +60,34 @@ Stages: `lead → registration → attended → replay → viewedcta → clicked
 | `PUT` | `/api/insights/conversations/:id` | Save/update a conversation |
 | `DELETE` | `/api/insights/conversations/:id` | Delete a conversation |
 
-The model's tools: `get_metrics`, `get_metrics_rollup`, `compare_periods`, `get_event_counts`, `list_custom_metrics`, `get_journey_funnel`, `get_contact_journey`, `get_journey_segment`, `describe_journey_data`, `get_email_report`, `run_sql` (read‑only), `remember`, `forget`.
+The model's tools: `get_metrics`, `get_metrics_rollup`, `compare_periods`, `get_event_counts`, `list_custom_metrics`, `get_journey_funnel`, `get_variant_funnel`, `get_contact_journey`, `get_journey_segment`, `describe_journey_data`, `get_email_report`, `get_sales_page_visits`, `run_sql` (read‑only), `remember`, `forget`.
+
+---
+
+## AI Tools API — `X-API-Key` (external AI apps)
+
+Gives an external AI app the same tool set the built‑in analyst uses. The app runs its own LLM loop: fetch the definitions, pass them to its model as tools, POST each `tool_use` here, and feed the JSON back as the `tool_result`.
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/api/ai/tools` | Tool definitions (Anthropic `{name, description, input_schema}` format), filtered to what the key may call. Returns `{ funnel, tools }`. |
+| `POST` | `/api/ai/tools/<tool_name>` | Execute one tool (`<tool_name>` = a tool from the list, e.g. `get_metrics`, `run_sql`). Body = the tool's input JSON. Returns `{ tool, funnel, result }`. |
+| `GET` | `/api/ai/tools/<email>` | Shortcut: a contact's complete journey (identity, attribution, stage, chronological timeline of pageviews + tags + funnel events) — the `@` marks it as an email, no body needed. Same as running `get_contact_journey`; requires that tool in scope. Also works as `POST`. |
+
+- **Auth**: `X-API-Key` — a key row in `public.api_keys`; the key selects the funnel. Mint a dedicated key per external app (see `db/migrate_api_key_scopes.sql` for the recipe).
+- **Scoping — deny by default**: the key row's `scopes TEXT[]` must explicitly name the tools it can list/call (`403` outside scope). `NULL`/empty = no AI tools; `ARRAY['*']` = all. The env webhook keys (`API_KEY`, `NATIVE_API_KEY`) get **no** AI tools access — they stay push‑only. PII lives in `run_sql`, `get_contact_journey`, `get_journey_segment` — omit those from `scopes` for a PII‑free key.
+- **Read‑only**: `remember`/`forget` are not exposed (`404`) — they personalize the in‑app chat per dashboard user.
+- **Errors**: unknown tool → `404`; out of scope → `403`. Tool‑level failures (bad input, SQL rejected) return `200` with `result.error` — exactly what the built‑in analyst's model sees.
+- **Limits**: 300 req/min per IP; `run_sql` is a single `SELECT`/`WITH`, capped at 500 rows / 5 s.
+
+```
+curl -s https://analytics.drshumard.com/api/ai/tools -H "X-API-Key: <key>"
+curl -s https://analytics.drshumard.com/api/ai/tools/get_journey_funnel \
+     -H "X-API-Key: <key>" -H "Content-Type: application/json" \
+     -d '{"date_from":"2026-06-01","date_to":"2026-06-30"}'
+# one person's full journey — look up by EMAIL:
+curl -s https://analytics.drshumard.com/api/ai/tools/jane@example.com -H "X-API-Key: <key>"
+```
 
 ---
 
