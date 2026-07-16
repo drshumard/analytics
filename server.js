@@ -2922,6 +2922,7 @@ async function getGhlPipelineStatus(funnel, input) {
     let segmentCapped = false;
     if (Array.isArray(input.emails) && input.emails.length) {
         emails = [...new Set(input.emails.map(e => String(e).trim().toLowerCase()).filter(e => e.includes('@')))];
+        if (emails.length > 500) { emails = emails.slice(0, 500); segmentCapped = true; }
         segmentLabel = `explicit list (${emails.length} emails)`;
     } else {
         const eventType = String(input.event_type || 'purchases');
@@ -2946,16 +2947,18 @@ async function getGhlPipelineStatus(funnel, input) {
     const index = await ghlPipelinesIndex();
     const pipeFilter = input.pipeline ? String(input.pipeline).toLowerCase() : null;
     const stageF = input.stage_filter ? String(input.stage_filter).toLowerCase() : null;
-    // Default scan: every pipeline small enough to be a patient-journey board.
-    // The giant call-dialer pipelines are skipped and reported, not hidden.
-    const targets = pipeFilter
-        ? index.filter(p => p.name.toLowerCase().includes(pipeFilter))
-        : index.filter(p => p.total > 0 && p.total <= GHL_MAX_DEFAULT_PIPELINE);
-    if (!targets.length) {
+    // The pipeline param FOCUSES the report, it does not narrow the scan: the
+    // patient-journey pipelines are always scanned so "not in pipeline X" can be
+    // split into "tracked elsewhere (where)" vs "in no pipeline" — conflating
+    // those two produced bad answers before.
+    const defaultSet = index.filter(p => p.total > 0 && p.total <= GHL_MAX_DEFAULT_PIPELINE);
+    const focus = pipeFilter ? index.filter(p => p.total > 0 && p.name.toLowerCase().includes(pipeFilter)) : [];
+    if (pipeFilter && !focus.length) {
         return { error: `No pipeline matches "${input.pipeline}". Available: ${index.map(p => `${p.name} (${p.total} opps)`).join(', ')}` };
     }
-    const skipped = pipeFilter ? [] : index
-        .filter(p => p.total > GHL_MAX_DEFAULT_PIPELINE)
+    const targets = [...new Map([...defaultSet, ...focus].map(p => [p.id, p])).values()];
+    const skipped = index
+        .filter(p => p.total > GHL_MAX_DEFAULT_PIPELINE && !targets.some(t => t.id === p.id))
         .map(p => `${p.name} (${p.total.toLocaleString()} opps — likely a call-dialer tracker; pass pipeline:"${p.name}" to scan it explicitly)`);
 
     const byEmail = new Map();
@@ -2974,39 +2977,62 @@ async function getGhlPipelineStatus(funnel, input) {
         }
     }
 
-    const matched = [];
-    const unmatched = [];
-    const countsByStage = {}; // "Pipeline — Stage" → count, within the scanned scope
+    const focusNames = new Set(focus.map(p => p.name));
+    const proj = ({ pipeline, stage, status, updated_at }) => ({ pipeline, stage, status, updated_at });
+    const inFocus = [];      // ≥1 opportunity in the focus pipelines (all scanned pipelines when no focus)
+    const inOtherOnly = [];  // tracked, but only outside the focus pipelines
+    const inNone = [];       // no opportunity in ANY scanned pipeline
+    const countsFocus = {};  // "Pipeline — Stage" → count, focus scope
+    const countsOther = {};  // where the not-in-focus people actually are
     for (const email of emails) {
         const opps = byEmail.get(email) || [];
-        if (!opps.length) { unmatched.push(email); continue; }
-        for (const o of opps) {
-            const k = `${o.pipeline} — ${o.stage}`;
-            countsByStage[k] = (countsByStage[k] || 0) + 1;
+        if (!opps.length) { inNone.push(email); continue; }
+        const scoped = pipeFilter ? opps.filter(o => focusNames.has(o.pipeline)) : opps;
+        if (scoped.length) {
+            for (const o of scoped) {
+                const k = `${o.pipeline} — ${o.stage}`;
+                countsFocus[k] = (countsFocus[k] || 0) + 1;
+            }
+            inFocus.push({ email, name: scoped[0].name, opportunities: opps.map(proj) });
+        } else {
+            for (const o of opps) {
+                const k = `${o.pipeline} — ${o.stage}`;
+                countsOther[k] = (countsOther[k] || 0) + 1;
+            }
+            inOtherOnly.push({ email, name: opps[0].name, opportunities: opps.map(proj) });
         }
-        matched.push({
-            email,
-            name: opps[0].name,
-            opportunities: opps.map(({ pipeline, stage, status, updated_at }) => ({ pipeline, stage, status, updated_at })),
-        });
     }
-    let people = matched;
-    if (stageF) people = matched.filter(p => p.opportunities.some(o => String(o.stage).toLowerCase().includes(stageF)));
+    let people = inFocus;
+    if (stageF) {
+        people = inFocus.filter(p => p.opportunities.some(o =>
+            (!pipeFilter || focusNames.has(o.pipeline)) && String(o.stage).toLowerCase().includes(stageF)));
+    }
+    console.log(`🔗 GHL join [${funnel}]: ${JSON.stringify({ input, segment: emails.length, in_focus: inFocus.length, in_other_only: inOtherOnly.length, in_none: inNone.length })}`);
     return {
+        READ_ME: pipeFilter
+            ? `Focus: ${focus.map(p => p.name).join(', ')}. "people_in_focus_pipeline" have an opportunity THERE; "people_only_in_other_pipelines" are NOT in the focus pipeline but ARE tracked elsewhere (locations in other_pipeline_counts / people lists); ONLY "people_in_no_pipeline" are untracked. Never add or relabel these buckets.`
+            : 'Scanned all patient-journey pipelines. "people_in_no_pipeline" have no opportunity in any scanned pipeline. Report these exact numbers — never derive your own.',
         pipelines_scanned: scanned,
         pipelines_skipped: skipped.length ? skipped : undefined,
         pipelines_truncated: truncatedPipes.length ? truncatedPipes : undefined,
         segment: segmentLabel,
         segment_size: emails.length,
         segment_capped_at_500: segmentCapped || undefined,
-        people_with_opportunity: matched.length,
-        people_without_opportunity: unmatched.length,
-        counts_by_pipeline_stage: countsByStage,
+        pipeline_focus: pipeFilter ? focus.map(p => p.name).join(', ') : 'all scanned pipelines',
+        people_in_focus_pipeline: inFocus.length,
+        counts_by_pipeline_stage: countsFocus,
+        people_only_in_other_pipelines: pipeFilter ? inOtherOnly.length : undefined,
+        other_pipeline_counts: pipeFilter && inOtherOnly.length ? countsOther : undefined,
+        people_only_in_other_pipelines_detail: pipeFilter && inOtherOnly.length ? inOtherOnly.slice(0, 100) : undefined,
+        other_detail_truncated: pipeFilter && inOtherOnly.length > 100 ? `showing 100 of ${inOtherOnly.length}` : undefined,
+        people_in_no_pipeline: inNone.length,
+        // FULL list (segment is capped at 500) — follow-ups about these people must
+        // pass this list back via the emails input, never recall it from memory.
+        people_in_no_pipeline_emails: inNone,
         stage_filter: input.stage_filter || undefined,
         stage_filter_matches: stageF ? people.length : undefined,
         people: people.slice(0, 150),
-        people_truncated: people.length > 150 ? `showing 150 of ${people.length}` : undefined,
-        without_opportunity_sample: unmatched.slice(0, 20),
+        people_truncated: people.length > 150 ? `people list truncated: showing 150 of ${people.length} — narrow with stage_filter/pipeline or pass emails back to enumerate the rest` : undefined,
     };
 }
 
@@ -3753,7 +3779,7 @@ const INSIGHTS_TOOLS = [
 // GoHighLevel join tool — registered only when GHL is configured.
 if (GHL_ENABLED) INSIGHTS_TOOLS.push({
     name: 'get_ghl_pipeline_status',
-    description: `PREFERRED for ANY question combining funnel people with GoHighLevel opportunity pipelines — "status of everyone who purchased in July", "how many July purchasers have a Report Of Findings scheduled", "what happened to buyers not in the ${GHL_PIPELINE || 'main'} pipeline". Give it a funnel segment (event_type + optional LA-timezone date range, or an explicit emails list); it scans every patient-journey pipeline server-side in seconds (cached 5 min; giant call-dialer pipelines >10k opps are skipped and listed in pipelines_skipped — pass pipeline to scan one of those explicitly) and returns the email join: counts by pipeline+stage, matched people with EVERY opportunity they hold (a person can be in several pipelines, e.g. sales AND follow-up), and who has no opportunity anywhere. Optional pipeline narrows to pipelines whose name contains the text; stage_filter narrows to stages containing the text. To find "what happened to" people missing from one pipeline, run WITHOUT the pipeline filter and read each person's opportunities. Use the ghl MCP tools only for single-contact drill-downs. Segments from event_type are capped at 500 distinct emails (flagged when hit).`,
+    description: `PREFERRED for ANY question combining funnel people with GoHighLevel opportunity pipelines — "status of everyone who purchased in July", "how many July purchasers have a Report Of Findings scheduled", "what happened to buyers not in the ${GHL_PIPELINE || 'main'} pipeline". Give it a funnel segment (event_type + optional LA-timezone date range, or an explicit emails list); it scans every patient-journey pipeline server-side in seconds (cached 5 min; giant call-dialer pipelines >10k opps are skipped and listed in pipelines_skipped — pass pipeline to scan one of those explicitly) and returns the email join: counts by pipeline+stage, matched people with EVERY opportunity they hold (a person can be in several pipelines, e.g. sales AND follow-up), and who has no opportunity anywhere. Optional pipeline FOCUSES the report on pipelines whose name contains the text — everything is still scanned, and non-members come pre-split into people_only_in_other_pipelines (with locations) vs people_in_no_pipeline, so never equate "not in pipeline X" with "untracked". stage_filter narrows the people list to stages containing the text. To find "what happened to" people missing from one pipeline, run WITHOUT the pipeline filter and read each person's opportunities. Use the ghl MCP tools only for single-contact drill-downs. Segments from event_type are capped at 500 distinct emails (flagged when hit).`,
     input_schema: {
         type: 'object',
         properties: {
@@ -3857,6 +3883,7 @@ GOHIGHLEVEL CRM — OPPORTUNITIES (ghl MCP tools):
 - Pipelines: ALL are visible.${GHL_PIPELINE ? ` "${GHL_PIPELINE}" is the primary sales pipeline — default to it when the user doesn't name one, but` : ''} other pipelines (e.g. follow-up pipelines like New Patient Consult) matter too: a person missing from one pipeline is often tracked in another. get_ghl_pipeline_status scans all patient-journey pipelines by default and returns each person's opportunities across them — check there before declaring anyone "missing". It skips the huge call-dialer pipelines (listed in pipelines_skipped) unless you target one via its pipeline param.
 - USE GHL for any question about patient/deal pipeline stages, follow-ups, or appointments — e.g. Day #1 (initial appointment), no-shows, testing/labs, "report of findings" (ROF) scheduled or needs scheduling, started / not started, financing, nurture, refunds, cancellations. That stage data exists ONLY in GoHighLevel, never in the funnel database.
 - Joins with funnel data ("status of everyone who purchased in July", "how many July purchasers have a report of findings scheduled"): call get_ghl_pipeline_status ONCE with the segment (event_type + dates, optional pipeline / stage_filter). NEVER page opportunities one-by-one through the ghl MCP tools for these — it is far too slow and will time out.
+- "Not in pipeline X" ≠ "untracked": when you pass pipeline:"X", the tool still scans everything and splits non-members into people_only_in_other_pipelines (WITH their locations) vs people_in_no_pipeline. Report those buckets verbatim per the READ_ME field. For follow-ups about a specific group, pass people_in_no_pipeline_emails (or the detail lists) back via the emails input.
 - Use the ghl MCP tools only for ad-hoc drill-downs get_ghl_pipeline_status doesn't cover (one contact's opportunity details/notes/tasks, non-pipeline data).
 - Access is read-only reporting — never attempt to create or modify records.
 - Typical asks: open opportunities by stage, pipeline value, win/loss rate, stalled deals, recent movement. Cross-reference with funnel data by contact email where useful.`;
@@ -3908,6 +3935,12 @@ TIMEZONE (critical):
   \`(to_timestamp(regexp_replace(metadata->>'webinar_datetime_utc','(\\\\d+)(st|nd|rd|th)','\\\\1','g'),'Month DD YYYY, HH12:MI:SS AM')::timestamp AT TIME ZONE 'UTC') AT TIME ZONE 'America/Los_Angeles'\`
   e.g. busiest webinar SLOTS in PST: \`SELECT to_char(<that expression>,'Dy HH12:MI AM') AS slot_pst, count(*) FROM events WHERE event_type='registrations' GROUP BY 1 ORDER BY 2 DESC\`
 - Date-range filters: filter on the raw UTC \`event_time\` (e.g. \`event_time >= now() - interval '7 days'\`), then convert to PST for display/grouping. Don't wrap event_time in a timezone conversion inside the WHERE range bound — it's slower and unnecessary.
+
+DATA INTEGRITY (non-negotiable — users act on your numbers at face value):
+- Every count, percentage, and name you present must come verbatim from a tool result in THIS conversation. Never derive counts by adding/subtracting across different tool calls or turns, and never extrapolate past a truncation flag (people_truncated, segment_capped_at_500, 500-row SQL cap) — truncated data means the derived number WILL be wrong.
+- Never list named people beyond what a tool returned. If a list was truncated, say so and offer to narrow the query instead of filling in from memory.
+- Follow-ups about a subset from an earlier answer ("check if those 53 are in X"): re-run the tool with that exact list (get_ghl_pipeline_status accepts emails) — do not reason from your recollection of the earlier turn.
+- If a fresh tool result contradicts a number you gave earlier in the chat, open your reply by flagging the correction and which number is right — never blend the two.
 
 INSTRUCTIONS:
 - Use tools to fetch only the data you need. Don't ask the user for date ranges — pick reasonable ones (last 7/14/30 days, last 3/6 months) based on the question.
