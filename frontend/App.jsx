@@ -2860,6 +2860,16 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
   // server's updated_at so we can detect remote edits (other tabs/devices).
   // Shape: { [id]: { msgs, updatedAt } }
   const msgsCache = useRef({});
+  const inputRef = useRef(null);
+
+  // Auto-grow the composer with its content (ChatGPT-style); snaps back when
+  // cleared after send. Capped so long drafts scroll instead of eating the page.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 220) + "px";
+  }, [chatInput]);
 
   const loadHistory = useCallback(async () => {
     try {
@@ -3060,15 +3070,17 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
     bottomColumn: { maxWidth: 760, margin: "0 auto" },
 
     // Single calm input container. No internal divider, no sparkle, just space.
-    inputCard: { width: "100%", background: "#fff", border: "1px solid #E5E7EB", borderRadius: 16, padding: "10px 12px 8px 16px", boxShadow: "0 1px 2px rgba(15,23,42,0.04)", transition: "border-color 0.15s, box-shadow 0.15s" },
+    inputCard: { width: "100%", background: "#fff", border: "1px solid #E5E7EB", borderRadius: 24, padding: "12px 14px 10px 18px", boxShadow: "0 1px 2px rgba(15,23,42,0.04)", transition: "border-color 0.15s, box-shadow 0.15s", boxSizing: "border-box" },
     inputCardFocus: { borderColor: "#9CA3AF", boxShadow: "0 4px 14px rgba(15,23,42,0.07)" },
-    textInput: { width: "100%", border: "none", outline: "none", background: "transparent", fontSize: 15, color: "#111827", fontFamily: fn, padding: "6px 2px", lineHeight: 1.5 },
+    // Multi-line composer: auto-grows with content (see the chatInput effect),
+    // scrolls past maxHeight. resize handle off — growth is automatic.
+    textInput: { width: "100%", display: "block", border: "none", outline: "none", background: "transparent", fontSize: 15, color: "#111827", fontFamily: fn, padding: "4px 2px", lineHeight: 1.5, resize: "none", minHeight: 24, maxHeight: 220, overflowY: "auto", boxSizing: "border-box" },
 
     // Footer row inside the input card. No background, no border — just spacing.
     inputFooter: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4, gap: 8 },
     sourceBtn: { display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 8px", background: "transparent", border: "none", fontSize: 12, fontWeight: 500, color: "#6B7280", cursor: "default", fontFamily: fn, borderRadius: 6 },
-    // Send is an icon-only square button. Subtle when disabled, prominent when ready.
-    sendBtn: { width: 32, height: 32, display: "inline-flex", alignItems: "center", justifyContent: "center", background: "#0F172A", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", padding: 0, transition: "opacity 0.15s, background 0.15s" },
+    // Send is an icon-only circular button. Subtle when disabled, prominent when ready.
+    sendBtn: { width: 36, height: 36, display: "inline-flex", alignItems: "center", justifyContent: "center", background: "#0F172A", color: "#fff", border: "none", borderRadius: "50%", cursor: "pointer", padding: 0, flexShrink: 0, transition: "opacity 0.15s, background 0.15s" },
 
     disclaimer: { fontSize: 11, color: "#9CA3AF", textAlign: "center", marginTop: 10, lineHeight: 1.5 },
     disclaimerLink: { color: "#6B7280", textDecoration: "underline" },
@@ -3087,13 +3099,14 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
       onFocus={e => { e.currentTarget.style.borderColor = IC.inputCardFocus.borderColor; e.currentTarget.style.boxShadow = IC.inputCardFocus.boxShadow; }}
       onBlur={e => { e.currentTarget.style.borderColor = IC.inputCard.border.split(' ').slice(-1)[0]; e.currentTarget.style.boxShadow = IC.inputCard.boxShadow; }}
     >
-      <input
+      <textarea
+        ref={inputRef}
+        rows={1}
         style={IC.textInput}
         value={chatInput}
         onChange={e => setChatInput(e.target.value)}
-        onKeyDown={e => e.key === "Enter" && !e.shiftKey && sendMessage()}
-        placeholder="Ask anything about your funnel…"
-        disabled={chatLoading}
+        onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+        placeholder="Ask anything about your funnel… (Shift+Enter for a new line)"
         autoFocus
       />
       <div style={IC.inputFooter}>
