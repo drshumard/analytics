@@ -2819,6 +2819,9 @@ const GHL_MCP_TOKEN = process.env.GHL_MCP_TOKEN;       // Private Integration to
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;   // GHL sub-account (location) ID
 const GHL_PIPELINE = process.env.GHL_PIPELINE;         // opportunity pipeline to analyze (name or ID)
 const GHL_ENABLED = !!(GHL_MCP_TOKEN && GHL_LOCATION_ID);
+console.log(GHL_ENABLED
+    ? `🔗 GHL insights: enabled (location ${GHL_LOCATION_ID}, primary pipeline: ${GHL_PIPELINE || 'none set'})`
+    : '🔗 GHL insights: DISABLED — set GHL_MCP_TOKEN + GHL_LOCATION_ID to enable GoHighLevel tools in AI Insights');
 
 // ─── GoHighLevel REST helpers (native join tool) ─────────────────────────────
 // The MCP connector handles ad-hoc lookups, but joining a funnel segment
@@ -2826,75 +2829,87 @@ const GHL_ENABLED = !!(GHL_MCP_TOKEN && GHL_LOCATION_ID);
 // MCP round-trips blows the chat deadline. These helpers pull it directly from
 // GHL's REST API (parallel pages) and cache the snapshot for 5 minutes.
 const GHL_API = 'https://services.leadconnectorhq.com';
-const ghlSnapshot = { at: 0, pipeline: null, byEmail: null, stageCounts: null, total: 0, inflight: null };
+const GHL_SNAP_TTL = 300_000;             // 5-min cache on pipeline index + per-pipeline snapshots
+const GHL_MAX_DEFAULT_PIPELINE = 10_000;  // default scan skips pipelines bigger than this (call-dialer trackers)
+const GHL_PAGE_CAP = 200;                 // per-pipeline page cap (100/page → 20k opps)
+const ghlCache = { indexAt: 0, index: null, pipes: new Map(), inflight: new Map() };
 
-async function ghlGet(path, params) {
+async function ghlGet(path, params, attempt = 0) {
     const url = new URL(GHL_API + path);
     for (const [k, v] of Object.entries(params || {})) if (v !== undefined) url.searchParams.set(k, v);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 15_000);
+    let res;
     try {
-        const res = await fetch(url, {
+        res = await fetch(url, {
             headers: { Authorization: `Bearer ${GHL_MCP_TOKEN}`, Version: '2021-07-28', Accept: 'application/json' },
             signal: ctrl.signal,
         });
-        if (!res.ok) throw new Error(`GHL ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-        return await res.json();
     } finally {
         clearTimeout(timer);
     }
+    if (!res.ok) {
+        const body = (await res.text()).slice(0, 300);
+        // One retry on rate-limit / transient server errors keeps a whole
+        // multi-page snapshot from failing over a single 429.
+        if (attempt < 1 && (res.status === 429 || res.status >= 500)) {
+            await new Promise(r => setTimeout(r, 1200));
+            return ghlGet(path, params, attempt + 1);
+        }
+        throw new Error(`GHL ${path} → HTTP ${res.status}: ${body}`);
+    }
+    return await res.json();
 }
 
-// Resolve GHL_PIPELINE (name or ID) → { id, name, stages: Map(stageId → name) }
-async function ghlResolvePipeline() {
+// All pipelines with stage maps AND per-pipeline opportunity totals (one cheap
+// limit=1 search each). Cached 5 min. Totals drive which pipelines the default
+// scan covers — the location has huge call-dialer pipelines (60k+ opps) that
+// would blow both the time budget and GHL's rate limit if fetched blindly.
+async function ghlPipelinesIndex() {
+    if (ghlCache.index && Date.now() - ghlCache.indexAt < GHL_SNAP_TTL) return ghlCache.index;
     const data = await ghlGet('/opportunities/pipelines', { locationId: GHL_LOCATION_ID });
-    const pipelines = data.pipelines || [];
-    const want = (GHL_PIPELINE || '').trim().toLowerCase();
-    const p = want
-        ? pipelines.find(x => x.id === GHL_PIPELINE || String(x.name || '').trim().toLowerCase() === want)
-        : pipelines[0];
-    if (!p) throw new Error(`GHL pipeline "${GHL_PIPELINE}" not found. Available: ${pipelines.map(x => x.name).join(', ')}`);
-    return { id: p.id, name: p.name, stages: new Map((p.stages || []).map(s => [s.id, s.name])) };
+    const pipelines = (data.pipelines || []).map(p => ({
+        id: p.id,
+        name: p.name,
+        stages: new Map((p.stages || []).map(s => [s.id, s.name])),
+        total: 0,
+    }));
+    for (let i = 0; i < pipelines.length; i += 5) {
+        await Promise.all(pipelines.slice(i, i + 5).map(async p => {
+            const d = await ghlGet('/opportunities/search', { location_id: GHL_LOCATION_ID, pipeline_id: p.id, limit: 1, page: 1 });
+            p.total = d.meta?.total ?? 0;
+        }));
+    }
+    ghlCache.index = pipelines;
+    ghlCache.indexAt = Date.now();
+    return pipelines;
 }
 
-// Snapshot of every opportunity in the configured pipeline, keyed by contact
-// email (latest opportunity wins). Cached 5 min; concurrent callers share one fetch.
-async function ghlPipelineSnapshot() {
-    if (ghlSnapshot.byEmail && Date.now() - ghlSnapshot.at < 300_000) return ghlSnapshot;
-    if (ghlSnapshot.inflight) return ghlSnapshot.inflight;
-    ghlSnapshot.inflight = (async () => {
-        const pipeline = await ghlResolvePipeline();
+// Every opportunity in ONE pipeline (paged, gently parallel, paced under GHL's
+// 100-req/10s burst limit). Cached 5 min per pipeline; concurrent callers share
+// one in-flight fetch.
+async function ghlFetchPipelineOpps(p) {
+    const hit = ghlCache.pipes.get(p.id);
+    if (hit && Date.now() - hit.at < GHL_SNAP_TTL) return hit;
+    if (ghlCache.inflight.has(p.id)) return ghlCache.inflight.get(p.id);
+    const job = (async () => {
         const PAGE = 100;
-        const search = page => ghlGet('/opportunities/search', {
-            location_id: GHL_LOCATION_ID,
-            pipeline_id: pipeline.id,
-            limit: PAGE,
-            page,
-        });
-        const first = await search(1);
-        const total = first.meta?.total ?? (first.opportunities || []).length;
-        const pages = Math.min(Math.ceil(total / PAGE), 150); // safety cap ~15k opps
-        const all = [...(first.opportunities || [])];
-        for (let start = 2; start <= pages; start += 6) {     // 6 parallel pages per burst
+        const pages = Math.min(Math.max(Math.ceil((p.total || 1) / PAGE), 1), GHL_PAGE_CAP);
+        const opps = [];
+        for (let start = 1; start <= pages; start += 6) {
             const batch = [];
-            for (let p = start; p < start + 6 && p <= pages; p++) batch.push(search(p));
-            for (const r of await Promise.all(batch)) all.push(...(r.opportunities || []));
+            for (let pg = start; pg < start + 6 && pg <= pages; pg++) {
+                batch.push(ghlGet('/opportunities/search', { location_id: GHL_LOCATION_ID, pipeline_id: p.id, limit: PAGE, page: pg }));
+            }
+            for (const r of await Promise.all(batch)) opps.push(...(r.opportunities || []));
+            if (start + 6 <= pages) await new Promise(r => setTimeout(r, 300));
         }
-        const byEmail = new Map();
-        const stageCounts = {};
-        for (const o of all) {
-            const stage = pipeline.stages.get(o.pipelineStageId) || o.pipelineStageId || 'unknown';
-            stageCounts[stage] = (stageCounts[stage] || 0) + 1;
-            const email = String(o.contact?.email || '').trim().toLowerCase();
-            if (!email) continue;
-            const rec = { stage, status: o.status, name: o.contact?.name || o.name, updated_at: o.updatedAt, monetary_value: o.monetaryValue || 0 };
-            const prev = byEmail.get(email);
-            if (!prev || String(rec.updated_at) > String(prev.updated_at)) byEmail.set(email, rec);
-        }
-        Object.assign(ghlSnapshot, { at: Date.now(), pipeline: { id: pipeline.id, name: pipeline.name }, byEmail, stageCounts, total: all.length });
-        return ghlSnapshot;
-    })().finally(() => { ghlSnapshot.inflight = null; });
-    return ghlSnapshot.inflight;
+        const entry = { at: Date.now(), opps, truncated: (p.total || 0) > pages * PAGE };
+        ghlCache.pipes.set(p.id, entry);
+        return entry;
+    })().finally(() => ghlCache.inflight.delete(p.id));
+    ghlCache.inflight.set(p.id, job);
+    return job;
 }
 
 const GHL_JOINABLE_EVENTS = new Set(['purchases', 'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta']);
@@ -2928,35 +2943,70 @@ async function getGhlPipelineStatus(funnel, input) {
         segmentLabel = `${eventType}${input.date_from || input.date_to ? ` ${input.date_from || '…'} → ${input.date_to || '…'}` : ' (all time)'}`;
     }
 
-    const snap = await ghlPipelineSnapshot();
+    const index = await ghlPipelinesIndex();
+    const pipeFilter = input.pipeline ? String(input.pipeline).toLowerCase() : null;
+    const stageF = input.stage_filter ? String(input.stage_filter).toLowerCase() : null;
+    // Default scan: every pipeline small enough to be a patient-journey board.
+    // The giant call-dialer pipelines are skipped and reported, not hidden.
+    const targets = pipeFilter
+        ? index.filter(p => p.name.toLowerCase().includes(pipeFilter))
+        : index.filter(p => p.total > 0 && p.total <= GHL_MAX_DEFAULT_PIPELINE);
+    if (!targets.length) {
+        return { error: `No pipeline matches "${input.pipeline}". Available: ${index.map(p => `${p.name} (${p.total} opps)`).join(', ')}` };
+    }
+    const skipped = pipeFilter ? [] : index
+        .filter(p => p.total > GHL_MAX_DEFAULT_PIPELINE)
+        .map(p => `${p.name} (${p.total.toLocaleString()} opps — likely a call-dialer tracker; pass pipeline:"${p.name}" to scan it explicitly)`);
+
+    const byEmail = new Map();
+    const scanned = [];
+    const truncatedPipes = [];
+    for (const p of targets) {
+        const { opps, truncated } = await ghlFetchPipelineOpps(p);
+        scanned.push(`${p.name} (${opps.length})`);
+        if (truncated) truncatedPipes.push(p.name);
+        for (const o of opps) {
+            const email = String(o.contact?.email || '').trim().toLowerCase();
+            if (!email) continue;
+            const rec = { pipeline: p.name, stage: p.stages.get(o.pipelineStageId) || o.pipelineStageId || 'unknown', status: o.status, name: o.contact?.name || o.name, updated_at: o.updatedAt };
+            const list = byEmail.get(email);
+            if (list) list.push(rec); else byEmail.set(email, [rec]);
+        }
+    }
+
     const matched = [];
     const unmatched = [];
-    const countsByStage = {};
+    const countsByStage = {}; // "Pipeline — Stage" → count, within the scanned scope
     for (const email of emails) {
-        const rec = snap.byEmail.get(email);
-        if (!rec) { unmatched.push(email); continue; }
-        matched.push({ email, ...rec });
-        countsByStage[rec.stage] = (countsByStage[rec.stage] || 0) + 1;
+        const opps = byEmail.get(email) || [];
+        if (!opps.length) { unmatched.push(email); continue; }
+        for (const o of opps) {
+            const k = `${o.pipeline} — ${o.stage}`;
+            countsByStage[k] = (countsByStage[k] || 0) + 1;
+        }
+        matched.push({
+            email,
+            name: opps[0].name,
+            opportunities: opps.map(({ pipeline, stage, status, updated_at }) => ({ pipeline, stage, status, updated_at })),
+        });
     }
     let people = matched;
-    if (input.stage_filter) {
-        const f = String(input.stage_filter).toLowerCase();
-        people = matched.filter(p => String(p.stage).toLowerCase().includes(f));
-    }
+    if (stageF) people = matched.filter(p => p.opportunities.some(o => String(o.stage).toLowerCase().includes(stageF)));
     return {
-        pipeline: snap.pipeline.name,
-        pipeline_total_opportunities: snap.total,
+        pipelines_scanned: scanned,
+        pipelines_skipped: skipped.length ? skipped : undefined,
+        pipelines_truncated: truncatedPipes.length ? truncatedPipes : undefined,
         segment: segmentLabel,
         segment_size: emails.length,
         segment_capped_at_500: segmentCapped || undefined,
-        matched_in_pipeline: matched.length,
-        not_in_pipeline: unmatched.length,
-        counts_by_stage: countsByStage,
+        people_with_opportunity: matched.length,
+        people_without_opportunity: unmatched.length,
+        counts_by_pipeline_stage: countsByStage,
         stage_filter: input.stage_filter || undefined,
-        stage_filter_matches: input.stage_filter ? people.length : undefined,
+        stage_filter_matches: stageF ? people.length : undefined,
         people: people.slice(0, 150),
         people_truncated: people.length > 150 ? `showing 150 of ${people.length}` : undefined,
-        unmatched_sample: unmatched.slice(0, 20),
+        without_opportunity_sample: unmatched.slice(0, 20),
     };
 }
 
@@ -3703,7 +3753,7 @@ const INSIGHTS_TOOLS = [
 // GoHighLevel join tool — registered only when GHL is configured.
 if (GHL_ENABLED) INSIGHTS_TOOLS.push({
     name: 'get_ghl_pipeline_status',
-    description: `PREFERRED for ANY question combining funnel people with the GoHighLevel${GHL_PIPELINE ? ` "${GHL_PIPELINE}"` : ''} opportunity pipeline — "status of everyone who purchased in July", "how many July purchasers have a Report Of Findings scheduled", "which registrants are in Testing". Give it a funnel segment (event_type + optional LA-timezone date range, or an explicit emails list); it fetches the ENTIRE pipeline server-side in seconds (cached 5 min) and returns the email join: counts by current stage, matched people (email, stage, status), and how many have no opportunity. Optional stage_filter narrows to stages whose name contains the text (e.g. "report of findings"). Use the ghl MCP tools only for single-contact drill-downs or data this doesn't return. Segments from event_type are capped at 500 distinct emails (flagged when hit).`,
+    description: `PREFERRED for ANY question combining funnel people with GoHighLevel opportunity pipelines — "status of everyone who purchased in July", "how many July purchasers have a Report Of Findings scheduled", "what happened to buyers not in the ${GHL_PIPELINE || 'main'} pipeline". Give it a funnel segment (event_type + optional LA-timezone date range, or an explicit emails list); it scans every patient-journey pipeline server-side in seconds (cached 5 min; giant call-dialer pipelines >10k opps are skipped and listed in pipelines_skipped — pass pipeline to scan one of those explicitly) and returns the email join: counts by pipeline+stage, matched people with EVERY opportunity they hold (a person can be in several pipelines, e.g. sales AND follow-up), and who has no opportunity anywhere. Optional pipeline narrows to pipelines whose name contains the text; stage_filter narrows to stages containing the text. To find "what happened to" people missing from one pipeline, run WITHOUT the pipeline filter and read each person's opportunities. Use the ghl MCP tools only for single-contact drill-downs. Segments from event_type are capped at 500 distinct emails (flagged when hit).`,
     input_schema: {
         type: 'object',
         properties: {
@@ -3711,7 +3761,8 @@ if (GHL_ENABLED) INSIGHTS_TOOLS.push({
             date_from:    { type: 'string', description: 'Inclusive start date YYYY-MM-DD (LA timezone). Omit for all time.' },
             date_to:      { type: 'string', description: 'Inclusive end date YYYY-MM-DD (LA timezone). Omit for all time.' },
             emails:       { type: 'array', items: { type: 'string' }, description: 'Explicit emails to join instead of event_type + dates' },
-            stage_filter: { type: 'string', description: 'Only report people whose current stage name contains this text (case-insensitive)' },
+            pipeline:     { type: 'string', description: 'Only count opportunities in pipelines whose name contains this text (case-insensitive), e.g. "DOA" or "consult". Omit to scan all pipelines.' },
+            stage_filter: { type: 'string', description: 'Only report people with a stage name containing this text (case-insensitive)' },
         },
     },
 });
@@ -3803,11 +3854,9 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
 
 GOHIGHLEVEL CRM — OPPORTUNITIES (ghl MCP tools):
 - locationId: ${GHL_LOCATION_ID} — provide it wherever a GHL tool expects a location.
-${GHL_PIPELINE
-        ? `- Scope: ONLY the "${GHL_PIPELINE}" opportunity pipeline. Resolve its pipeline ID once via the pipelines tool, then filter every opportunity search/report to it. If asked about other pipelines, say access is limited to this one.`
-        : '- Use the pipelines tool to discover the available opportunity pipelines.'}
-- USE GHL for any question about patient/deal pipeline stages or appointments — e.g. Day #1 (initial appointment), no-shows, testing/labs, "report of findings" (ROF) scheduled or needs scheduling, started / not started, financing, nurture, refunds, cancellations. That stage data exists ONLY in GoHighLevel, never in the funnel database.
-- Joins with funnel data ("status of everyone who purchased in July", "how many July purchasers have a report of findings scheduled"): call get_ghl_pipeline_status ONCE with the segment (event_type + dates, optional stage_filter). NEVER page opportunities one-by-one through the ghl MCP tools for these — it is far too slow and will time out.
+- Pipelines: ALL are visible.${GHL_PIPELINE ? ` "${GHL_PIPELINE}" is the primary sales pipeline — default to it when the user doesn't name one, but` : ''} other pipelines (e.g. follow-up pipelines like New Patient Consult) matter too: a person missing from one pipeline is often tracked in another. get_ghl_pipeline_status scans all patient-journey pipelines by default and returns each person's opportunities across them — check there before declaring anyone "missing". It skips the huge call-dialer pipelines (listed in pipelines_skipped) unless you target one via its pipeline param.
+- USE GHL for any question about patient/deal pipeline stages, follow-ups, or appointments — e.g. Day #1 (initial appointment), no-shows, testing/labs, "report of findings" (ROF) scheduled or needs scheduling, started / not started, financing, nurture, refunds, cancellations. That stage data exists ONLY in GoHighLevel, never in the funnel database.
+- Joins with funnel data ("status of everyone who purchased in July", "how many July purchasers have a report of findings scheduled"): call get_ghl_pipeline_status ONCE with the segment (event_type + dates, optional pipeline / stage_filter). NEVER page opportunities one-by-one through the ghl MCP tools for these — it is far too slow and will time out.
 - Use the ghl MCP tools only for ad-hoc drill-downs get_ghl_pipeline_status doesn't cover (one contact's opportunity details/notes/tasks, non-pipeline data).
 - Access is read-only reporting — never attempt to create or modify records.
 - Typical asks: open opportunities by stage, pipeline value, win/loss rate, stalled deals, recent movement. Cross-reference with funnel data by contact email where useful.`;
