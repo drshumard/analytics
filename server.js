@@ -3059,17 +3059,27 @@ async function getGhlPipelineStatus(funnel, input) {
     }
 
     const index = await ghlPipelinesIndex();
-    const pipeFilter = input.pipeline ? String(input.pipeline).toLowerCase() : null;
     const stageF = input.stage_filter ? String(input.stage_filter).toLowerCase() : null;
-    // The pipeline param FOCUSES the report, it does not narrow the scan: the
-    // patient-journey pipelines are always scanned so "not in pipeline X" can be
-    // split into "tracked elsewhere (where)" vs "in no pipeline" — conflating
-    // those two produced bad answers before.
+    // PRIORITY VIEW: the focus pipeline (default: the primary, env GHL_PIPELINE)
+    // is the source of truth for anyone in it — their placement elsewhere is
+    // informational only. People NOT in focus are represented by their most
+    // recent other-pipeline opportunity. Every person is counted exactly once,
+    // so the buckets always sum to the segment. pipeline:"all" drops the focus
+    // (each person counted by their most recent opportunity anywhere). The scan
+    // always covers all patient-journey pipelines regardless of focus.
+    const rawPipe = input.pipeline ? String(input.pipeline).trim() : null;
+    const wantAll = !!rawPipe && /^(all|\*)$/i.test(rawPipe);
+    const focusName = wantAll ? null : (rawPipe || GHL_PIPELINE || null);
+    const pipeFilter = focusName ? focusName.toLowerCase() : null;
     const defaultSet = index.filter(p => p.total > 0 && p.total <= GHL_MAX_DEFAULT_PIPELINE);
-    const focus = pipeFilter ? index.filter(p => p.total > 0 && p.name.toLowerCase().includes(pipeFilter)) : [];
+    let focus = pipeFilter ? index.filter(p => p.total > 0 && p.name.toLowerCase().includes(pipeFilter)) : [];
     if (pipeFilter && !focus.length) {
-        return { error: `No pipeline matches "${input.pipeline}". Available: ${index.map(p => `${p.name} (${p.total} opps)`).join(', ')}` };
+        if (rawPipe) {
+            return { error: `No pipeline matches "${rawPipe}". Available: ${index.map(p => `${p.name} (${p.total} opps)`).join(', ')}` };
+        }
+        focus = []; // primary from env not found in GHL — degrade to the "all" view
     }
+    const focusActive = focus.length > 0;
     const targets = [...new Map([...defaultSet, ...focus].map(p => [p.id, p])).values()];
     const skipped = index
         .filter(p => p.total > GHL_MAX_DEFAULT_PIPELINE && !targets.some(t => t.id === p.id))
@@ -3109,12 +3119,19 @@ async function getGhlPipelineStatus(funnel, input) {
     const focusNames = new Set(focus.map(p => p.name));
     // Compact one-line-per-opportunity strings keep big people lists cheap to read.
     const projStr = o => `${o.pipeline} — ${o.stage} [${o.status}${o.updated_at ? ', updated ' + String(o.updated_at).slice(0, 10) : ''}]`;
-    const compact = e => ({ email: e.email, name: e.name, matched_via: e.matched_via, opportunities: e.opportunities.map(projStr) });
-    const inFocus = [];      // ≥1 opportunity in the focus pipelines (all scanned pipelines when no focus)
-    const inOtherOnly = [];  // tracked, but only outside the focus pipelines
+    const compact = e => ({
+        email: e.email,
+        name: e.name,
+        matched_via: e.matched_via,
+        current_status: projStr(e.current),
+        all_opportunities: e.opportunities.length > 1 ? e.opportunities.map(projStr) : undefined,
+    });
+    const latest = list => list.reduce((a, b) => (String(b.updated_at || '') > String(a.updated_at || '') ? b : a));
+    const inFocus = [];      // counted by their most recent FOCUS-pipeline opportunity
+    const inOtherOnly = [];  // not in focus — counted by their most recent opportunity elsewhere
     const inNone = [];       // no opportunity in ANY scanned pipeline
-    const countsFocus = {};  // "Pipeline — Stage" → count, focus scope
-    const countsOther = {};  // where the not-in-focus people actually are
+    const countsFocus = {};  // "Pipeline — Stage" → people (ONE per person, via current_status)
+    const countsOther = {};  // same, for the not-in-focus people
     let viaCount = 0;
     for (const email of emails) {
         let opps = byEmail.get(email) || [];
@@ -3136,31 +3153,30 @@ async function getGhlPipelineStatus(funnel, input) {
         }
         if (!opps.length) { inNone.push(email); continue; }
         if (via) viaCount++;
-        const scoped = pipeFilter ? opps.filter(o => focusNames.has(o.pipeline)) : opps;
+        // Exactly ONE current status per person: their most recent opportunity in
+        // the focus pipeline if they have one, else their most recent anywhere.
+        const scoped = focusActive ? opps.filter(o => focusNames.has(o.pipeline)) : opps;
         if (scoped.length) {
-            for (const o of scoped) {
-                const k = `${o.pipeline} — ${o.stage}`;
-                countsFocus[k] = (countsFocus[k] || 0) + 1;
-            }
-            inFocus.push({ email, name: scoped[0].name, matched_via: via, opportunities: opps });
+            const cur = latest(scoped);
+            countsFocus[`${cur.pipeline} — ${cur.stage}`] = (countsFocus[`${cur.pipeline} — ${cur.stage}`] || 0) + 1;
+            inFocus.push({ email, name: cur.name, matched_via: via, current: cur, opportunities: opps });
         } else {
-            for (const o of opps) {
-                const k = `${o.pipeline} — ${o.stage}`;
-                countsOther[k] = (countsOther[k] || 0) + 1;
-            }
-            inOtherOnly.push({ email, name: opps[0].name, matched_via: via, opportunities: opps });
+            const cur = latest(opps);
+            countsOther[`${cur.pipeline} — ${cur.stage}`] = (countsOther[`${cur.pipeline} — ${cur.stage}`] || 0) + 1;
+            inOtherOnly.push({ email, name: cur.name, matched_via: via, current: cur, opportunities: opps });
         }
     }
     let people = inFocus;
     if (stageF) {
-        people = inFocus.filter(p => p.opportunities.some(o =>
-            (!pipeFilter || focusNames.has(o.pipeline)) && String(o.stage).toLowerCase().includes(stageF)));
+        // Stage filtering follows the dedup rule: a person counts for a stage only
+        // if their CURRENT status matches, not some older opportunity elsewhere.
+        people = inFocus.filter(p => String(p.current.stage).toLowerCase().includes(stageF));
     }
-    console.log(`🔗 GHL join [${funnel}]: ${JSON.stringify({ input, segment: emails.length, in_focus: inFocus.length, in_other_only: inOtherOnly.length, in_none: inNone.length, via_identity: viaCount })}`);
+    console.log(`🔗 GHL join [${funnel}]: ${JSON.stringify({ input, focus: focusActive ? focus.map(p => p.name).join('|') : 'all', segment: emails.length, in_focus: inFocus.length, in_other_only: inOtherOnly.length, in_none: inNone.length, via_identity: viaCount })}`);
     return {
-        READ_ME: (pipeFilter
-            ? `Focus: ${focus.map(p => p.name).join(', ')}. "people_in_focus_pipeline" have an opportunity THERE; "people_only_in_other_pipelines" are NOT in the focus pipeline but ARE tracked elsewhere (locations in other_pipeline_counts / people lists); ONLY "people_in_no_pipeline" are untracked. Never add or relabel these buckets.`
-            : 'Scanned all patient-journey pipelines. "people_in_no_pipeline" have no opportunity in any scanned pipeline. Report these exact numbers — never derive your own.')
+        READ_ME: (focusActive
+            ? `PRIORITY VIEW, deduplicated — every person counted exactly ONCE. Focus pipeline: ${focus.map(p => p.name).join(', ')}${rawPipe ? '' : ' (the primary — applied by default)'}. People in the focus pipeline are bucketed by their most recent focus stage (counts_by_pipeline_stage) — their placement in other pipelines is informational only (all_opportunities), NEVER count it. People not in focus are bucketed by their most recent other-pipeline stage (other_pipeline_counts). The three buckets people_in_focus_pipeline + people_only_in_other_pipelines + people_in_no_pipeline are mutually exclusive and sum EXACTLY to segment_size — present them that way.`
+            : 'Deduplicated — every person counted exactly ONCE by their most recent opportunity in any scanned pipeline (counts_by_pipeline_stage). people_in_focus_pipeline + people_in_no_pipeline sum to segment_size.')
             + ' Matching uses direct email, then the app\'s identity graph (linked/merged emails and phone) — a person\'s matched_via field says which linkage connected them; mention it when relevant.',
         pipelines_scanned: scanned,
         pipelines_skipped: skipped.length ? skipped : undefined,
@@ -3168,14 +3184,16 @@ async function getGhlPipelineStatus(funnel, input) {
         segment: segmentLabel,
         segment_size: emails.length,
         segment_capped_at_500: segmentCapped || undefined,
-        pipeline_focus: pipeFilter ? focus.map(p => p.name).join(', ') : 'all scanned pipelines',
+        pipeline_focus: focusActive
+            ? focus.map(p => p.name).join(', ') + (rawPipe ? '' : ' (primary — default focus)')
+            : 'none — most recent opportunity anywhere',
         matched_via_linked_identity: viaCount || undefined,
         people_in_focus_pipeline: inFocus.length,
         counts_by_pipeline_stage: countsFocus,
-        people_only_in_other_pipelines: pipeFilter ? inOtherOnly.length : undefined,
-        other_pipeline_counts: pipeFilter && inOtherOnly.length ? countsOther : undefined,
-        people_only_in_other_pipelines_detail: pipeFilter && inOtherOnly.length ? inOtherOnly.slice(0, 100).map(compact) : undefined,
-        other_detail_truncated: pipeFilter && inOtherOnly.length > 100 ? `showing 100 of ${inOtherOnly.length}` : undefined,
+        people_only_in_other_pipelines: focusActive ? inOtherOnly.length : undefined,
+        other_pipeline_counts: focusActive && inOtherOnly.length ? countsOther : undefined,
+        people_only_in_other_pipelines_detail: focusActive && inOtherOnly.length ? inOtherOnly.slice(0, 100).map(compact) : undefined,
+        other_detail_truncated: focusActive && inOtherOnly.length > 100 ? `showing 100 of ${inOtherOnly.length}` : undefined,
         people_in_no_pipeline: inNone.length,
         // FULL list (segment is capped at 500) — follow-ups about these people must
         // pass this list back via the emails input, never recall it from memory.
@@ -3930,7 +3948,7 @@ const INSIGHTS_TOOLS = [
 // GoHighLevel join tool — registered only when GHL is configured.
 if (GHL_ENABLED) INSIGHTS_TOOLS.push({
     name: 'get_ghl_pipeline_status',
-    description: `PREFERRED for ANY question combining funnel people with GoHighLevel opportunity pipelines — "status of everyone who purchased in July", "how many July purchasers have a Report Of Findings scheduled", "what happened to buyers not in the ${GHL_PIPELINE || 'main'} pipeline". Give it a funnel segment (event_type + optional LA-timezone date range, or an explicit emails list); it scans every patient-journey pipeline server-side in seconds (cached 5 min; giant call-dialer pipelines >10k opps are skipped and listed in pipelines_skipped — pass pipeline to scan one of those explicitly) and returns the join: counts by pipeline+stage, matched people with EVERY opportunity they hold (a person can be in several pipelines, e.g. sales AND follow-up), and who has no opportunity anywhere. Matching goes beyond exact email: people are also matched through the app's identity graph — linked/merged alternate emails and phone numbers — and carry matched_via when an indirect link connected them (e.g. purchase email merged under a different primary contact in GHL). Optional pipeline FOCUSES the report on pipelines whose name contains the text — everything is still scanned, and non-members come pre-split into people_only_in_other_pipelines (with locations) vs people_in_no_pipeline, so never equate "not in pipeline X" with "untracked". stage_filter narrows the people list to stages containing the text. To find "what happened to" people missing from one pipeline, run WITHOUT the pipeline filter and read each person's opportunities. Use the ghl MCP tools only for single-contact drill-downs. Segments from event_type are capped at 500 distinct emails (flagged when hit).`,
+    description: `PREFERRED for ANY question combining funnel people with GoHighLevel opportunity pipelines — "status of everyone who purchased in July", "how many July purchasers have a Report Of Findings scheduled", "what happened to buyers not in the ${GHL_PIPELINE || 'main'} pipeline". Give it a funnel segment (event_type + optional LA-timezone date range, or an explicit emails list); it scans every patient-journey pipeline server-side in seconds (cached 5 min; giant call-dialer pipelines >10k opps are skipped and listed in pipelines_skipped — pass pipeline to scan one of those explicitly) and returns a DEDUPLICATED PRIORITY VIEW: every person counted exactly once. By default the primary pipeline${GHL_PIPELINE ? ` ("${GHL_PIPELINE}")` : ''} is the focus and source of truth — people in it are bucketed by their most recent focus stage (placement elsewhere is informational only); people NOT in it are bucketed by their most recent other-pipeline stage; the three buckets (in focus / only elsewhere / in no pipeline) sum exactly to the segment, ready for conversion analysis. Matching goes beyond exact email: the app's identity graph (linked/merged alternate emails, phone numbers) also matches, carrying matched_via when an indirect link connected someone. pipeline refocuses on another pipeline by name substring, or "all" for most-recent-opportunity-anywhere counting. stage_filter narrows the people list to current stages containing the text. Use the ghl MCP tools only for single-contact drill-downs. Segments from event_type are capped at 500 distinct emails (flagged when hit).`,
     input_schema: {
         type: 'object',
         properties: {
@@ -3938,7 +3956,7 @@ if (GHL_ENABLED) INSIGHTS_TOOLS.push({
             date_from:    { type: 'string', description: 'Inclusive start date YYYY-MM-DD (LA timezone). Omit for all time.' },
             date_to:      { type: 'string', description: 'Inclusive end date YYYY-MM-DD (LA timezone). Omit for all time.' },
             emails:       { type: 'array', items: { type: 'string' }, description: 'Explicit emails to join instead of event_type + dates' },
-            pipeline:     { type: 'string', description: 'Only count opportunities in pipelines whose name contains this text (case-insensitive), e.g. "DOA" or "consult". Omit to scan all pipelines.' },
+            pipeline:     { type: 'string', description: `Focus pipeline by name substring (case-insensitive), e.g. "consult". DEFAULT when omitted: the primary pipeline${GHL_PIPELINE ? ` "${GHL_PIPELINE}"` : ''}. Pass "all" to drop the focus and count each person by their most recent opportunity anywhere.` },
             stage_filter: { type: 'string', description: 'Only report people with a stage name containing this text (case-insensitive)' },
         },
     },
@@ -4031,7 +4049,7 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
 
 GOHIGHLEVEL CRM — OPPORTUNITIES (ghl MCP tools):
 - locationId: ${GHL_LOCATION_ID} — provide it wherever a GHL tool expects a location.
-- Pipelines: ALL are visible.${GHL_PIPELINE ? ` "${GHL_PIPELINE}" is the primary sales pipeline — default to it when the user doesn't name one, but` : ''} other pipelines (e.g. follow-up pipelines like New Patient Consult) matter too: a person missing from one pipeline is often tracked in another. get_ghl_pipeline_status scans all patient-journey pipelines by default and returns each person's opportunities across them — check there before declaring anyone "missing". It skips the huge call-dialer pipelines (listed in pipelines_skipped) unless you target one via its pipeline param.
+- Pipelines: ALL are visible, but${GHL_PIPELINE ? ` "${GHL_PIPELINE}" is the PRIMARY pipeline — the source of truth for anyone in it. Follow-up pipelines (e.g. New Patient Consult) only describe people NOT in the primary.` : ' the first pipeline is treated as primary.'} get_ghl_pipeline_status enforces this automatically: its buckets are deduplicated (one current status per person) and sum exactly to the segment — quote them as-is for conversion analysis, and never add a person's other-pipeline placements on top. It skips the huge call-dialer pipelines (listed in pipelines_skipped) unless you target one via its pipeline param.
 - USE GHL for any question about patient/deal pipeline stages, follow-ups, or appointments — e.g. Day #1 (initial appointment), no-shows, testing/labs, "report of findings" (ROF) scheduled or needs scheduling, started / not started, financing, nurture, refunds, cancellations. That stage data exists ONLY in GoHighLevel, never in the funnel database.
 - Joins with funnel data ("status of everyone who purchased in July", "how many July purchasers have a report of findings scheduled"): call get_ghl_pipeline_status ONCE with the segment (event_type + dates, optional pipeline / stage_filter). NEVER page opportunities one-by-one through the ghl MCP tools for these — it is far too slow and will time out.
 - "Not in pipeline X" ≠ "untracked": when you pass pipeline:"X", the tool still scans everything and splits non-members into people_only_in_other_pipelines (WITH their locations) vs people_in_no_pipeline. Report those buckets verbatim per the READ_ME field. For follow-ups about a specific group, pass people_in_no_pipeline_emails (or the detail lists) back via the emails input.
