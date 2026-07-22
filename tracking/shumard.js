@@ -548,31 +548,35 @@
   }
 
   /* ─── Form binding ─── */
+  /* Bind markers use the `_sta_` prefix, NOT the bare `_st_` names — the older
+     stealth-app tracker build runs on the same funnel pages and stamps `_st_bound`/
+     `_st_inputs_bound`/`_st_submit_bound`; with shared names whichever script loads
+     first locks the other out of every field. */
   /* Bind one input: change + blur + (debounced) input, AND read its CURRENT value
      immediately — so prefilled / browser-autofilled values (which fire no change/blur)
      are captured the moment we see the field. */
   function bindOneInput(el) {
-    if (!el || el._st_bound) return; el._st_bound=true;
+    if (!el || el._sta_bound) return; el._sta_bound=true;
     el.addEventListener('change', function(){handleFieldChange(el);}, true);
     el.addEventListener('blur',   function(){handleFieldChange(el);}, true);
     el.addEventListener('input',  function(){
-      if (el._st_fc_t) clearTimeout(el._st_fc_t);
-      el._st_fc_t = setTimeout(function(){handleFieldChange(el);}, 300);
+      if (el._sta_fc_t) clearTimeout(el._sta_fc_t);
+      el._sta_fc_t = setTimeout(function(){handleFieldChange(el);}, 300);
     }, true);
     handleFieldChange(el); /* capture prefilled / autofilled value at bind time */
   }
   function bindInputListeners(form) {
-    if (!form||form._st_inputs_bound) return; form._st_inputs_bound=true;
+    if (!form||form._sta_inputs_bound) return; form._sta_inputs_bound=true;
     form.querySelectorAll('input, textarea, select').forEach(bindOneInput);
   }
   function bindSubmitListener(form) {
-    if (!form||form._st_submit_bound) return; form._st_submit_bound=true;
+    if (!form||form._sta_submit_bound) return; form._sta_submit_bound=true;
     form.addEventListener('submit', function(){setTimeout(function(){handleFormSubmit(form);},0);}, true);
   }
   function bindForms() { queryAllDeep('form').forEach(function(f){bindInputListeners(f);bindSubmitListener(f);}); }
   function bindLooseInputs() {
     queryAllDeep('input, textarea').forEach(function(el){
-      if (el.form||el._st_bound) return; bindOneInput(el);
+      if (el.form||el._sta_bound) return; bindOneInput(el);
     });
   }
   /* Bind everything across document + shadow roots, and make sure each shadow root
@@ -611,8 +615,8 @@
   var _bindT=null;
   function scheduleBind(){ if (_bindT) return; _bindT=setTimeout(function(){ _bindT=null; bindAll(); }, 150); }
   function ensureObserver(root) {
-    if (!root || root._st_observed || !window.MutationObserver) return;
-    root._st_observed = true;
+    if (!root || root._sta_observed || !window.MutationObserver) return;
+    root._sta_observed = true;
     try {
       var target = (root === document) ? document.body : root;
       if (target) new MutationObserver(scheduleBind).observe(target, {childList:true, subtree:true});
