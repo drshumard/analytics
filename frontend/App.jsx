@@ -156,6 +156,12 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Chat failed: ${res.status}`); }
     return res.json();
   },
+  async workerChat(messages) {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/worker/chat`, { method: "POST", headers, body: JSON.stringify({ messages }) });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Worker chat failed: ${res.status}`); }
+    return res.json();
+  },
   async getConversations() {
     const headers = await getAuthHeaders();
     const res = await fetch(`${API_BASE}/api/insights/conversations`, { headers });
@@ -990,6 +996,7 @@ export default function App() {
                 <button style={S.btnLight} onClick={() => setView("crm")}>CRM</button>
                 <button style={S.btnLight} onClick={() => setView("emailreport")}>Email Report</button>
                 <button style={S.btnLight} onClick={() => setView("insights")}>AI Insights</button>
+                {isAdmin && <button style={S.btnLight} onClick={() => setView("worker")}>AI Worker</button>}
                 <button style={S.btnLight} onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}>Activity Log</button>
                 {isAdmin && <button style={S.btnLight} onClick={() => setView("query")}>Query Data</button>}
                 {isAdmin && <button style={S.btnLight} onClick={() => { setEditCM(null); setView("custom-list"); }}>Manage Metrics</button>}
@@ -1026,6 +1033,7 @@ export default function App() {
               <button className="mobile-nav-item" onClick={() => setView("crm")}><I d="M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-2.13a4 4 0 10-4-4 4 4 0 004 4z" size={16} stroke="#6B7280" /> CRM</button>
               <button className="mobile-nav-item" onClick={() => setView("emailreport")}><I d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z M22 6l-10 7L2 6" size={16} stroke="#6B7280" /> Email Report</button>
               <button className="mobile-nav-item" onClick={() => setView("insights")}><I d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" size={16} stroke="#6B7280" /> AI Insights</button>
+              {isAdmin && <button className="mobile-nav-item" onClick={() => setView("worker")}><I d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z" size={16} stroke="#6B7280" /> AI Worker</button>}
               <button className="mobile-nav-item" onClick={async () => { try { const r = await api.getEvents(100, evFilter); setEvents(r.data || []); } catch (e) { flash(e.message, "err"); } setView("events"); }}><I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" size={16} stroke="#6B7280" /> Activity Log</button>
               {isAdmin && <button className="mobile-nav-item" onClick={() => setView("query")}><I d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" size={16} stroke="#6B7280" /> Query Data</button>}
               {isAdmin && <button className="mobile-nav-item" onClick={() => { setEditCM(null); setView("custom-list"); }}><I d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" size={16} stroke="#6B7280" /> Manage Metrics</button>}
@@ -1058,7 +1066,7 @@ export default function App() {
         </div>
       )}
 
-      <main className="main-content" style={view === "insights" ? { padding: 0, maxWidth: "none", margin: 0 } : S.main}>
+      <main className="main-content" style={view === "insights" || view === "worker" ? { padding: 0, maxWidth: "none", margin: 0 } : S.main}>
         {view === "dash" && (
           <div className="fi">
             <div className="title-row" style={S.titleRow}>
@@ -1536,6 +1544,7 @@ export default function App() {
           </div>
         )}
         {view === "insights" && <InsightsChat flash={flash} isMobile={isMobile} activeFunnel={activeFunnel} />}
+        {view === "worker" && isAdmin && <InsightsChat flash={flash} isMobile={isMobile} activeFunnel={activeFunnel} mode="worker" />}
         {view === "query" && <QueryBuilder flash={flash} />}
       </main>
 
@@ -2847,7 +2856,13 @@ function TypingStatus({ IC }) {
   );
 }
 
-function InsightsChat({ flash, isMobile, activeFunnel }) {
+function InsightsChat({ flash, isMobile, activeFunnel, mode = "insights" }) {
+  // mode="worker" turns this into the admin-only AI Worker: same shell, but it
+  // talks to /api/worker/chat (write tools) and keeps its own history slice —
+  // both modes share the conversations table, namespaced by id prefix.
+  const isWorker = mode === "worker";
+  const idPrefix = isWorker ? "work-" : "chat-";
+  const brandLabel = isWorker ? "Worker AI" : "Funnel AI";
   const [history, setHistory] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [chatMsgs, setChatMsgs] = useState([]);
@@ -2874,13 +2889,13 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
   const loadHistory = useCallback(async () => {
     try {
       const { data } = await api.getConversations();
-      setHistory(data || []);
+      setHistory((data || []).filter(c => isWorker === String(c.id).startsWith("work-")));
     } catch (e) {
       console.error('Failed to load conversations:', e.message);
     } finally {
       setHistoryLoading(false);
     }
-  }, []);
+  }, [isWorker]);
 
   // Load conversation list from Supabase on mount
   useEffect(() => { loadHistory(); }, [loadHistory]);
@@ -2958,7 +2973,7 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
     const msg = text || chatInput.trim();
     if (!msg || chatLoading) return;
 
-    const chatId = activeId || `chat-${Date.now()}`;
+    const chatId = activeId || `${idPrefix}${Date.now()}`;
     if (!activeId) setActiveId(chatId);
 
     const newMsgs = [...chatMsgs, { role: "user", content: msg }];
@@ -2968,7 +2983,7 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
     saveChat(chatId, newMsgs);
 
     try {
-      const { reply } = await api.chat(newMsgs);
+      const { reply } = await (isWorker ? api.workerChat(newMsgs) : api.chat(newMsgs));
       const fullMsgs = [...newMsgs, { role: "assistant", content: reply }];
       setChatMsgs(fullMsgs);
       saveChat(chatId, fullMsgs);
@@ -2990,7 +3005,11 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
     return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
   };
 
-  const quickPrompts = [
+  const quickPrompts = isWorker ? [
+    { letter: "S", color: "#10B981", label: "Add a Sale", prompt: "I need to add a sale that the webhooks missed. Ask me for the buyer's email, the source, and when it happened — then record it and verify it landed on the right day." },
+    { letter: "F", color: "#F97316", label: "Fix a Day", prompt: "The numbers for a specific day look wrong. Ask me which day and what's off, check the underlying data, and fix it." },
+    { letter: "A", color: "#8B5CF6", label: "Recent Actions", prompt: "Show me the most recent worker actions from the audit log." },
+  ] : [
     { letter: "W", color: "#3B82F6", label: "Weekly Recap", prompt: "Summarize this week's performance and call out anything unusual." },
     { letter: "F", color: "#F97316", label: "Funnel Health", prompt: "Walk me through the funnel step by step and flag where we're losing the most people." },
     { letter: "T", color: "#8B5CF6", label: "Trend Analyst", prompt: "What trends do you see in the last 14 days of metrics?" },
@@ -3011,7 +3030,7 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
 
   const shareChat = async () => {
     if (chatMsgs.length === 0) { flash("Start a chat first", "err"); return; }
-    const text = chatMsgs.map(m => `**${m.role === "user" ? "You" : "Funnel AI"}:** ${m.content}`).join("\n\n");
+    const text = chatMsgs.map(m => `**${m.role === "user" ? "You" : brandLabel}:** ${m.content}`).join("\n\n");
     try { await navigator.clipboard.writeText(text); flash("Chat copied to clipboard", "ok"); }
     catch { flash("Copy failed", "err"); }
   };
@@ -3106,7 +3125,7 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
         value={chatInput}
         onChange={e => setChatInput(e.target.value)}
         onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
-        placeholder="Ask anything about your funnel… (Shift+Enter for a new line)"
+        placeholder={isWorker ? "Tell me what needs doing… (Shift+Enter for a new line)" : "Ask anything about your funnel… (Shift+Enter for a new line)"}
         autoFocus
       />
       <div style={IC.inputFooter}>
@@ -3127,7 +3146,9 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
 
   const Disclaimer = (
     <div style={IC.disclaimer}>
-      Funnel AI may display inaccurate info, so please double check the response. <span style={IC.disclaimerLink}>Your Privacy &amp; Funnel AI</span>
+      {isWorker
+        ? <>Worker AI makes real changes to your data — it confirms before anything destructive, and every action is logged. Double-check what it reports.</>
+        : <>Funnel AI may display inaccurate info, so please double check the response. <span style={IC.disclaimerLink}>Your Privacy &amp; Funnel AI</span></>}
     </div>
   );
 
@@ -3137,7 +3158,7 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
       {sidebarOpen && (
         <div style={IC.sidebar}>
           <div style={IC.sidebarHeader}>
-            <span style={IC.sidebarTitle}>Chat</span>
+            <span style={IC.sidebarTitle}>{isWorker ? "Worker" : "Chat"}</span>
             <button style={IC.iconOnlyBtn} title="Search"><I d="M21 21l-4.35-4.35 M11 19a8 8 0 1 1 0-16 8 8 0 0 1 0 16z" size={16} stroke="#9CA3AF" /></button>
           </div>
           <button style={IC.newChatBtn} onClick={newChat}>
@@ -3204,8 +3225,8 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
       <div style={IC.main}>
         <div style={IC.topbar}>
           <div style={IC.brand}>
-            <span style={IC.brandName}>Funnel AI</span>
-            <span style={IC.brandPill}>Beta</span>
+            <span style={IC.brandName}>{brandLabel}</span>
+            <span style={isWorker ? { ...IC.brandPill, background: "#FEF3C7", color: "#92400E" } : IC.brandPill}>{isWorker ? "Admin" : "Beta"}</span>
           </div>
           <div style={IC.topActions}>
             <button style={IC.pillBtn} onClick={shareChat} title="Copy conversation">
@@ -3224,8 +3245,8 @@ function InsightsChat({ flash, isMobile, activeFunnel }) {
             <div style={IC.msgColumn}>
               {chatMsgs.length === 0 && !chatLoading ? (
                 <div style={IC.emptyGreet}>
-                  <div style={IC.emptyGreetTitle}>What would you like to explore?</div>
-                  <div style={IC.emptyGreetSub}>Ask about trends, compare periods, dig into a specific day, or pull a chart of any metric over time.</div>
+                  <div style={IC.emptyGreetTitle}>{isWorker ? "What needs doing?" : "What would you like to explore?"}</div>
+                  <div style={IC.emptyGreetSub}>{isWorker ? "I can record missed sales and events, fix a day's numbers, link duplicate contacts, and repair data — then verify everything I changed." : "Ask about trends, compare periods, dig into a specific day, or pull a chart of any metric over time."}</div>
                 </div>
               ) : (
                 <>

@@ -64,6 +64,16 @@ The model's tools: `get_metrics`, `get_metrics_rollup`, `compare_periods`, `get_
 
 ---
 
+## AI Worker — Bearer + `X-Funnel` (**admin only**)
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/worker/chat` | Chat with the operations worker (`{ messages:[{role,content}] }`). Same shape as the analyst chat, but `requireAdmin` and armed with WRITE tools. |
+
+The worker has every analyst read tool **plus**: `add_sale` (backdated purchase — event + daily column + refinalize + cache), `add_event` (other funnel events), `update_event`, `delete_event`, `set_metric_override` (admin display overrides), `finalize_day`, `link_identity` / `unlink_identity`, `run_sql_write` (single‑statement escape hatch via `ai_run_sql_write` RPC; DDL needs an explicit confirm flag), `clear_cache`, `get_audit_log`. Every write is recorded in `worker_audit_log` (see `db/migrate_ai_worker.sql`). Worker conversations share `chat_conversations`, namespaced by the `work-` id prefix.
+
+---
+
 ## AI Tools API — `X-API-Key` (external AI apps)
 
 Gives an external AI app the same tool set the built‑in analyst uses. The app runs its own LLM loop: fetch the definitions, pass them to its model as tools, POST each `tool_use` here, and feed the JSON back as the `tool_result`.

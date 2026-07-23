@@ -4304,6 +4304,728 @@ FORMATTING:
 });
 
 // =============================================================================
+// AI WORKER — admin-only operations agent (all analyst read tools + WRITE tools)
+// =============================================================================
+// The worker is the do-er counterpart to the AI Insights analyst: it records
+// sales/events (backdated correctly), fixes daily numbers, links duplicate
+// identities, repairs data via SQL, and verifies its own work. Every write-tool
+// call is recorded in worker_audit_log. Endpoint is requireAdmin — viewers
+// never see it (the frontend hides it, the server enforces it).
+
+// "YYYY-MM-DD[ HH:mm[:ss]]" (no zone) is interpreted as America/Los_Angeles —
+// that's how admins read times off GHL/webinar screens. ISO strings with an
+// explicit zone (Z / ±HH:MM) are trusted as-is. Date-only lands at noon LA so
+// DST edges can't shift the calendar day. Returns a Date, or null if unparsable.
+function parseWorkerDatetime(input) {
+    if (input === undefined || input === null || String(input).trim() === '') return new Date();
+    const s = String(input).trim();
+    if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(s)) {
+        const d = new Date(s);
+        return isNaN(d.getTime()) ? null : d;
+    }
+    const m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+    if (!m) {
+        const d = new Date(s);
+        return isNaN(d.getTime()) ? null : d;
+    }
+    const [, Y, Mo, D, H = '12', Mi = '0', Se = '0'] = m;
+    const laOffsetMs = (utcDate) => {
+        const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+            timeZone: 'America/Los_Angeles', hour12: false,
+            year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+        }).formatToParts(utcDate).map(x => [x.type, x.value]));
+        return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second) - utcDate.getTime();
+    };
+    const wallUtc = Date.UTC(+Y, +Mo - 1, +D, +H, +Mi, +Se);
+    let result = new Date(wallUtc - laOffsetMs(new Date(wallUtc)));
+    const off2 = laOffsetMs(result); // re-check across a DST boundary
+    if (wallUtc - off2 !== result.getTime()) result = new Date(wallUtc - off2);
+    return result;
+}
+
+const laDayISO = (d) => d.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+
+// The daily_metrics column an event row counts toward (null = uncounted type).
+function dailyColumnForEvent(ev) {
+    const t = ev.event_type;
+    if (t === 'purchases') return PURCHASE_DEDUP_MAP[ev.metadata?.source] || 'purchases_fb';
+    if (t === 'stayeduntil') return STAYED_DEDUP_MAP[Number(ev.metadata?.stayeduntil)] || null;
+    if (['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta'].includes(t)) return t;
+    return null;
+}
+
+// Ensure the daily row exists, bump `column` by delta (clamped at 0 on the way
+// down), and re-finalize when the day was already frozen so the canonical
+// numbers pick up the change. Shared tail of add_sale/add_event/delete_event.
+async function workerAdjustDay(funnel, isoDate, column, delta) {
+    const sb = clientFor(funnel);
+    const [y, mo, d] = isoDate.split('-');
+    await sb.from('daily_metrics').upsert({ date: isoDate, day_of_week: getLADayOfWeek(`${mo}/${d}/${y}`) }, { onConflict: 'date', ignoreDuplicates: true });
+    let adjusted = false;
+    if (column) {
+        if (delta < 0) {
+            const { data: cur } = await sb.from('daily_metrics').select(column).eq('date', isoDate).maybeSingle();
+            if (!cur || Number(cur[column]) <= 0) delta = 0; // don't drive counters negative
+        }
+        if (delta !== 0) {
+            const { error } = await sb.rpc('increment_field', { p_date: isoDate, p_field: column, p_amount: delta });
+            adjusted = !error;
+            if (error) console.error(`⚠️ Worker[${funnel}]: counter ${column} ${delta > 0 ? '+' : ''}${delta} for ${isoDate} failed:`, error.message);
+        }
+    }
+    let refinalized = false;
+    const { data: dayRow } = await sb.from('daily_metrics').select('finalized_at').eq('date', isoDate).maybeSingle();
+    if (dayRow?.finalized_at) {
+        try {
+            await finalizeDailyMetricsForDate(funnel, isoDate);
+            refinalized = true;
+        } catch (e) {
+            console.error(`⚠️ Worker[${funnel}]: refinalize ${isoDate} failed:`, e.message);
+        }
+    }
+    invalidateDedupForDate(funnel, isoDate);
+    invalidateInsightsCache(funnel);
+    return { counter_adjusted: adjusted, refinalized };
+}
+
+async function workerAddSale(funnel, input, ctx) {
+    const sb = clientFor(funnel);
+    const email = String(input.email || '').toLowerCase().trim();
+    if (!email || !email.includes('@')) return { error: 'A valid buyer email is required.' };
+    const source = input.source || 'Paid Ads';
+    if (!PURCHASE_DEDUP_MAP[source]) return { error: `Unknown source "${source}". Valid: ${Object.keys(PURCHASE_DEDUP_MAP).join(', ')}` };
+    const when = parseWorkerDatetime(input.datetime);
+    if (!when) return { error: `Could not parse datetime "${input.datetime}". Use "YYYY-MM-DD HH:mm" (Pacific) or an ISO string.` };
+    if (when.getTime() > Date.now() + 5 * 60 * 1000) return { error: `That datetime is in the future (${when.toISOString()}).` };
+
+    const saleDay = laDayISO(when);
+
+    // One purchase per email per LA day (mirrors the webhook dedup).
+    const win = 36 * 60 * 60 * 1000;
+    const { data: nearby } = await sb.from('events')
+        .select('id, event_time, metadata')
+        .eq('event_type', 'purchases')
+        .ilike('email', email)
+        .gte('event_time', new Date(when.getTime() - win).toISOString())
+        .lte('event_time', new Date(when.getTime() + win).toISOString());
+    const existing = (nearby || []).find(ev => laDayISO(new Date(ev.event_time)) === saleDay);
+    if (existing && !input.skip_dedup) {
+        return {
+            duplicate: true,
+            existing: { event_id: existing.id, event_time: existing.event_time, source: existing.metadata?.source || null },
+            note: `${email} already has a purchase on ${saleDay} (LA). Nothing was written. If this is genuinely a second sale, confirm with the user and retry with skip_dedup: true.`,
+        };
+    }
+
+    // Post-webinar detection, same rule as the webhook: Paid Ads / Sales A/B
+    // purchase 12h+ after the buyer's most recent webinar engagement.
+    let resolvedSource = source;
+    let column = PURCHASE_DEDUP_MAP[source];
+    if (['Paid Ads', 'Sales A', 'Sales B'].includes(source)) {
+        const { data: engaged } = await sb.from('events')
+            .select('event_time, event_type')
+            .in('event_type', ['attended', 'replays'])
+            .ilike('email', email)
+            .lte('event_time', when.toISOString())
+            .order('event_time', { ascending: false })
+            .limit(1);
+        if (engaged?.length && (when.getTime() - new Date(engaged[0].event_time).getTime()) / 3600000 >= 12) {
+            resolvedSource = 'Post Webinar';
+            column = 'purchases_postwebinar';
+        }
+    }
+
+    const { data: evRow, error: evErr } = await sb.from('events').insert({
+        event_type: 'purchases',
+        name: input.name || null,
+        email,
+        phone: input.phone || null,
+        event_time: when.toISOString(),
+        metadata: { source: resolvedSource, added_by: 'ai_worker', added_by_email: ctx.userEmail || null },
+    }).select('id').single();
+    if (evErr) return { error: `Event insert failed: ${evErr.message}` };
+
+    const tail = await workerAdjustDay(funnel, saleDay, column, 1);
+    return {
+        ok: true, event_id: evRow.id, email, source: resolvedSource, column,
+        counted_on: saleDay, event_time_utc: when.toISOString(),
+        event_time_la: when.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }),
+        ...tail,
+        ...(resolvedSource !== source ? { note: `Auto-classified as Post Webinar (last webinar engagement was 12h+ before the sale).` } : {}),
+    };
+}
+
+const WORKER_EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', 'stayeduntil'];
+
+async function workerAddEvent(funnel, input, ctx) {
+    const sb = clientFor(funnel);
+    const type = input.event_type;
+    if (!WORKER_EVENT_TYPES.includes(type)) return { error: `event_type must be one of: ${WORKER_EVENT_TYPES.join(', ')}. For purchases use add_sale.` };
+    const email = String(input.email || '').toLowerCase().trim();
+    if (!email || !email.includes('@')) return { error: 'A valid email is required.' };
+    const when = parseWorkerDatetime(input.datetime);
+    if (!when) return { error: `Could not parse datetime "${input.datetime}".` };
+    if (when.getTime() > Date.now() + 5 * 60 * 1000) return { error: `That datetime is in the future (${when.toISOString()}).` };
+
+    const metadata = { ...(input.metadata && typeof input.metadata === 'object' ? input.metadata : {}) };
+    let column = type;
+    if (type === 'stayeduntil') {
+        const minute = Number(input.stayeduntil ?? metadata.stayeduntil);
+        column = STAYED_DEDUP_MAP[minute];
+        if (!column) return { error: 'stayeduntil events need stayeduntil: 45, 60, or 80.' };
+        metadata.stayeduntil = minute;
+    }
+
+    const day = laDayISO(when);
+    const win = 36 * 60 * 60 * 1000;
+    const { data: nearby } = await sb.from('events')
+        .select('id, event_time')
+        .eq('event_type', type)
+        .ilike('email', email)
+        .gte('event_time', new Date(when.getTime() - win).toISOString())
+        .lte('event_time', new Date(when.getTime() + win).toISOString());
+    const existing = (nearby || []).find(ev => laDayISO(new Date(ev.event_time)) === day);
+    if (existing && !input.skip_dedup) {
+        return {
+            duplicate: true,
+            existing: { event_id: existing.id, event_time: existing.event_time },
+            note: `${email} already has a ${type} event on ${day} (LA). Nothing was written. Retry with skip_dedup: true only if the user confirms it's a genuine second event.`,
+        };
+    }
+
+    metadata.added_by = 'ai_worker';
+    metadata.added_by_email = ctx.userEmail || null;
+    const { data: evRow, error: evErr } = await sb.from('events').insert({
+        event_type: type,
+        name: input.name || null,
+        email,
+        phone: input.phone || null,
+        event_time: when.toISOString(),
+        metadata,
+    }).select('id').single();
+    if (evErr) return { error: `Event insert failed: ${evErr.message}` };
+
+    const tail = await workerAdjustDay(funnel, day, column, 1);
+    return {
+        ok: true, event_id: evRow.id, email, event_type: type, column, counted_on: day,
+        event_time_utc: when.toISOString(),
+        event_time_la: when.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }),
+        ...tail,
+    };
+}
+
+async function workerDeleteEvent(funnel, input) {
+    const sb = clientFor(funnel);
+    const id = Number(input.event_id);
+    if (!id) return { error: 'event_id is required.' };
+    const { data: ev, error } = await sb.from('events').select('*').eq('id', id).maybeSingle();
+    if (error) return { error: error.message };
+    if (!ev) return { error: `No event with id ${id}.` };
+
+    const { error: delErr } = await sb.from('events').delete().eq('id', id);
+    if (delErr) return { error: `Delete failed: ${delErr.message}` };
+
+    const day = laDayISO(new Date(ev.event_time));
+    const tail = await workerAdjustDay(funnel, day, dailyColumnForEvent(ev), -1);
+    return {
+        ok: true,
+        deleted: { event_id: ev.id, event_type: ev.event_type, email: ev.email, name: ev.name, event_time: ev.event_time, metadata: ev.metadata },
+        counted_on: day, ...tail,
+    };
+}
+
+async function workerUpdateEvent(funnel, input, ctx) {
+    const sb = clientFor(funnel);
+    const id = Number(input.event_id);
+    if (!id) return { error: 'event_id is required.' };
+    const { data: ev, error } = await sb.from('events').select('*').eq('id', id).maybeSingle();
+    if (error) return { error: error.message };
+    if (!ev) return { error: `No event with id ${id}.` };
+
+    const patch = {};
+    if (input.email !== undefined) patch.email = String(input.email).toLowerCase().trim() || null;
+    if (input.name !== undefined) patch.name = input.name || null;
+    if (input.phone !== undefined) patch.phone = input.phone || null;
+    if (input.metadata_merge && typeof input.metadata_merge === 'object') {
+        patch.metadata = { ...(ev.metadata || {}), ...input.metadata_merge, edited_by: 'ai_worker', edited_by_email: ctx.userEmail || null };
+    }
+    if (Object.keys(patch).length === 0) return { error: 'Nothing to update — pass email, name, phone, and/or metadata_merge. To change the time or source, delete and re-add the event instead (counters must move with it).' };
+    if (patch.metadata?.source && patch.metadata.source !== ev.metadata?.source && ev.event_type === 'purchases') {
+        return { error: 'Changing a purchase\'s source via metadata_merge would desync the daily counters. Delete the event and re-add it with the right source.' };
+    }
+
+    const { error: updErr } = await sb.from('events').update(patch).eq('id', id);
+    if (updErr) return { error: updErr.message };
+
+    const day = laDayISO(new Date(ev.event_time));
+    const tail = await workerAdjustDay(funnel, day, null, 0); // no counter move; refinalize + cache
+    return { ok: true, event_id: id, before: { email: ev.email, name: ev.name, phone: ev.phone }, applied: patch, ...tail };
+}
+
+const WORKER_OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'stayed_45', 'stayed_60', 'stayed_80'];
+
+async function workerSetOverride(funnel, input) {
+    const sb = clientFor(funnel);
+    const dateInput = parseDateInput(input.date);
+    if (!dateInput) return { error: 'Invalid date. Use YYYY-MM-DD.' };
+    const isoDate = dateToISO(dateInput);
+    if (!input.values || typeof input.values !== 'object' || Array.isArray(input.values)) {
+        return { error: 'Pass values: { field: number | null, ... }. null clears that field\'s override.' };
+    }
+    const bad = Object.keys(input.values).filter(f => !WORKER_OVERRIDE_FIELDS.includes(f));
+    if (bad.length) return { error: `Not overridable: ${bad.join(', ')}. Valid: ${WORKER_OVERRIDE_FIELDS.join(', ')}` };
+
+    await sb.from('daily_metrics').upsert({ date: isoDate, day_of_week: getLADayOfWeek(dateInput) }, { onConflict: 'date', ignoreDuplicates: true });
+    const { data: existing } = await sb.from('daily_metrics').select('overrides').eq('date', isoDate).maybeSingle();
+    const merged = { ...(existing?.overrides || {}) };
+    for (const [f, v] of Object.entries(input.values)) {
+        if (v === null) delete merged[f];
+        else merged[f] = (f === 'fb_spend') ? parseFloat(v) || 0 : parseInt(v) || 0;
+    }
+    const { error } = await sb.from('daily_metrics').update({ overrides: merged }).eq('date', isoDate);
+    if (error) return { error: error.message };
+    invalidateMetricsCache(funnel);
+    invalidateInsightsCache(funnel);
+    return { ok: true, date: isoDate, overrides: merged };
+}
+
+async function workerLinkIdentity(funnel, input, ctx) {
+    const sb = clientFor(funnel);
+    const alias = String(input.alias_email || '').toLowerCase().trim();
+    const canonical = String(input.canonical_email || '').toLowerCase().trim();
+    if (!alias || !canonical || !alias.includes('@') || !canonical.includes('@')) return { error: 'alias_email and canonical_email are both required.' };
+    if (alias === canonical) return { error: 'alias and canonical are the same address.' };
+    const { count } = await sb.from('events').select('id', { count: 'exact', head: true }).eq('event_type', 'registrations').ilike('email', canonical);
+    if (!count) return { error: `No registration found for ${canonical} — the canonical side must be the registrant's email.` };
+    const { error } = await sb.from('identity_links').upsert(
+        { alias_email: alias, canonical_email: canonical, note: input.note || 'via ai_worker', created_by: ctx.userId, created_at: new Date().toISOString() },
+        { onConflict: 'alias_email' });
+    if (error) return { error: error.message };
+    const b = getCacheBucket(funnel);
+    b.identityLinks = undefined; b.stitchAliases = undefined;
+    b.dedupCounts = {}; b.dedupTimestamps = {};
+    invalidateMetricsCache(funnel);
+    invalidateInsightsCache(funnel);
+    return { ok: true, alias_email: alias, canonical_email: canonical };
+}
+
+async function workerUnlinkIdentity(funnel, input) {
+    const sb = clientFor(funnel);
+    const alias = String(input.alias_email || '').toLowerCase().trim();
+    if (!alias) return { error: 'alias_email is required.' };
+    const { error } = await sb.from('identity_links').delete().eq('alias_email', alias);
+    if (error) return { error: error.message };
+    const b = getCacheBucket(funnel);
+    b.identityLinks = undefined; b.stitchAliases = undefined;
+    b.dedupCounts = {}; b.dedupTimestamps = {};
+    invalidateMetricsCache(funnel);
+    invalidateInsightsCache(funnel);
+    return { ok: true, unlinked: alias };
+}
+
+async function workerRunSQLWrite(funnel, input) {
+    const sql = typeof input.query === 'string' ? input.query.trim().replace(/;+\s*$/, '') : '';
+    if (!sql) return { error: 'query is required.' };
+    if (sql.includes(';')) return { error: 'One statement at a time — no semicolon chaining.' };
+    if (/\b(drop|truncate|alter|create|grant|revoke|vacuum|reindex|cluster)\b/i.test(sql) && input.confirm_danger !== true) {
+        return { error: 'This statement contains DDL/TRUNCATE. Describe the exact change to the user first; retry with confirm_danger: true only after they explicitly approve.' };
+    }
+    const { data, error } = await clientFor(funnel).rpc('ai_run_sql_write', { query: sql });
+    if (error) return { error: error.message };
+    // Writes can touch anything — flush this funnel's caches wholesale.
+    if (!/^select/i.test(sql)) {
+        const b = getCacheBucket(funnel);
+        b.dedupCounts = {}; b.dedupTimestamps = {};
+        invalidateMetricsCache(funnel);
+        invalidateInsightsCache(funnel);
+    }
+    return data;
+}
+
+function workerClearCache(funnel) {
+    const b = getCacheBucket(funnel);
+    const days = Object.keys(b.dedupCounts).length;
+    b.dedupCounts = {}; b.dedupTimestamps = {};
+    b.identityLinks = undefined; b.stitchAliases = undefined;
+    invalidateMetricsCache(funnel);
+    invalidateInsightsCache(funnel);
+    return { ok: true, message: `Cache cleared (${days} days flushed)` };
+}
+
+async function workerGetAuditLog(funnel, input) {
+    const limit = Math.min(Math.max(parseInt(input.limit) || 20, 1), 100);
+    const { data, error } = await clientFor(funnel).from('worker_audit_log')
+        .select('id, user_email, tool, input, result, created_at')
+        .order('created_at', { ascending: false })
+        .limit(limit);
+    if (error) return { error: error.message };
+    return { actions: data || [] };
+}
+
+const WORKER_TOOLS = [
+    {
+        name: 'add_sale',
+        description: 'Record a purchase the webhooks missed — the RIGHT way to add a sale. Writes the event (source of truth), bumps the correct daily purchase column for the sale\'s LA calendar day, re-finalizes the day if it was frozen, and invalidates caches. Supports backdating: pass the real sale time and it lands on the right day. Auto-detects Post Webinar (Paid Ads / Sales A / Sales B sale 12h+ after the buyer\'s last webinar engagement). Refuses same-email-same-day duplicates unless skip_dedup is set.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                email:      { type: 'string', description: 'Buyer email (required)' },
+                name:       { type: 'string', description: 'Buyer name' },
+                phone:      { type: 'string', description: 'Buyer phone' },
+                source:     { type: 'string', enum: Object.keys(PURCHASE_DEDUP_MAP), description: 'Purchase source. GHL "AI CHAT BOT" pipeline = "AI Bot". Default: Paid Ads.' },
+                datetime:   { type: 'string', description: 'When the sale happened. "YYYY-MM-DD HH:mm" is read as PACIFIC time; ISO with zone is trusted; omit for now.' },
+                skip_dedup: { type: 'boolean', description: 'Set true ONLY after the user confirms a genuine second same-day sale for this email.' },
+            },
+            required: ['email'],
+        },
+    },
+    {
+        name: 'add_event',
+        description: 'Record a non-purchase funnel event (registrations, attended, replays, viewedcta, clickedcta, stayeduntil) that was missed. Same guarantees as add_sale: event + daily counter + refinalize + cache, backdating supported, same-day duplicate protection. For purchases use add_sale.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                event_type:  { type: 'string', enum: WORKER_EVENT_TYPES },
+                email:       { type: 'string', description: 'Person\'s email (required)' },
+                name:        { type: 'string' },
+                phone:       { type: 'string' },
+                datetime:    { type: 'string', description: '"YYYY-MM-DD HH:mm" Pacific, or ISO with zone. Omit for now.' },
+                stayeduntil: { type: 'number', enum: [45, 60, 80], description: 'Required when event_type is stayeduntil.' },
+                metadata:    { type: 'object', description: 'Extra metadata keys, e.g. {"variant":"A","webinar_datetime_utc":"July 22nd 2026, 11:35:00 pm"}. Match the shape of existing events (describe_journey_data shows real samples).' },
+                skip_dedup:  { type: 'boolean', description: 'Set true only after the user confirms a genuine same-day duplicate.' },
+            },
+            required: ['event_type', 'email'],
+        },
+    },
+    {
+        name: 'update_event',
+        description: 'Fix a recorded event\'s email, name, phone, or merge metadata keys — e.g. a typo\'d buyer email. Cannot move an event in time or change a purchase\'s source (delete and re-add instead, so counters follow). Re-finalizes the day when needed.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                event_id:       { type: 'number', description: 'events.id to patch (find it via run_sql or get_contact_journey)' },
+                email:          { type: 'string' },
+                name:           { type: 'string' },
+                phone:          { type: 'string' },
+                metadata_merge: { type: 'object', description: 'Keys merged into the event\'s metadata (existing keys overwritten).' },
+            },
+            required: ['event_id'],
+        },
+    },
+    {
+        name: 'delete_event',
+        description: 'Delete a wrongly-recorded event by id and decrement the matching daily counter for its LA day (re-finalizing frozen days). ALWAYS show the user the event (via run_sql / get_contact_journey) and get their explicit go-ahead before deleting. Returns the full deleted row so it can be re-added if this was a mistake.',
+        input_schema: {
+            type: 'object',
+            properties: { event_id: { type: 'number', description: 'events.id to delete' } },
+            required: ['event_id'],
+        },
+    },
+    {
+        name: 'set_metric_override',
+        description: 'Set or clear admin display-overrides on a day\'s metrics — the same mechanism as editing a row in the dashboard. Overrides sit ON TOP of automated data and never modify raw counters or events. Use for corrections like "FB spend for Jul 3 should be $5,200". For a MISSED real sale/event, use add_sale/add_event instead so the person exists in the data.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                date:   { type: 'string', description: 'YYYY-MM-DD' },
+                values: { type: 'object', description: `{ field: number } to set, { field: null } to clear. Fields: ${WORKER_OVERRIDE_FIELDS.join(', ')}` },
+            },
+            required: ['date', 'values'],
+        },
+    },
+    {
+        name: 'finalize_day',
+        description: 'Recompute a past day\'s canonical numbers from its events (deduped) and freeze them — same as the dashboard\'s "Refinalize this day" button. Use after manual event surgery on an old day, or when the user says a day\'s displayed numbers look stale.',
+        input_schema: {
+            type: 'object',
+            properties: { date: { type: 'string', description: 'YYYY-MM-DD' } },
+            required: ['date'],
+        },
+    },
+    {
+        name: 'link_identity',
+        description: 'Link an alias email to a registrant\'s canonical email so purchases/events under the alias count as the same person (e.g. someone bought under a different email than they registered with). The canonical side must have a registration. Clears dedup caches so numbers recompute.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                alias_email:     { type: 'string', description: 'The secondary/other email' },
+                canonical_email: { type: 'string', description: 'The registrant\'s email (must have a registration)' },
+                note:            { type: 'string', description: 'Why this link exists' },
+            },
+            required: ['alias_email', 'canonical_email'],
+        },
+    },
+    {
+        name: 'unlink_identity',
+        description: 'Remove an identity link by alias email. Confirm with the user before removing.',
+        input_schema: {
+            type: 'object',
+            properties: { alias_email: { type: 'string' } },
+            required: ['alias_email'],
+        },
+    },
+    {
+        name: 'run_sql_write',
+        description: 'LAST-RESORT escape hatch: run ONE arbitrary SQL statement (INSERT/UPDATE/DELETE/SELECT; WITH … RETURNING works) against the funnel\'s schema when no dedicated tool fits. NEVER use it to add/remove events or sales — add_sale/add_event/delete_event keep counters, finalization, and caches in sync; raw SQL does not (you would have to fix those yourself). DDL/TRUNCATE additionally requires confirm_danger:true after explicit user approval. Caches are flushed automatically after writes. 10s timeout, SELECTs capped at 500 rows.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                query:          { type: 'string', description: 'A single SQL statement.' },
+                confirm_danger: { type: 'boolean', description: 'Required true for DDL/TRUNCATE — only after the user explicitly approved the exact statement.' },
+            },
+            required: ['query'],
+        },
+    },
+    {
+        name: 'clear_cache',
+        description: 'Flush this funnel\'s server caches (dedup counts, metrics response, insights context, identity links) so the dashboard recomputes from the database. The write tools invalidate what they touch automatically — reach for this after external/direct DB changes or when the user says the dashboard looks stale.',
+        input_schema: { type: 'object', properties: {} },
+    },
+    {
+        name: 'get_audit_log',
+        description: 'Recent AI-worker actions (who, which tool, input, result, when) from worker_audit_log — use when the user asks what the worker has done or to double-check a past action.',
+        input_schema: {
+            type: 'object',
+            properties: { limit: { type: 'number', description: 'Max rows, default 20, max 100' } },
+        },
+    },
+];
+
+const WORKER_WRITE_TOOLS = new Set(['add_sale', 'add_event', 'update_event', 'delete_event', 'set_metric_override', 'finalize_day', 'link_identity', 'unlink_identity', 'run_sql_write', 'clear_cache']);
+
+// Fire-and-forget audit trail. Failures are logged, never thrown — an audit
+// hiccup must not fail the action itself (which already happened).
+function workerAudit(funnel, ctx, tool, input, result) {
+    let stored = result ?? null;
+    try {
+        const s = JSON.stringify(stored);
+        if (s && s.length > 4000) stored = { truncated: s.slice(0, 4000) };
+    } catch { stored = { unserializable: true }; }
+    clientFor(funnel).from('worker_audit_log')
+        .insert({ user_email: ctx.userEmail || null, tool, input: input || {}, result: stored })
+        .then(({ error }) => { if (error) console.error(`⚠️ Worker[${funnel}]: audit insert failed:`, error.message); });
+}
+
+async function executeWorkerTool(name, input, ctx) {
+    const { funnel } = ctx;
+    let out;
+    try {
+        switch (name) {
+            case 'add_sale':            out = await workerAddSale(funnel, input, ctx); break;
+            case 'add_event':           out = await workerAddEvent(funnel, input, ctx); break;
+            case 'update_event':        out = await workerUpdateEvent(funnel, input, ctx); break;
+            case 'delete_event':        out = await workerDeleteEvent(funnel, input); break;
+            case 'set_metric_override': out = await workerSetOverride(funnel, input); break;
+            case 'finalize_day': {
+                const dateInput = parseDateInput(input.date);
+                if (!dateInput) { out = { error: 'Invalid date. Use YYYY-MM-DD.' }; break; }
+                out = await finalizeDailyMetricsForDate(funnel, dateToISO(dateInput));
+                invalidateDedupForDate(funnel, dateToISO(dateInput));
+                invalidateInsightsCache(funnel);
+                break;
+            }
+            case 'link_identity':       out = await workerLinkIdentity(funnel, input, ctx); break;
+            case 'unlink_identity':     out = await workerUnlinkIdentity(funnel, input); break;
+            case 'run_sql_write':       out = await workerRunSQLWrite(funnel, input); break;
+            case 'clear_cache':         out = workerClearCache(funnel); break;
+            case 'get_audit_log':       out = await workerGetAuditLog(funnel, input); break;
+            default:
+                return executeInsightsTool(name, input, ctx);
+        }
+    } catch (err) {
+        out = { error: err.message || String(err) };
+    }
+    if (WORKER_WRITE_TOOLS.has(name)) {
+        console.log(`🔧 Worker[${funnel}] ${ctx.userEmail}: ${name}(${JSON.stringify(input).slice(0, 300)})`);
+        workerAudit(funnel, ctx, name, input, out);
+    }
+    return out;
+}
+
+app.post('/api/worker/chat', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    if (!ANTHROPIC_API_KEY) {
+        return res.status(503).json({ error: 'AI Worker not configured — set ANTHROPIC_API_KEY' });
+    }
+    try {
+        const { messages = [] } = req.body;
+        if (!Array.isArray(messages) || messages.length === 0) {
+            return res.status(400).json({ error: 'Send { messages: [{ role, content }] }' });
+        }
+
+        const funnel = req.funnel;
+        const brand = FUNNEL_BRANDS[funnel] || { brand: funnel, context: '', funnelName: funnel };
+        const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+        const memory = await loadMemory(funnel, req.user.id);
+        const memoryBlock = memory.length === 0
+            ? '(no remembered facts yet — use the `remember` tool to save things future chats should know)'
+            : memory.map(m => `- ${m.key}: ${m.value}`).join('\n');
+
+        const ghlBlock = !GHL_ENABLED ? '' : `
+
+GOHIGHLEVEL CRM (ghl MCP tools + get_ghl_pipeline_status):
+- locationId: ${GHL_LOCATION_ID} — provide it wherever a GHL tool expects a location.
+- For pipeline/stage/appointment REPORTING, use get_ghl_pipeline_status exactly as the analyst does (deduplicated buckets, never page opportunities one-by-one for segments).
+- You MAY create or modify GHL records via the ghl MCP tools when the user asks — but GHL is the live patient CRM: state exactly what you will change (which contact/opportunity, which field, old → new) and get an explicit yes BEFORE any GHL write. Never bulk-modify GHL records.`;
+
+        const systemPrompt = `You are the OPERATIONS WORKER for ${brand.brand}${brand.context ? `, ${brand.context}` : ''} — an admin-only agent on their ${brand.funnelName} analytics dashboard. Unlike the read-only analyst chat, you EXECUTE changes: record missed sales and funnel events (backdated correctly), fix daily numbers, link duplicate identities, repair data, and verify your own work. The person you are talking to is an authenticated admin.
+
+TODAY'S DATE: ${today} (Los Angeles timezone)
+
+HOW THE DATA WORKS (respect this model or numbers WILL drift):
+- \`events\` is the source of truth — one row per funnel action (event_type, email, event_time in UTC, metadata jsonb). \`daily_metrics\` holds denormalized per-day counters, one column per stage / purchase source. The dashboard prefers DEDUPLICATED event counts for recent days; past days are frozen ("finalized") into canonical columns.
+- Therefore a day's numbers = its events. add_sale / add_event / delete_event handle the FULL flow for you: event row + the right daily column for the sale's LA calendar day + re-finalize if the day was frozen + cache invalidation. NEVER manipulate events via run_sql_write when a dedicated tool fits.
+- Purchase sources → columns: Paid Ads→purchases_fb, Native→purchases_native, Youtube→purchases_youtube, AI Bot→purchases_aibot, AI Bot B→purchases_aibot_b, CPA Traffic→purchases_cpa, Sales A→purchases_sales_a, Sales B→purchases_sales_b, Post Webinar→purchases_postwebinar. The GHL "AI CHAT BOT" pipeline corresponds to source "AI Bot". add_sale auto-detects Post Webinar (Paid Ads / Sales A / Sales B sale 12h+ after the buyer's last webinar engagement).
+- One purchase per email per LA day is the dedup rule. add_sale reports duplicates instead of double-recording; use skip_dedup only after the user confirms a genuine second sale.
+- Cosmetic corrections to a day's DISPLAYED numbers ("show 5 registrations for Jul 3") go through set_metric_override — overrides sit on top and never touch raw data. A MISSED real sale/event goes through add_sale/add_event so the person actually exists in the data.
+
+OPERATING RULES (non-negotiable):
+1. LOOK BEFORE YOU WRITE. Fetch the current state first (the person's events via get_contact_journey/run_sql, the day's metrics) and say what you found. If the user pastes a GHL opportunity, check whether it's already recorded before adding.
+2. VERIFY AFTER YOU WRITE. Read the data back and confirm with specifics: event id, date, column, resulting value.
+3. CONFIRM DESTRUCTIVE OR BULK ACTIONS FIRST. Deletes, multi-row updates, DDL, and any GHL modification: state exactly what will happen and wait for an explicit yes. A single additive action the user just asked for (e.g. "add this sale") needs no re-confirmation — do it.
+4. NEVER INVENT DATA. Only write values the user gave you or a tool returned. Missing email/source/date → ask.
+5. REPORT FAITHFULLY. Tool errors and dedup refusals are reported verbatim, never papered over. Every write you make lands in the audit log (get_audit_log).
+6. TIMESTAMPS: tool datetimes like "2026-07-22 18:15" are read as PACIFIC time (that's how GHL and webinar screens display). Date-only lands at noon Pacific. The business runs on Pacific time — report all times in PT.
+
+TIMEZONE (for SQL):
+- All DB timestamps are UTC. Convert with \`event_time AT TIME ZONE 'America/Los_Angeles'\` for hour/day/date grouping; filter ranges on raw UTC event_time.
+- \`events.metadata->>'webinar_datetime_utc'\` is UTC text like "April 11th 2026, 10:00:00 pm" (strip ordinal suffixes before parsing).
+
+DATA INTEGRITY (users act on your numbers at face value):
+- Every count, name, and value you present must come verbatim from a tool result in THIS conversation. Never derive counts across calls, never extrapolate past truncation flags, never list people beyond what a tool returned.
+- If a fresh tool result contradicts something you said earlier, open with the correction.${ghlBlock}
+
+REMEMBERED FACTS (shared with the analyst chat):
+${memoryBlock}
+
+TOOLS: you have every analyst read tool (get_metrics, journeys, segments, describe_journey_data, run_sql, ${GHL_ENABLED ? 'get_ghl_pipeline_status, ' : ''}etc.) PLUS the write tools (add_sale, add_event, update_event, delete_event, set_metric_override, finalize_day, link_identity, unlink_identity, run_sql_write, clear_cache, get_audit_log). Prefer the most specific tool; run_sql_write is the last resort.
+
+FORMATTING:
+- Use markdown. Bold the key outcome ("**Recorded: 1 AI Bot sale for Jul 22**"). After a change, show a short before → after.
+- Chart blocks (\`\`\`chart with {type,title,x,series,data} JSON) render as real charts — use them when a trend/comparison helps.`;
+
+        const TRIM_KEEP = 20;
+        const trimmed = messages.length > TRIM_KEEP ? messages.slice(-TRIM_KEEP) : messages;
+        const apiMessages = trimmed.map(m => ({
+            role: m.role === 'user' ? 'user' : 'assistant',
+            content: m.content,
+        }));
+
+        const SERVER_TOOLS = [
+            { type: 'code_execution_20250522', name: 'code_execution' },
+        ];
+        const clientTools = [...INSIGHTS_TOOLS, ...WORKER_TOOLS];
+        const allTools = [...clientTools, ...SERVER_TOOLS];
+
+        const GHL_MCP_SERVERS = GHL_ENABLED ? [{
+            type: 'url',
+            name: 'ghl',
+            url: 'https://services.leadconnectorhq.com/mcp/',
+            authorization_token: GHL_MCP_TOKEN,
+        }] : undefined;
+        if (GHL_ENABLED) allTools.push({ type: 'mcp_toolset', mcp_server_name: 'ghl' });
+
+        const toolCtx = { funnel, userId: req.user.id, userEmail: req.user.email };
+
+        const MAX_ITERS = 12;
+        const DEADLINE_MS = 110_000;
+        const PER_CALL_MS = 90_000;
+        const startedAt = Date.now();
+        let lastUsage = null;
+        for (let iter = 0; iter < MAX_ITERS; iter++) {
+            const outOfTime = Date.now() - startedAt > DEADLINE_MS;
+            const callCtrl = new AbortController();
+            const callTimer = setTimeout(() => callCtrl.abort(), PER_CALL_MS);
+            let response;
+            try {
+                response = await fetch('https://api.anthropic.com/v1/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': ANTHROPIC_API_KEY,
+                        'anthropic-version': '2023-06-01',
+                        'anthropic-beta': 'code-execution-2025-05-22' + (GHL_ENABLED ? ',mcp-client-2025-11-20' : ''),
+                    },
+                    body: JSON.stringify({
+                        model: 'claude-sonnet-5',
+                        max_tokens: 4096,
+                        cache_control: { type: 'ephemeral' },
+                        system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+                        tools: allTools,
+                        mcp_servers: GHL_MCP_SERVERS,
+                        tool_choice: outOfTime ? { type: 'none' } : undefined,
+                        messages: apiMessages,
+                    }),
+                    signal: callCtrl.signal,
+                });
+            } catch (e) {
+                clearTimeout(callTimer);
+                if (e.name === 'AbortError') {
+                    console.error(`❌ Worker[${funnel}]: Anthropic call aborted after ${PER_CALL_MS}ms (iter ${iter})`);
+                    return res.status(504).json({ error: 'The AI took too long to respond. Try a narrower request.' });
+                }
+                throw e;
+            }
+            clearTimeout(callTimer);
+
+            if (!response.ok) {
+                const errBody = await response.text();
+                console.error('❌ Claude API error (worker):', response.status, errBody);
+                return res.status(502).json({ error: 'AI service error', detail: errBody });
+            }
+
+            const result = await response.json();
+            lastUsage = result.usage;
+
+            if (result.stop_reason === 'pause_turn') {
+                apiMessages.push({ role: 'assistant', content: result.content });
+                continue;
+            }
+
+            if (result.stop_reason === 'tool_use') {
+                const ourToolNames = new Set(clientTools.map(t => t.name));
+                const toolUses = (result.content || []).filter(c => c.type === 'tool_use' && ourToolNames.has(c.name));
+                const serverUses = (result.content || []).filter(c => c.type === 'tool_use' && !ourToolNames.has(c.name));
+                console.log(`🛠️  Worker[${funnel}] iter ${iter}: ${toolUses.length} client + ${serverUses.length} server tool call(s): ${[...toolUses, ...serverUses].map(t => t.name).join(', ')}`);
+
+                if (toolUses.length === 0) {
+                    apiMessages.push({ role: 'assistant', content: result.content });
+                    apiMessages.push({ role: 'user', content: 'continue' });
+                    continue;
+                }
+
+                const toolResults = [];
+                for (const tu of toolUses) {
+                    const out = await executeWorkerTool(tu.name, tu.input || {}, toolCtx);
+                    toolResults.push({
+                        type: 'tool_result',
+                        tool_use_id: tu.id,
+                        content: JSON.stringify(out),
+                    });
+                }
+
+                apiMessages.push({ role: 'assistant', content: result.content });
+                apiMessages.push({ role: 'user', content: toolResults });
+                continue;
+            }
+
+            const reply = (result.content || [])
+                .filter(c => c.type === 'text')
+                .map(c => c.text)
+                .join('\n')
+                .trim() || 'No response generated.';
+            return res.json({ reply, usage: lastUsage });
+        }
+
+        console.error(`❌ Worker[${funnel}]: tool loop exceeded ${MAX_ITERS} iterations`);
+        return res.status(500).json({ error: 'Tool loop exceeded max iterations' });
+
+    } catch (err) {
+        console.error('❌ POST /api/worker/chat error:', err.message);
+        res.status(500).json({ error: 'Internal server error', detail: err.message });
+    }
+});
+
+// =============================================================================
 // CHAT CONVERSATION PERSISTENCE
 // =============================================================================
 
