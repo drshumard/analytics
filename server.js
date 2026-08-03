@@ -4507,6 +4507,24 @@ async function executeInsightsTool(name, input, ctx) {
     }
 }
 
+// Shared presentation rules for both AI chats. The frontend renders \`\`\`stats
+// and \`\`\`chart fences as real visual blocks — these rules push the model to
+// reach for them instead of markdown tables, which end users find hard to read.
+const VIZ_FORMAT_GUIDE = `FORMATTING — the reader is a busy business owner, not an analyst. Numbers become VISUALS, not tables:
+- Lead with the answer in one plain-English sentence ("Your typical buyer is a woman in her mid-60s in Florida"). Then the visual blocks, then 2-3 sentences of commentary. Never a wall of numbers in prose.
+- Headline numbers (counts, medians, rates, coverage — up to ~6) → a \`\`\`stats block:
+  \`\`\`stats
+  {"tiles":[{"label":"Buyers (30d)","value":"233"},{"label":"Median age","value":"64"},{"label":"Female","value":"60%","note":"of 208 known"},{"label":"CPA","value":"$1,214","delta":"-8% vs June","delta_good":true}]}
+  \`\`\`
+  "delta" is optional ("+12% vs last week"); set "delta_good":false when a rise is bad (costs). "note" is small print under the value.
+- Part-to-whole shares (gender split, purchases by source, A/B split) → \`\`\`chart with {"type":"donut","title":"Gender","data":[{"label":"Female","value":125},{"label":"Male","value":83},{"label":"Unknown","value":21}]} — max 6 slices, fold the tail into "Other".
+- Ranked categories with names (top states, cities, campaigns, email sources) → \`\`\`chart with {"type":"hbar","title":"Top states","x":"label","series":[{"key":"value","label":"Buyers"}],"data":[{"label":"Florida","value":31},{"label":"California","value":27}]} — sorted descending.
+- Distributions over ordered buckets (age brackets, hour of day, minutes stayed) → \`\`\`chart with {"type":"bar","title":"Buyer ages","x":"bucket","series":[{"key":"people","label":"Buyers"}],"data":[{"bucket":"50-59","people":46}]} — ONE series.
+- Trends over time → "line" ("area" for a single series): {"type":"line","title":"Daily registrations","x":"date","series":[{"key":"registrations","label":"Registrations"}],"data":[{"date":"2026-05-01","registrations":30}]}.
+- Do NOT set "color" — the renderer assigns a consistent, accessible palette. Max 4 series on one chart; one idea per chart.
+- Markdown TABLES are a LAST resort: only for comparing items across 3+ DIFFERENT attributes at once (e.g. campaigns × budget × CTR × spend), max ~8 rows, and always properly formatted on their own lines (header row, separator row, data rows) — never inline in a sentence, never inside a bullet. NEVER present a label→count breakdown (age distribution, gender split, top states, purchases by source) as a table — those are charts.
+- Bold the single key takeaway. Skip decorative emoji, emoji bullets, and horizontal rules between sections.`;
+
 app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) => {
     if (!ANTHROPIC_API_KEY) {
         return res.status(503).json({ error: 'AI Insights not configured — set ANTHROPIC_API_KEY' });
@@ -4631,25 +4649,7 @@ ${FB_ADS_ENABLED ? `- LIVE FACEBOOK ADS: \`get_fb_ads\` shows what's actually ru
 - When the user shares context worth remembering across chats (promos, definitions, business changes), use the \`remember\` tool silently.
 - If asked about something not in the data, say so honestly.
 
-FORMATTING:
-- Use markdown: headers, bullets, bold for key numbers, tables when comparing.
-- When a chart would communicate better than a table (any trend, distribution, or comparison across >5 data points), emit a fenced \`\`\`chart block with JSON. The frontend will render it as a real chart. Shape:
-  \`\`\`chart
-  {
-    "type": "line",                                    // "line" | "bar" | "area"
-    "title": "Daily Registrations (last 30 days)",
-    "x": "date",
-    "series": [
-      {"key": "registrations", "label": "Registrations", "color": "#3B82F6"},
-      {"key": "purchases",     "label": "Purchases",     "color": "#10B981"}
-    ],
-    "data": [
-      {"date": "2026-05-01", "registrations": 30, "purchases": 2},
-      {"date": "2026-05-02", "registrations": 35, "purchases": 3}
-    ]
-  }
-  \`\`\`
-  Use 2-4 series max. Keep it readable.`;
+${VIZ_FORMAT_GUIDE}`;
 
         // Build the message stack we'll send to Claude. Incoming history is
         // user/assistant text only; we'll grow it with tool_use / tool_result
@@ -5399,9 +5399,8 @@ ${memoryBlock}
 
 TOOLS: you have every analyst read tool (get_metrics, journeys, segments, describe_journey_data, run_sql, ${GHL_ENABLED ? 'get_ghl_pipeline_status, ' : ''}etc.) PLUS the write tools (add_sale, add_event, update_event, delete_event, set_metric_override, finalize_day, link_identity, unlink_identity, run_sql_write, clear_cache, get_audit_log). Prefer the most specific tool; run_sql_write is the last resort.
 
-FORMATTING:
-- Use markdown. Bold the key outcome ("**Recorded: 1 AI Bot sale for Jul 22**"). After a change, show a short before → after.
-- Chart blocks (\`\`\`chart with {type,title,x,series,data} JSON) render as real charts — use them when a trend/comparison helps.`;
+${VIZ_FORMAT_GUIDE}
+- Worker-specific: bold the key outcome ("**Recorded: 1 AI Bot sale for Jul 22**"); after a change show a short before → after in plain prose (or a small stats row), never a table.`;
 
         const TRIM_KEEP = 20;
         const trimmed = messages.length > TRIM_KEEP ? messages.slice(-TRIM_KEEP) : messages;

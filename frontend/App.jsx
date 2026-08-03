@@ -2288,8 +2288,13 @@ function CMForm({ initial, onSubmit, onCancel, metrics, customs = [] }) {
   );
 }
 
-// Simple markdown renderer for chat messages
-const CHART_COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#8B5CF6', '#EF4444', '#06B6D4'];
+// Chat data-viz primitives. Specs follow the dataviz method: categorical hues
+// in a FIXED validated order (never cycled past 8, CVD-checked on white),
+// single hue when one series carries magnitude, thin marks with rounded
+// data-ends, hairline grid, legend only for ≥2 series, tooltips on every mark,
+// values in ink (never the series color).
+const CHART_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948'];
+const VIZ = { grid: '#e1e0d9', axis: '#c3c2b7', muted: '#898781', ink: '#0b0b0b', sub: '#52514e', surface: '#fff', good: '#006300', bad: '#d03b3b' };
 
 function niceCeil(n) {
   if (n <= 0) return 1;
@@ -2307,37 +2312,161 @@ function fmtChartNum(v) {
   const abs = Math.abs(v);
   if (abs >= 1e6) return (v / 1e6).toFixed(abs >= 1e7 ? 0 : 1) + 'M';
   if (abs >= 1e3) return (v / 1e3).toFixed(abs >= 1e4 ? 0 : 1) + 'k';
+  if (Number.isInteger(v)) return String(v);
   if (abs >= 10) return v.toFixed(0);
   if (abs >= 1) return v.toFixed(1);
   if (abs > 0) return v.toFixed(2);
   return '0';
 }
 
-function MdChart({ spec }) {
-  if (!spec || !Array.isArray(spec.data) || spec.data.length === 0) {
-    return <div style={{ padding: 12, color: '#9CA3AF', fontSize: 13 }}>(empty chart)</div>;
+const fmtTipNum = (v) => Number.isFinite(v) ? v.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—';
+
+// One fixed-position tooltip shared by all marks of a chart.
+function useVizTip() {
+  const [tip, setTip] = useState(null); // { x, y, title, lines:[{swatch,text}] }
+  const show = (e, title, lines) => setTip({ x: e.clientX, y: e.clientY, title, lines });
+  const move = (e) => setTip(t => (t ? { ...t, x: e.clientX, y: e.clientY } : t));
+  const hide = () => setTip(null);
+  const node = tip ? (
+    <div style={{ position: 'fixed', left: Math.min(tip.x + 12, (typeof window !== 'undefined' ? window.innerWidth : 1000) - 250), top: tip.y + 14, zIndex: 1000, background: '#0F172A', color: '#fff', borderRadius: 8, padding: '8px 11px', fontSize: 12, lineHeight: 1.55, pointerEvents: 'none', boxShadow: '0 4px 14px rgba(15,23,42,0.28)', maxWidth: 240 }}>
+      {tip.title && <div style={{ fontWeight: 600 }}>{tip.title}</div>}
+      {(tip.lines || []).map((l, i) => (
+        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          {l.swatch && <span style={{ width: 8, height: 8, borderRadius: 2, background: l.swatch, display: 'inline-block', flexShrink: 0 }} />}
+          <span>{l.text}</span>
+        </div>
+      ))}
+    </div>
+  ) : null;
+  return { show, move, hide, node };
+}
+
+const CHART_WRAP = { margin: "12px 0", padding: 14, border: "1px solid #E5E7EB", borderRadius: 12, background: "#fff" };
+const CHART_TITLE = { fontSize: 13, fontWeight: 600, color: VIZ.ink, marginBottom: 8 };
+const CHART_LEGEND = { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 8, justifyContent: "center" };
+const CHART_LEGEND_ITEM = { display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, color: VIZ.sub };
+
+// Rounded data-end, square baseline (4px cap; plain rect when too small).
+function barPath(x, y, w, h, up) {
+  const r = Math.min(4, w / 2, h);
+  if (h <= 0 || r <= 0) return `M${x},${y} h${w} v${h} h${-w} Z`;
+  if (up) return `M${x},${y + h} v${-(h - r)} q0,${-r} ${r},${-r} h${w - 2 * r} q${r},0 ${r},${r} v${h - r} Z`;
+  return `M${x},${y} v${h - r} q0,${r} ${r},${r} h${w - 2 * r} q${r},0 ${r},${-r} v${-(h - r)} Z`;
+}
+
+// Part-to-whole donut: slices in fixed categorical order (sorted by size,
+// tail folded into "Other"), 2px surface gaps, total in the center, legend
+// carries label + value + share (identity is never color-alone).
+function DonutChart({ spec, tip }) {
+  let rows = (spec.data || [])
+    .map(d => ({ label: String(d.label ?? d[spec.x] ?? '?'), value: Number(d.value ?? d.y) }))
+    .filter(r => Number.isFinite(r.value) && r.value > 0);
+  if (!rows.length) return <div style={{ padding: 12, color: VIZ.muted, fontSize: 13 }}>(empty chart)</div>;
+  rows.sort((a, b) => b.value - a.value);
+  if (rows.length > 6) {
+    const rest = rows.slice(5).reduce((s, r) => s + r.value, 0);
+    rows = [...rows.slice(0, 5), { label: 'Other', value: rest }];
   }
+  const total = rows.reduce((s, r) => s + r.value, 0);
+  const H = 210, cx = 105, cy = 105, R = 88, ir = 56;
+  let a = -Math.PI / 2;
+  const slices = rows.map((r, i) => {
+    const a0 = a; a += (r.value / total) * 2 * Math.PI;
+    return { ...r, a0, a1: a, pct: Math.round(r.value / total * 1000) / 10, color: CHART_COLORS[i % 8] };
+  });
+  const pt = (ang, rad) => [cx + rad * Math.cos(ang), cy + rad * Math.sin(ang)];
+  const arc = (s) => {
+    if (s.a1 - s.a0 >= 2 * Math.PI - 0.001) return null; // single full slice → ring
+    const large = s.a1 - s.a0 > Math.PI ? 1 : 0;
+    const [x0, y0] = pt(s.a0, R), [x1, y1] = pt(s.a1, R), [x2, y2] = pt(s.a1, ir), [x3, y3] = pt(s.a0, ir);
+    return `M${x0},${y0} A${R},${R} 0 ${large} 1 ${x1},${y1} L${x2},${y2} A${ir},${ir} 0 ${large} 0 ${x3},${y3} Z`;
+  };
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 20, flexWrap: 'wrap' }}>
+      <svg viewBox={`0 0 210 ${H}`} style={{ width: 190, maxWidth: '45%', height: 'auto', flexShrink: 0 }}>
+        {slices.map((s, i) => {
+          const d = arc(s);
+          const handlers = {
+            onMouseEnter: (e) => tip.show(e, s.label, [{ swatch: s.color, text: `${fmtTipNum(s.value)} · ${s.pct}%` }]),
+            onMouseMove: tip.move, onMouseLeave: tip.hide,
+          };
+          if (!d) return <circle key={i} cx={cx} cy={cy} r={(R + ir) / 2} fill="none" stroke={s.color} strokeWidth={R - ir} {...handlers} />;
+          return <path key={i} d={d} fill={s.color} stroke={VIZ.surface} strokeWidth={2} {...handlers} />;
+        })}
+        <text x={cx} y={cy - 2} textAnchor="middle" fontSize={22} fontWeight={600} fill={VIZ.ink}>{fmtChartNum(total)}</text>
+        <text x={cx} y={cy + 16} textAnchor="middle" fontSize={11} fill={VIZ.muted}>{spec.center_label || 'total'}</text>
+      </svg>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 150, flex: 1 }}>
+        {slices.map((s, i) => (
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
+            <span style={{ width: 10, height: 10, borderRadius: 3, background: s.color, flexShrink: 0 }} />
+            <span style={{ color: VIZ.sub, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.label}</span>
+            <span style={{ color: VIZ.ink, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{fmtTipNum(s.value)}</span>
+            <span style={{ color: VIZ.muted, fontVariantNumeric: 'tabular-nums', minWidth: 44, textAlign: 'right' }}>{s.pct}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Ranked categories (top states, campaigns by spend): horizontal bars, ONE hue
+// (magnitude is the job), value in ink at each bar end, labels never clipped.
+function HBarChart({ spec, tip }) {
+  const xKey = spec.x || 'label';
+  const sKey = (spec.series && spec.series[0] && spec.series[0].key) || 'value';
+  const rows = (spec.data || [])
+    .map(d => ({ label: String(d[xKey] ?? d.label ?? '?'), value: Number(d[sKey] ?? d.value) }))
+    .filter(r => Number.isFinite(r.value))
+    .slice(0, 20);
+  if (!rows.length) return <div style={{ padding: 12, color: VIZ.muted, fontSize: 13 }}>(empty chart)</div>;
+  const max = Math.max(...rows.map(r => r.value), 0) || 1;
+  const W = 640, rowH = 30, barH = 18, LAB = 132, VAL = 64;
+  const H = rows.length * rowH + 4;
+  const innerW = W - LAB - VAL - 16;
+  const color = (spec.series && spec.series[0] && spec.series[0].color) || CHART_COLORS[0];
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block' }}>
+      {rows.map((r, i) => {
+        const y = i * rowH + 2;
+        const w = Math.max((r.value / max) * innerW, 1.5);
+        const handlers = {
+          onMouseEnter: (e) => tip.show(e, r.label, [{ swatch: color, text: fmtTipNum(r.value) }]),
+          onMouseMove: tip.move, onMouseLeave: tip.hide,
+        };
+        return (
+          <g key={i}>
+            <text x={LAB - 8} y={y + barH / 2 + 4} textAnchor="end" fontSize={12} fill={VIZ.sub}>
+              {r.label.length > 18 ? r.label.slice(0, 17) + '…' : r.label}
+            </text>
+            <path d={`M${LAB},${y} h${w - Math.min(4, w / 2)} q${Math.min(4, w / 2)},0 ${Math.min(4, w / 2)},${Math.min(4, barH / 2)} v${barH - 2 * Math.min(4, barH / 2)} q0,${Math.min(4, barH / 2)} ${-Math.min(4, w / 2)},${Math.min(4, barH / 2)} h${-(w - Math.min(4, w / 2))} Z`} fill={color} {...handlers} />
+            <text x={LAB + w + 8} y={y + barH / 2 + 4} fontSize={12} fontWeight={600} fill={VIZ.ink} fontVariantNumeric="tabular-nums">{fmtChartNum(r.value)}</text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// XY chart (line / area / bar over an ordered x). Single series wears one hue
+// and needs no legend; grouped series follow the fixed categorical order.
+function XYChart({ spec, tip }) {
   const type = spec.type === 'bar' ? 'bar' : (spec.type === 'area' ? 'area' : 'line');
   const xKey = spec.x || 'x';
-  const series = (Array.isArray(spec.series) ? spec.series : []).filter(s => s && s.key);
-  if (series.length === 0) return <div style={{ padding: 12, color: '#9CA3AF', fontSize: 13 }}>(chart has no series)</div>;
+  const series = (Array.isArray(spec.series) ? spec.series : []).filter(s => s && s.key).slice(0, 8);
+  if (series.length === 0) return <div style={{ padding: 12, color: VIZ.muted, fontSize: 13 }}>(chart has no series)</div>;
+  const colorFor = (s, si) => s.color || CHART_COLORS[si % 8];
 
   const W = 640, H = 280, PAD_L = 48, PAD_R = 16, PAD_T = 12, PAD_B = 44;
   const innerW = W - PAD_L - PAD_R;
   const innerH = H - PAD_T - PAD_B;
 
   let yMin = 0, yMax = 0;
-  spec.data.forEach(d => {
-    series.forEach(s => {
-      const v = Number(d[s.key]);
-      if (Number.isFinite(v)) {
-        if (v < yMin) yMin = v;
-        if (v > yMax) yMax = v;
-      }
-    });
-  });
+  spec.data.forEach(d => series.forEach(s => {
+    const v = Number(d[s.key]);
+    if (Number.isFinite(v)) { if (v < yMin) yMin = v; if (v > yMax) yMax = v; }
+  }));
   if (yMax === yMin) yMax = yMin + 1;
-  // 10% headroom above the tallest value so bars/lines don't kiss the top edge.
   const niceMax = niceCeil(yMax * 1.1);
   const niceMin = yMin >= 0 ? 0 : -niceCeil(-yMin * 1.1);
   const range = niceMax - niceMin || 1;
@@ -2347,95 +2476,140 @@ function MdChart({ spec }) {
   const xCount = spec.data.length;
   const xScale = (i) => PAD_L + (xCount === 1 ? innerW / 2 : (i / (xCount - 1)) * innerW);
   const groupW = innerW / Math.max(xCount, 1);
-  const barW = type === 'bar' ? Math.max(2, (groupW * 0.8) / series.length) : 0;
+  const barW = type === 'bar' ? Math.min(24, Math.max(2, (groupW * 0.8) / series.length)) : 0;
 
-  const yTickCount = 5;
   const yTicks = [];
-  for (let t = 0; t <= yTickCount; t++) {
-    const v = niceMin + range * (t / yTickCount);
+  for (let t = 0; t <= 5; t++) {
+    const v = niceMin + range * (t / 5);
     yTicks.push({ v, y: yScale(v) });
   }
-
   const xLabelEvery = Math.max(1, Math.ceil(xCount / 8));
   const zeroY = yScale(0);
+  const colW = innerW / Math.max(xCount, 1);
 
-  const chartWrap = { margin: "12px 0", padding: 14, border: "1px solid #E5E7EB", borderRadius: 12, background: "#fff" };
-  const chartTitle = { fontSize: 13, fontWeight: 600, color: "#111827", marginBottom: 8 };
-  const chartLegend = { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 8, justifyContent: "center" };
-  const chartLegendItem = { display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, color: "#4B5563" };
+  const tipForIndex = (e, i) => {
+    const d = spec.data[i];
+    tip.show(e, String(d[xKey] ?? ''), series.map((s, si) => ({ swatch: colorFor(s, si), text: `${s.label || s.key}: ${fmtTipNum(Number(d[s.key]))}` })));
+  };
+  const showBarLabels = type === 'bar' && series.length === 1 && xCount <= 8;
 
   return (
-    <div style={chartWrap}>
-      {spec.title && <div style={chartTitle}>{spec.title}</div>}
+    <>
       <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
-        <defs>
-          <clipPath id={clipId}>
-            <rect x={PAD_L} y={PAD_T} width={innerW} height={innerH} />
-          </clipPath>
-        </defs>
+        <defs><clipPath id={clipId}><rect x={PAD_L} y={PAD_T - 6} width={innerW} height={innerH + 6} /></clipPath></defs>
         {yTicks.map((t, i) => (
           <g key={`t${i}`}>
-            <line x1={PAD_L} y1={t.y} x2={W - PAD_R} y2={t.y} stroke="#F3F4F6" strokeWidth={1} />
-            <text x={PAD_L - 6} y={t.y + 3} fontSize={10} fill="#9CA3AF" textAnchor="end">{fmtChartNum(t.v)}</text>
+            <line x1={PAD_L} y1={t.y} x2={W - PAD_R} y2={t.y} stroke={VIZ.grid} strokeWidth={1} />
+            <text x={PAD_L - 6} y={t.y + 3} fontSize={10} fill={VIZ.muted} textAnchor="end">{fmtChartNum(t.v)}</text>
           </g>
         ))}
-        <line x1={PAD_L} y1={H - PAD_B} x2={W - PAD_R} y2={H - PAD_B} stroke="#E5E7EB" />
+        <line x1={PAD_L} y1={H - PAD_B} x2={W - PAD_R} y2={H - PAD_B} stroke={VIZ.axis} />
         {spec.data.map((d, i) => (i % xLabelEvery === 0 || i === xCount - 1) && (
-          <text key={`x${i}`} x={xScale(i)} y={H - PAD_B + 14} fontSize={10} fill="#6B7280" textAnchor="middle">
+          <text key={`x${i}`} x={xScale(i)} y={H - PAD_B + 14} fontSize={10} fill={VIZ.muted} textAnchor="middle">
             {(() => { const s = String(d[xKey] ?? ''); return s.length > 10 ? s.slice(0, 10) : s; })()}
           </text>
         ))}
         <g clipPath={`url(#${clipId})`}>
-        {series.map((s, si) => {
-          const color = s.color || CHART_COLORS[si % CHART_COLORS.length];
-          if (type === 'bar') {
-            return spec.data.map((d, i) => {
-              const v = Number(d[s.key]);
-              if (!Number.isFinite(v)) return null;
-              // Center the group of bars on each x position. 80% of group
-              // width is used for bars; the remaining 20% gives breathing room.
-              const x = xScale(i) - (barW * series.length) / 2 + si * barW;
-              const y = yScale(v);
-              const h = Math.abs(zeroY - y);
-              return <rect key={`${si}-${i}`} x={x} y={Math.min(y, zeroY)} width={barW * 0.86} height={Math.max(h, 1)} fill={color} rx={2} />;
-            });
-          }
-          const pts = spec.data
-            .map((d, i) => {
-              const v = Number(d[s.key]);
-              return Number.isFinite(v) ? { x: xScale(i), y: yScale(v) } : null;
-            })
-            .filter(Boolean);
-          if (pts.length === 0) return null;
-          const polyPts = pts.map(p => `${p.x},${p.y}`).join(' ');
-          if (type === 'area' && pts.length >= 2) {
-            const area = `M${pts[0].x},${zeroY} L${pts.map(p => `${p.x},${p.y}`).join(' L')} L${pts[pts.length-1].x},${zeroY} Z`;
+          {series.map((s, si) => {
+            const color = colorFor(s, si);
+            if (type === 'bar') {
+              return spec.data.map((d, i) => {
+                const v = Number(d[s.key]);
+                if (!Number.isFinite(v)) return null;
+                const x = xScale(i) - (barW * series.length) / 2 + si * barW;
+                const y = yScale(v);
+                const h = Math.max(Math.abs(zeroY - y), 1);
+                return (
+                  <path key={`${si}-${i}`} d={barPath(x, Math.min(y, zeroY), barW * 0.86, h, v >= 0)} fill={color}
+                    onMouseEnter={(e) => tipForIndex(e, i)} onMouseMove={tip.move} onMouseLeave={tip.hide} />
+                );
+              });
+            }
+            const pts = spec.data
+              .map((d, i) => {
+                const v = Number(d[s.key]);
+                return Number.isFinite(v) ? { x: xScale(i), y: yScale(v), i } : null;
+              })
+              .filter(Boolean);
+            if (pts.length === 0) return null;
+            const polyPts = pts.map(p => `${p.x},${p.y}`).join(' ');
             return (
               <g key={`s${si}`}>
-                <path d={area} fill={color} opacity={0.14} />
-                <polyline points={polyPts} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" />
+                {type === 'area' && pts.length >= 2 && (
+                  <path d={`M${pts[0].x},${zeroY} L${pts.map(p => `${p.x},${p.y}`).join(' L')} L${pts[pts.length - 1].x},${zeroY} Z`} fill={color} opacity={0.10} />
+                )}
+                <polyline points={polyPts} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+                {pts.length <= 60 && pts.map((p, i) => (
+                  <circle key={i} cx={p.x} cy={p.y} r={4} fill={color} stroke={VIZ.surface} strokeWidth={2} />
+                ))}
               </g>
             );
-          }
-          return (
-            <g key={`s${si}`}>
-              <polyline points={polyPts} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
-              {pts.length <= 60 && pts.map((p, i) => (
-                <circle key={i} cx={p.x} cy={p.y} r={2.5} fill={color} />
-              ))}
-            </g>
-          );
-        })}
+          })}
         </g>
-      </svg>
-      <div style={chartLegend}>
-        {series.map((s, si) => (
-          <span key={si} style={chartLegendItem}>
-            <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color || CHART_COLORS[si % CHART_COLORS.length], display: "inline-block" }} />
-            <span>{s.label || s.key}</span>
-          </span>
+        {showBarLabels && spec.data.map((d, i) => {
+          const v = Number(d[series[0].key]);
+          if (!Number.isFinite(v)) return null;
+          return <text key={`bl${i}`} x={xScale(i)} y={yScale(v) - 6} fontSize={11} fontWeight={600} fill={VIZ.sub} textAnchor="middle">{fmtChartNum(v)}</text>;
+        })}
+        {/* full-height hover columns: one tooltip per x showing every series */}
+        {spec.data.map((d, i) => (
+          <rect key={`hov${i}`} x={xScale(i) - colW / 2} y={PAD_T} width={colW} height={innerH} fill="transparent"
+            onMouseEnter={(e) => tipForIndex(e, i)} onMouseMove={tip.move} onMouseLeave={tip.hide} />
         ))}
-      </div>
+      </svg>
+      {series.length > 1 && (
+        <div style={CHART_LEGEND}>
+          {series.map((s, si) => (
+            <span key={si} style={CHART_LEGEND_ITEM}>
+              <span style={{ width: 10, height: 10, borderRadius: 2, background: colorFor(s, si), display: "inline-block" }} />
+              <span>{s.label || s.key}</span>
+            </span>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+function MdChart({ spec }) {
+  const tip = useVizTip();
+  if (!spec || !Array.isArray(spec.data) || spec.data.length === 0) {
+    return <div style={{ padding: 12, color: VIZ.muted, fontSize: 13 }}>(empty chart)</div>;
+  }
+  const body = spec.type === 'donut' || spec.type === 'pie'
+    ? <DonutChart spec={spec} tip={tip} />
+    : spec.type === 'hbar'
+      ? <HBarChart spec={spec} tip={tip} />
+      : <XYChart spec={spec} tip={tip} />;
+  return (
+    <div style={CHART_WRAP}>
+      {spec.title && <div style={CHART_TITLE}>{spec.title}</div>}
+      {body}
+      {tip.node}
+    </div>
+  );
+}
+
+// KPI row of stat tiles: label · value · optional delta (signed; green when
+// good) · optional note. The block form for headline numbers — never a table.
+function MdStats({ spec }) {
+  const tiles = Array.isArray(spec && spec.tiles) ? spec.tiles.filter(t => t && t.label !== undefined && t.value !== undefined).slice(0, 8) : [];
+  if (!tiles.length) return <div style={{ padding: 12, color: VIZ.muted, fontSize: 13 }}>(empty stats)</div>;
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(132px, 1fr))', gap: 10, margin: '12px 0' }}>
+      {tiles.map((t, i) => {
+        const deltaStr = t.delta !== undefined && t.delta !== null ? String(t.delta) : null;
+        const neg = deltaStr ? /^\s*[-−↓]/.test(deltaStr) : false;
+        const good = t.delta_good !== undefined ? !!t.delta_good : !neg;
+        return (
+          <div key={i} style={{ border: '1px solid #E5E7EB', borderRadius: 12, padding: '12px 14px', background: '#fff', minWidth: 0 }}>
+            <div style={{ fontSize: 12, color: VIZ.sub, marginBottom: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{String(t.label)}</div>
+            <div style={{ fontSize: 25, fontWeight: 600, color: VIZ.ink, letterSpacing: '-0.02em', lineHeight: 1.15, wordBreak: 'break-word' }}>{String(t.value)}</div>
+            {deltaStr && <div style={{ fontSize: 12, fontWeight: 600, marginTop: 4, color: good ? VIZ.good : VIZ.bad }}>{deltaStr}</div>}
+            {t.note !== undefined && t.note !== null && <div style={{ fontSize: 11, color: VIZ.muted, marginTop: 4 }}>{String(t.note)}</div>}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -2537,17 +2711,17 @@ function renderMd(text) {
       i++;
       while (i < lines.length && !lines[i].startsWith('```')) { code.push(lines[i]); i++; }
       i++;
-      // Special-case ```chart — parse JSON and render an inline SVG chart.
-      // Fall back to a code block if the JSON is malformed.
-      if (lang === 'chart') {
+      // Special-case ```chart / ```stats — parse JSON and render a visual
+      // block. Fall back to a code block if the JSON is malformed.
+      if (lang === 'chart' || lang === 'stats') {
         try {
           const spec = JSON.parse(code.join('\n'));
-          out.push(<MdChart key={key++} spec={spec} />);
+          out.push(lang === 'stats' ? <MdStats key={key++} spec={spec} /> : <MdChart key={key++} spec={spec} />);
           continue;
         } catch (e) {
           out.push(
             <div key={key++} style={MD.preWrap}>
-              <div style={MD.preLang}>chart (invalid JSON)</div>
+              <div style={MD.preLang}>{lang} (invalid JSON)</div>
               <pre style={MD.pre}>{code.join('\n')}</pre>
             </div>
           );
