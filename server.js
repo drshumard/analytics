@@ -2822,6 +2822,17 @@ const GHL_ENABLED = !!(GHL_MCP_TOKEN && GHL_LOCATION_ID);
 console.log(GHL_ENABLED
     ? `🔗 GHL insights: enabled (location ${GHL_LOCATION_ID}, primary pipeline: ${GHL_PIPELINE || 'none set'})`
     : '🔗 GHL insights: DISABLED — set GHL_MCP_TOKEN + GHL_LOCATION_ID to enable GoHighLevel tools in AI Insights');
+
+// Patient-profile demographics service (customer avatar for AI Insights).
+// The CP4L1 backend answers GET ?email=… with { gender, date_of_birth, age,
+// city, state } from the diabetes intake form (404 = no patient). Attached to
+// the chat only when URL + key are configured.
+const PATIENT_PROFILE_URL = process.env.PATIENT_PROFILE_URL;
+const PATIENT_PROFILE_API_KEY = process.env.PATIENT_PROFILE_API_KEY;
+const AVATAR_ENABLED = !!(PATIENT_PROFILE_URL && PATIENT_PROFILE_API_KEY);
+console.log(AVATAR_ENABLED
+    ? `🧑‍⚕️ Customer avatar: enabled (${PATIENT_PROFILE_URL})`
+    : '🧑‍⚕️ Customer avatar: DISABLED — set PATIENT_PROFILE_URL + PATIENT_PROFILE_API_KEY to enable get_customer_avatar');
 if (GHL_ENABLED) {
     // Prewarm the pipeline snapshots shortly after boot; thereafter the
     // stale-while-revalidate cache keeps chat tool calls near-instant.
@@ -3608,6 +3619,7 @@ async function getJourneyDataDictionary(funnel) {
             tracking_contacts: 'contact_id, session_id, client_ip, name, email, phone, attribution (jsonb), tags, merged_into, merged_children, created_at, updated_at — shumard.js identities',
             tracking_page_visits: 'id, contact_id, session_id, current_url, referrer_url, page_title, attribution, timestamp — every page view',
             tracking_tag_events: 'id, contact_id, tag, current_url, timestamp — funnel tag fires',
+            ...(AVATAR_ENABLED ? { contact_demographics: 'email (pk, lowercased), found, gender, date_of_birth, age, city, state, matched_email, fetched_at — cached patient-intake demographics; populated lazily by get_customer_avatar; filter found=true for joins; ages <18/>105 are bad intake DOBs' } : {}),
         },
         event_types: eventTypes,
         events_metadata_keys: metadataKeys,
@@ -3776,6 +3788,221 @@ async function forgetFact(funnel, userId, key) {
     return { ok: true, key };
 }
 
+// ─── Customer avatar: patient-profile demographics ───────────────────────────
+// Aggregated demographic "avatar" (gender / age / location) for a funnel
+// segment. Per-email profiles come from the CP4L1 patient-profile service and
+// are cached in contact_demographics: found rows forever (demographics don't
+// change), not-found rows retried after 7 days (patients onboard later). When
+// the funnel email itself has no profile, identity-linked alternates are tried
+// (a buyer's portal login can differ from their checkout email).
+
+const AVATAR_NOT_FOUND_RETRY_MS = 7 * 24 * 60 * 60 * 1000;
+const AVATAR_FETCH_CONCURRENCY = 6;
+const AVATAR_JOINABLE_EVENTS = new Set(['purchases', 'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta']);
+
+async function fetchPatientProfile(email) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+        const res = await fetch(`${PATIENT_PROFILE_URL}?email=${encodeURIComponent(email)}`, {
+            headers: { 'X-API-Key': PATIENT_PROFILE_API_KEY },
+            signal: ctrl.signal,
+        });
+        if (res.status === 404) return { found: false };
+        if (!res.ok) return { error: `patient-profile HTTP ${res.status}` };
+        return { found: true, profile: await res.json() };
+    } catch (e) {
+        return { error: e.name === 'AbortError' ? 'patient-profile timeout' : e.message };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// email → contact_demographics row for every email in the list, fetching and
+// caching whatever isn't cached yet. Transient fetch errors are NOT cached
+// (retried next call) and surface in fetch_errors.
+async function getDemographicsForEmails(funnel, emails) {
+    const sb = clientFor(funnel);
+    const uniq = [...new Set(emails.map(e => String(e).toLowerCase().trim()).filter(e => e.includes('@')))];
+    const records = new Map();
+    for (let i = 0; i < uniq.length; i += 100) {
+        const { data } = await sb.from('contact_demographics').select('*').in('email', uniq.slice(i, i + 100));
+        for (const r of data || []) records.set(r.email, r);
+    }
+    const now = Date.now();
+    const toFetch = uniq.filter(e => {
+        const c = records.get(e);
+        if (!c) return true;
+        return !c.found && (now - new Date(c.fetched_at).getTime()) > AVATAR_NOT_FOUND_RETRY_MS;
+    });
+
+    let fetchErrors = 0;
+    if (toFetch.length) {
+        const links = await getIdentityLinks(funnel); // alias → canonical
+        const reverse = {};
+        for (const [a, c] of Object.entries(links)) if (!reverse[c]) reverse[c] = a;
+        const rows = [];
+        let idx = 0;
+        await Promise.all(Array.from({ length: Math.min(AVATAR_FETCH_CONCURRENCY, toFetch.length) }, async () => {
+            while (idx < toFetch.length) {
+                const email = toFetch[idx++];
+                let r = await fetchPatientProfile(email);
+                let matched = email;
+                if (!r.error && !r.found) {
+                    const alt = links[email] || reverse[email];
+                    if (alt) {
+                        const r2 = await fetchPatientProfile(alt);
+                        if (r2.found || r2.error) { r = r2; matched = alt; }
+                    }
+                }
+                if (r.error) { fetchErrors++; continue; }
+                const p = r.profile || {};
+                rows.push({
+                    email,
+                    found: !!r.found,
+                    gender: p.gender || null,
+                    date_of_birth: p.date_of_birth || null,
+                    age: (typeof p.age === 'number' && Number.isFinite(p.age)) ? p.age : null,
+                    city: p.city || null,
+                    state: p.state || null,
+                    matched_email: r.found && matched !== email ? matched : null,
+                    fetched_at: new Date().toISOString(),
+                });
+            }
+        }));
+        for (let i = 0; i < rows.length; i += 100) {
+            const chunk = rows.slice(i, i + 100);
+            const { error } = await sb.from('contact_demographics').upsert(chunk, { onConflict: 'email' });
+            if (error) console.warn(`⚠️ Avatar[${funnel}]: cache upsert failed:`, error.message);
+            for (const row of chunk) records.set(row.email, row);
+        }
+        if (fetchErrors) console.warn(`⚠️ Avatar[${funnel}]: ${fetchErrors}/${toFetch.length} profile fetches failed (will retry next call)`);
+    }
+    return { records, fetched_now: toFetch.length - fetchErrors, fetch_errors: fetchErrors };
+}
+
+// Age TODAY, preferring date_of_birth (so cached rows never go stale) with the
+// service-computed age as fallback. Callers decide plausibility.
+function avatarAge(rec) {
+    if (rec.date_of_birth) {
+        const dob = new Date(String(rec.date_of_birth));
+        if (!isNaN(dob.getTime())) {
+            const nowD = new Date();
+            let a = nowD.getUTCFullYear() - dob.getUTCFullYear();
+            if (nowD.getUTCMonth() < dob.getUTCMonth() || (nowD.getUTCMonth() === dob.getUTCMonth() && nowD.getUTCDate() < dob.getUTCDate())) a--;
+            return a;
+        }
+    }
+    return (typeof rec.age === 'number') ? rec.age : null;
+}
+
+async function getCustomerAvatar(funnel, input) {
+    if (!AVATAR_ENABLED) return { error: 'Patient-profile service not configured (PATIENT_PROFILE_URL / PATIENT_PROFILE_API_KEY)' };
+
+    // Segment resolution — same shape as getGhlPipelineStatus, plus purchase_source.
+    let emails, segmentLabel;
+    let segmentCapped = false;
+    if (Array.isArray(input.emails) && input.emails.length) {
+        emails = [...new Set(input.emails.map(e => String(e).trim().toLowerCase()).filter(e => e.includes('@')))];
+        if (emails.length > 500) { emails = emails.slice(0, 500); segmentCapped = true; }
+        segmentLabel = `explicit list (${emails.length} emails)`;
+    } else {
+        const eventType = String(input.event_type || 'purchases');
+        if (!AVATAR_JOINABLE_EVENTS.has(eventType)) return { error: `event_type must be one of: ${[...AVATAR_JOINABLE_EVENTS].join(', ')}` };
+        const dateOk = d => /^\d{4}-\d{2}-\d{2}$/.test(d);
+        const conds = [`event_type = '${eventType}'`, 'email IS NOT NULL', "email <> ''"];
+        if (input.date_from) {
+            if (!dateOk(input.date_from)) return { error: 'date_from must be YYYY-MM-DD' };
+            conds.push(`(event_time AT TIME ZONE 'America/Los_Angeles')::date >= '${input.date_from}'`);
+        }
+        if (input.date_to) {
+            if (!dateOk(input.date_to)) return { error: 'date_to must be YYYY-MM-DD' };
+            conds.push(`(event_time AT TIME ZONE 'America/Los_Angeles')::date <= '${input.date_to}'`);
+        }
+        if (input.purchase_source) {
+            if (eventType !== 'purchases') return { error: 'purchase_source only applies to event_type "purchases"' };
+            conds.push(`metadata->>'source' = '${String(input.purchase_source).replace(/'/g, "''")}'`);
+        }
+        const out = await runReadOnlySQL(funnel, `SELECT DISTINCT lower(email) AS email FROM events WHERE ${conds.join(' AND ')}`);
+        if (out.error) return out;
+        emails = (out.rows || []).map(r => r.email);
+        segmentCapped = emails.length >= 500;
+        segmentLabel = `${eventType}${input.purchase_source ? ` (${input.purchase_source})` : ''}${input.date_from || input.date_to ? ` ${input.date_from || '…'} → ${input.date_to || '…'}` : ' (all time)'}`;
+    }
+    if (!emails.length) return { segment: segmentLabel, segment_size: 0, note: 'No emails in this segment.' };
+
+    const { records, fetched_now, fetch_errors } = await getDemographicsForEmails(funnel, emails);
+    const found = emails.map(e => records.get(e)).filter(r => r && r.found);
+
+    const genders = {};
+    const stateCounts = new Map();  // lower → { label, people }
+    const cityCounts = new Map();   // "city|state" lower → { label, people }
+    const ages = [];
+    let ageMissing = 0, ageImplausible = 0;
+    for (const r of found) {
+        const g = (r.gender || '').trim().toLowerCase() || 'unknown';
+        genders[g] = (genders[g] || 0) + 1;
+        const a = avatarAge(r);
+        if (a === null) ageMissing++;
+        else if (a < 18 || a > 105) ageImplausible++; // garbage intake DOBs (e.g. DOB typed as today)
+        else ages.push(a);
+        const st = (r.state || '').trim();
+        if (st) {
+            const k = st.toLowerCase();
+            const cur = stateCounts.get(k) || { state: st, people: 0 };
+            cur.people++; stateCounts.set(k, cur);
+        }
+        const ct = (r.city || '').trim();
+        if (ct) {
+            const label = st ? `${ct}, ${st}` : ct;
+            const k = label.toLowerCase();
+            const cur = cityCounts.get(k) || { city: label, people: 0 };
+            cur.people++; cityCounts.set(k, cur);
+        }
+    }
+    ages.sort((x, y) => x - y);
+    const AGE_BUCKETS = [['18-39', 18, 39], ['40-49', 40, 49], ['50-59', 50, 59], ['60-69', 60, 69], ['70-79', 70, 79], ['80+', 80, 200]];
+    const buckets = {};
+    for (const [label, lo, hi] of AGE_BUCKETS) {
+        const n = ages.filter(a => a >= lo && a <= hi).length;
+        if (n) buckets[label] = n;
+    }
+
+    const result = {
+        READ_ME: 'Profiles come from the patient intake form (portal), keyed by email; identity-linked alternates were tried automatically. Coverage skews to actual patients/buyers: profiles_found/segment_size is the match rate, and people with NO profile are absent from every split below — never extrapolate the splits to them. Ages <18 or >105 are bad intake DOBs, excluded from age stats and counted in age.implausible_excluded.',
+        segment: segmentLabel,
+        segment_size: emails.length,
+        ...(segmentCapped ? { segment_capped_at_500: true } : {}),
+        profiles_found: found.length,
+        coverage_pct: emails.length ? Math.round(found.length / emails.length * 1000) / 10 : 0,
+        ...(fetched_now ? { newly_fetched: fetched_now } : {}),
+        ...(fetch_errors ? { fetch_errors_retry_next_call: fetch_errors } : {}),
+        gender: genders,
+        age: {
+            known: ages.length,
+            missing: ageMissing,
+            implausible_excluded: ageImplausible,
+            ...(ages.length ? {
+                min: ages[0],
+                median: ages[Math.floor(ages.length / 2)],
+                average: Math.round(ages.reduce((s, a) => s + a, 0) / ages.length * 10) / 10,
+                max: ages[ages.length - 1],
+                buckets,
+            } : {}),
+        },
+        top_states: [...stateCounts.values()].sort((a, b) => b.people - a.people).slice(0, 10),
+        top_cities: [...cityCounts.values()].sort((a, b) => b.people - a.people).slice(0, 10),
+    };
+    if (input.include_people) {
+        result.people = found.slice(0, 100).map(r => ({
+            email: r.email, gender: r.gender, age: avatarAge(r), city: r.city, state: r.state,
+            ...(r.matched_email ? { matched_via: r.matched_email } : {}),
+        }));
+        if (found.length > 100) result.people_truncated = true;
+    }
+    return result;
+}
+
 // ─── AI Insights: tool definitions ────────────────────────────────────────────
 const INSIGHTS_TOOLS = [
     {
@@ -3836,7 +4063,7 @@ const INSIGHTS_TOOLS = [
     },
     {
         name: 'run_sql',
-        description: 'Run a read-only SQL query against the funnel\'s schema. Use this as an escape hatch for analytical questions the other tools don\'t cover — joins, grouping by day-of-week, filtering by arbitrary event attributes, per-person journeys, etc. Tables/views: daily_metrics; events (one row per funnel action — columns id, event_type ∈ registrations/attended/replays/viewedcta/clickedcta/purchases/stayeduntil, name, email, phone, event_time, metadata jsonb); metadata holds webinar_datetime_utc (text like "April 11th 2026, 10:00:00 pm"), source (purchase source), stayeduntil, variant (A/B split-test bucket — present on registrations AND, going forward, on downstream events (Stealth-stamped); a registration counts under its OWN tag (untagged=undetected, never back-filled), and an untagged downstream event inherits the registrant\'s variant forward-only via email/phone; prefer the get_variant_funnel tool for A/B splits, or get_journey_segment with variant:"A" for the people list, rather than filtering metadata->>\'variant\' directly); crm_people (ONE ROW PER PERSON by email, merging shumard.js tracking + events — columns email, name, phone, stage, is_tracked, has_registration/has_attended/has_replay/has_viewedcta/has_clickedcta/has_purchase, event_count, attribution jsonb, tags, first_seen, last_activity); tracking_contacts / tracking_page_visits / tracking_tag_events (per-person attribution, page journey, tag fires); custom_metrics; dashboard_lenses. Examples: busiest webinar slots → SELECT metadata->>\'webinar_datetime_utc\', count(*) FROM events WHERE event_type=\'registrations\' GROUP BY 1 ORDER BY 2 DESC; registrations by weekday → GROUP BY to_char(event_time AT TIME ZONE \'America/Los_Angeles\',\'Day\'). STRICT RULES: single SELECT or WITH statement; no INSERT/UPDATE/DELETE/DDL; results capped at 500 rows and 5-second timeout. Runs in the active funnel\'s schema (no need to prefix table names).',
+        description: 'Run a read-only SQL query against the funnel\'s schema. Use this as an escape hatch for analytical questions the other tools don\'t cover — joins, grouping by day-of-week, filtering by arbitrary event attributes, per-person journeys, etc. Tables/views: daily_metrics; events (one row per funnel action — columns id, event_type ∈ registrations/attended/replays/viewedcta/clickedcta/purchases/stayeduntil, name, email, phone, event_time, metadata jsonb); metadata holds webinar_datetime_utc (text like "April 11th 2026, 10:00:00 pm"), source (purchase source), stayeduntil, variant (A/B split-test bucket — present on registrations AND, going forward, on downstream events (Stealth-stamped); a registration counts under its OWN tag (untagged=undetected, never back-filled), and an untagged downstream event inherits the registrant\'s variant forward-only via email/phone; prefer the get_variant_funnel tool for A/B splits, or get_journey_segment with variant:"A" for the people list, rather than filtering metadata->>\'variant\' directly); crm_people (ONE ROW PER PERSON by email, merging shumard.js tracking + events — columns email, name, phone, stage, is_tracked, has_registration/has_attended/has_replay/has_viewedcta/has_clickedcta/has_purchase, event_count, attribution jsonb, tags, first_seen, last_activity); tracking_contacts / tracking_page_visits / tracking_tag_events (per-person attribution, page journey, tag fires); custom_metrics; dashboard_lenses; contact_demographics (cached patient-intake demographics keyed by lower(email): gender, date_of_birth, age, city, state, found, matched_email — rows appear as get_customer_avatar fetches them; join via lower(events.email) or crm_people.email and filter found=true; treat ages <18 or >105 as bad intake data). Examples: busiest webinar slots → SELECT metadata->>\'webinar_datetime_utc\', count(*) FROM events WHERE event_type=\'registrations\' GROUP BY 1 ORDER BY 2 DESC; registrations by weekday → GROUP BY to_char(event_time AT TIME ZONE \'America/Los_Angeles\',\'Day\'). STRICT RULES: single SELECT or WITH statement; no INSERT/UPDATE/DELETE/DDL; results capped at 500 rows and 5-second timeout. Runs in the active funnel\'s schema (no need to prefix table names).',
         input_schema: {
             type: 'object',
             properties: {
@@ -3962,6 +4189,23 @@ if (GHL_ENABLED) INSIGHTS_TOOLS.push({
     },
 });
 
+// Customer avatar tool — registered only when the patient-profile service is configured.
+if (AVATAR_ENABLED) INSIGHTS_TOOLS.push({
+    name: 'get_customer_avatar',
+    description: 'CUSTOMER AVATAR / demographics for a funnel segment: gender split, age stats + decade buckets (bad intake DOBs excluded), top cities and states. Sourced live from the patient intake-profile service keyed by email (identity-linked alternate emails tried automatically) and cached server-side, so repeat calls are fast. Give it a segment like get_ghl_pipeline_status: event_type + optional LA-timezone date range (e.g. purchases in the last 7 days), optional purchase_source ("AI Bot", "Paid Ads", …), or an explicit emails list (capped at 500, flagged when hit). Use for "who is my typical buyer", "average age of purchasers", "where are my customers", "compare the avatar of AI Bot vs Paid Ads buyers" (two calls). COVERAGE CAVEAT: profiles exist only for people who completed the intake form (mostly actual patients/buyers) — always report profiles_found vs segment_size and never extrapolate the splits to unmatched people. Registration-stage segments will match poorly; that is expected, not an error. For arbitrary SQL joins, the cached rows live in the contact_demographics table.',
+    input_schema: {
+        type: 'object',
+        properties: {
+            event_type:      { type: 'string', enum: ['purchases', 'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta'], description: 'Funnel segment (default: purchases)' },
+            date_from:       { type: 'string', description: 'Inclusive start date YYYY-MM-DD (LA timezone). Omit for all time.' },
+            date_to:         { type: 'string', description: 'Inclusive end date YYYY-MM-DD (LA timezone). Omit for all time.' },
+            purchase_source: { type: 'string', description: 'Only with event_type "purchases": restrict to one source, e.g. "AI Bot", "Paid Ads", "Sales A".' },
+            emails:          { type: 'array', items: { type: 'string' }, description: 'Explicit emails instead of event_type + dates (e.g. a list from get_journey_segment or get_ghl_pipeline_status).' },
+            include_people:  { type: 'boolean', description: 'Also return the per-person list (email, gender, age, city, state; capped at 100). Default false — only set when the user wants WHO, not just the aggregate.' },
+        },
+    },
+});
+
 async function executeInsightsTool(name, input, ctx) {
     const { funnel, userId } = ctx;
     try {
@@ -3980,6 +4224,8 @@ async function executeInsightsTool(name, input, ctx) {
                 return await runReadOnlySQL(funnel, input.query);
             case 'get_ghl_pipeline_status':
                 return await getGhlPipelineStatus(funnel, input || {});
+            case 'get_customer_avatar':
+                return await getCustomerAvatar(funnel, input || {});
             case 'get_journey_funnel':
                 return await getJourneyFunnel(funnel, input.date_from, input.date_to);
             case 'get_variant_funnel':
@@ -4124,7 +4370,8 @@ INSTRUCTIONS:
   • \`get_journey_segment\` — the LIST of people matching a segment (registered-but-not-attended, buyers from a given webinar slot, attended-but-didn't-buy, etc.). Use when the user wants WHO, not just how many.
   • \`get_email_report\` — email-marketing performance by source (clicks → people → buyers → conversion %, traffic_source=email). Use for "which emails convert best".
   • \`get_sales_page_visits\` — how many people hit each NAMED sales/checkout page (e.g. "Sales Page B" = /checkout2): distinct stitched people + raw visits per page, optional date range. Use for "how many people hit Sales Page B / checkout2", sales-page traffic. Labels are admin-configurable (see describe_journey_data → sales_pages).
-  • \`describe_journey_data\` — live schema + every \`events.metadata\` key (with samples) + enum values. Call it FIRST when unsure what's queryable, so you never guess a column or metadata key.
+  • \`describe_journey_data\` — live schema + every \`events.metadata\` key (with samples) + enum values. Call it FIRST when unsure what's queryable, so you never guess a column or metadata key.${AVATAR_ENABLED ? `
+  • \`get_customer_avatar\` — the demographic CUSTOMER AVATAR (gender split, age stats + buckets, top cities/states) for any segment: event_type + dates, purchase_source, or an email list. Use for "who is my typical buyer", "average age of purchasers", "where are customers located", or avatar comparisons between sources (one call per source). ALWAYS quote profiles_found vs segment_size — people without an intake profile are absent from the splits, so never project the percentages onto them. The per-email data is joinable in run_sql via the contact_demographics table.` : ''}
   • \`run_sql\` against \`crm_people\` / \`events.metadata\` for anything else (webinar-slot popularity, attribution, cohorts). The journey snapshot above already answers the most common ones — cite it directly when it suffices.
 - For statistical work (forecasts, regressions, anomaly detection, t-tests), use the code execution tool. The data you've fetched is available as variables.
 - Give specific, data-backed insights. Reference actual numbers and dates.
