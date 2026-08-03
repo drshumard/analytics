@@ -3802,7 +3802,14 @@ async function forgetFact(funnel, userId, key) {
 // (a buyer's portal login can differ from their checkout email).
 
 const AVATAR_NOT_FOUND_RETRY_MS = 7 * 24 * 60 * 60 * 1000;
-const AVATAR_FETCH_CONCURRENCY = 6;
+const AVATAR_FETCH_CONCURRENCY = 8;
+// Segment ceiling (most-recent people kept when hit) and the per-call budget
+// of NEW profile-service fetches: a cold multi-thousand segment enriches over
+// successive calls (profiles_pending) instead of blowing the chat deadline.
+// Segments resolve via paginated direct queries — NOT ai_run_sql, whose
+// 500-row cap is a guard for the SQL escape hatch, not a segment limit.
+const AVATAR_MAX_SEGMENT = 2500;
+const AVATAR_FETCH_BUDGET = 1000;
 const AVATAR_JOINABLE_EVENTS = new Set(['purchases', 'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta']);
 
 async function fetchPatientProfile(email) {
@@ -3835,11 +3842,13 @@ async function getDemographicsForEmails(funnel, emails) {
         for (const r of data || []) records.set(r.email, r);
     }
     const now = Date.now();
-    const toFetch = uniq.filter(e => {
+    const toFetchAll = uniq.filter(e => {
         const c = records.get(e);
         if (!c) return true;
         return !c.found && (now - new Date(c.fetched_at).getTime()) > AVATAR_NOT_FOUND_RETRY_MS;
     });
+    const pending = Math.max(0, toFetchAll.length - AVATAR_FETCH_BUDGET);
+    const toFetch = toFetchAll.slice(0, AVATAR_FETCH_BUDGET);
 
     let fetchErrors = 0;
     if (toFetch.length) {
@@ -3883,7 +3892,43 @@ async function getDemographicsForEmails(funnel, emails) {
         }
         if (fetchErrors) console.warn(`⚠️ Avatar[${funnel}]: ${fetchErrors}/${toFetch.length} profile fetches failed (will retry next call)`);
     }
-    return { records, fetched_now: toFetch.length - fetchErrors, fetch_errors: fetchErrors };
+    return { records, fetched_now: toFetch.length - fetchErrors, fetch_errors: fetchErrors, pending };
+}
+
+// UTC instants for an inclusive LA calendar-day range (DST-correct — reuses
+// the worker's LA wall-time parser). Either side optional.
+function laRangeUtc(dateFrom, dateTo) {
+    const out = {};
+    if (dateFrom) out.gte = parseWorkerDatetime(`${dateFrom} 00:00`).toISOString();
+    if (dateTo) {
+        const next = new Date(new Date(`${dateTo}T12:00:00Z`).getTime() + 86400000).toISOString().slice(0, 10);
+        out.lt = parseWorkerDatetime(`${next} 00:00`).toISOString();
+    }
+    return out;
+}
+
+// Distinct lowercased emails for an event segment, newest-first, via paginated
+// direct queries (no 500-row RPC cap). Stops at `max` distinct emails.
+async function avatarEventEmails(funnel, eventType, dateFrom, dateTo, purchaseSource, max) {
+    const sb = clientFor(funnel);
+    const { gte, lt } = laRangeUtc(dateFrom, dateTo);
+    const set = new Set();
+    for (let from = 0; ; from += 1000) {
+        let q = sb.from('events').select('email').eq('event_type', eventType)
+            .not('email', 'is', null).neq('email', '')
+            .order('event_time', { ascending: false }).range(from, from + 999);
+        if (gte) q = q.gte('event_time', gte);
+        if (lt) q = q.lt('event_time', lt);
+        if (purchaseSource) q = q.eq('metadata->>source', purchaseSource);
+        const { data, error } = await q;
+        if (error) throw new Error(error.message);
+        for (const r of data || []) {
+            const e = String(r.email).toLowerCase().trim();
+            if (e.includes('@') && set.size < max) set.add(e);
+        }
+        if (!data || data.length < 1000 || set.size >= max) break;
+    }
+    return [...set];
 }
 
 // Age TODAY, preferring date_of_birth (so cached rows never go stale) with the
@@ -3910,58 +3955,60 @@ async function getCustomerAvatar(funnel, input) {
     let emails, segmentLabel;
     let segmentCapped = false;
     const stageFiltered = (Array.isArray(input.reached_stages) && input.reached_stages.length) || (Array.isArray(input.not_reached_stages) && input.not_reached_stages.length);
+    const dateOk = d => /^\d{4}-\d{2}-\d{2}$/.test(d);
+    if (input.date_from && !dateOk(input.date_from)) return { error: 'date_from must be YYYY-MM-DD' };
+    if (input.date_to && !dateOk(input.date_to)) return { error: 'date_to must be YYYY-MM-DD' };
     if (Array.isArray(input.emails) && input.emails.length) {
         emails = [...new Set(input.emails.map(e => String(e).trim().toLowerCase()).filter(e => e.includes('@')))];
-        if (emails.length > 500) { emails = emails.slice(0, 500); segmentCapped = true; }
+        if (emails.length > AVATAR_MAX_SEGMENT) { emails = emails.slice(0, AVATAR_MAX_SEGMENT); segmentCapped = true; }
         segmentLabel = `explicit list (${emails.length} emails)`;
     } else if (stageFiltered) {
         const mapStage = (s) => JOURNEY_STAGE_COL[String(s).toLowerCase().trim()];
-        const conds = ['TRUE'];
         const bad = [];
-        for (const s of (input.reached_stages || [])) { const c = mapStage(s); if (c) conds.push(c); else bad.push(s); }
-        for (const s of (input.not_reached_stages || [])) { const c = mapStage(s); if (c) conds.push(`NOT ${c}`); else bad.push(s); }
+        const reached = (input.reached_stages || []).map(s => { const c = mapStage(s); if (!c) bad.push(s); return c; }).filter(Boolean);
+        const notReached = (input.not_reached_stages || []).map(s => { const c = mapStage(s); if (!c) bad.push(s); return c; }).filter(Boolean);
         if (bad.length) return { error: `Unknown stage(s): ${bad.join(', ')}. Valid: registration, attended, replay, viewedcta/saw_cta, clickedcta/clicked_cta, purchase` };
-        const dateOk = d => /^\d{4}-\d{2}-\d{2}$/.test(d);
-        if (input.date_from || input.date_to) {
-            // For stage segments the date range means WHEN THEY REGISTERED (the
-            // segment is people, not events — has_attended has no date of its own).
-            let sub = "SELECT lower(email) FROM events WHERE event_type='registrations' AND email IS NOT NULL";
-            if (input.date_from) { if (!dateOk(input.date_from)) return { error: 'date_from must be YYYY-MM-DD' }; sub += ` AND (event_time AT TIME ZONE 'America/Los_Angeles')::date >= '${input.date_from}'`; }
-            if (input.date_to) { if (!dateOk(input.date_to)) return { error: 'date_to must be YYYY-MM-DD' }; sub += ` AND (event_time AT TIME ZONE 'America/Los_Angeles')::date <= '${input.date_to}'`; }
-            conds.push(`email_key IN (${sub})`);
-        }
-        if (input.purchase_source) conds.push(`email_key IN (SELECT lower(email) FROM events WHERE event_type='purchases' AND metadata->>'source' ILIKE '${String(input.purchase_source).replace(/['\\;]/g, '')}' AND email IS NOT NULL)`);
-        const out = await runReadOnlySQL(funnel, `SELECT email_key AS email FROM crm_people WHERE ${conds.join(' AND ')}`);
-        if (out.error) return out;
-        emails = (out.rows || []).map(r => r.email);
-        segmentCapped = emails.length >= 500;
+        try {
+            // Restriction sets resolved first: for stage segments the date range
+            // means WHEN THEY REGISTERED (the segment is people, not events).
+            const regSet = (input.date_from || input.date_to)
+                ? new Set(await avatarEventEmails(funnel, 'registrations', input.date_from || null, input.date_to || null, null, 1000000)) : null;
+            const srcSet = input.purchase_source
+                ? new Set(await avatarEventEmails(funnel, 'purchases', null, null, input.purchase_source, 1000000)) : null;
+            const sb = clientFor(funnel);
+            const set = new Set();
+            for (let from = 0; ; from += 1000) {
+                let q = sb.from('crm_people').select('email').order('last_activity', { ascending: false, nullsFirst: false }).range(from, from + 999);
+                for (const c of reached) q = q.eq(c, true);
+                for (const c of notReached) q = q.eq(c, false);
+                const { data, error } = await q;
+                if (error) return { error: error.message };
+                for (const r of data || []) {
+                    const e = String(r.email || '').toLowerCase().trim();
+                    if (!e.includes('@')) continue;
+                    if (regSet && !regSet.has(e)) continue;
+                    if (srcSet && !srcSet.has(e)) continue;
+                    if (set.size < AVATAR_MAX_SEGMENT) set.add(e);
+                }
+                if (!data || data.length < 1000 || set.size >= AVATAR_MAX_SEGMENT) break;
+            }
+            emails = [...set];
+        } catch (e) { return { error: e.message }; }
+        segmentCapped = emails.length >= AVATAR_MAX_SEGMENT;
         segmentLabel = `journey segment: reached [${(input.reached_stages || []).join(', ') || 'any'}]${(input.not_reached_stages || []).length ? `, not reached [${input.not_reached_stages.join(', ')}]` : ''}${input.date_from || input.date_to ? `, registered ${input.date_from || '…'} → ${input.date_to || '…'}` : ''}`;
     } else {
         const eventType = String(input.event_type || 'purchases');
         if (!AVATAR_JOINABLE_EVENTS.has(eventType)) return { error: `event_type must be one of: ${[...AVATAR_JOINABLE_EVENTS].join(', ')}` };
-        const dateOk = d => /^\d{4}-\d{2}-\d{2}$/.test(d);
-        const conds = [`event_type = '${eventType}'`, 'email IS NOT NULL', "email <> ''"];
-        if (input.date_from) {
-            if (!dateOk(input.date_from)) return { error: 'date_from must be YYYY-MM-DD' };
-            conds.push(`(event_time AT TIME ZONE 'America/Los_Angeles')::date >= '${input.date_from}'`);
-        }
-        if (input.date_to) {
-            if (!dateOk(input.date_to)) return { error: 'date_to must be YYYY-MM-DD' };
-            conds.push(`(event_time AT TIME ZONE 'America/Los_Angeles')::date <= '${input.date_to}'`);
-        }
-        if (input.purchase_source) {
-            if (eventType !== 'purchases') return { error: 'purchase_source only applies to event_type "purchases"' };
-            conds.push(`metadata->>'source' = '${String(input.purchase_source).replace(/'/g, "''")}'`);
-        }
-        const out = await runReadOnlySQL(funnel, `SELECT DISTINCT lower(email) AS email FROM events WHERE ${conds.join(' AND ')}`);
-        if (out.error) return out;
-        emails = (out.rows || []).map(r => r.email);
-        segmentCapped = emails.length >= 500;
+        if (input.purchase_source && eventType !== 'purchases') return { error: 'purchase_source only applies to event_type "purchases"' };
+        try {
+            emails = await avatarEventEmails(funnel, eventType, input.date_from || null, input.date_to || null, input.purchase_source || null, AVATAR_MAX_SEGMENT);
+        } catch (e) { return { error: e.message }; }
+        segmentCapped = emails.length >= AVATAR_MAX_SEGMENT;
         segmentLabel = `${eventType}${input.purchase_source ? ` (${input.purchase_source})` : ''}${input.date_from || input.date_to ? ` ${input.date_from || '…'} → ${input.date_to || '…'}` : ' (all time)'}`;
     }
     if (!emails.length) return { segment: segmentLabel, segment_size: 0, note: 'No emails in this segment.' };
 
-    const { records, fetched_now, fetch_errors } = await getDemographicsForEmails(funnel, emails);
+    const { records, fetched_now, fetch_errors, pending } = await getDemographicsForEmails(funnel, emails);
     const found = emails.map(e => records.get(e)).filter(r => r && r.found);
 
     const genders = {};
@@ -4002,10 +4049,11 @@ async function getCustomerAvatar(funnel, input) {
         READ_ME: 'Profiles come from the patient intake form (portal), keyed by email; identity-linked alternates were tried automatically. Coverage skews to actual patients/buyers: profiles_found/segment_size is the match rate, and people with NO profile are absent from every split below — never extrapolate the splits to them. Ages <18 or >105 are bad intake DOBs, excluded from age stats and counted in age.implausible_excluded.',
         segment: segmentLabel,
         segment_size: emails.length,
-        ...(segmentCapped ? { segment_capped_at_500: true } : {}),
+        ...(segmentCapped ? { segment_capped: `Segment exceeded ${AVATAR_MAX_SEGMENT} people — the MOST RECENT ${AVATAR_MAX_SEGMENT} were kept.` } : {}),
         profiles_found: found.length,
         coverage_pct: emails.length ? Math.round(found.length / emails.length * 1000) / 10 : 0,
         ...(fetched_now ? { newly_fetched: fetched_now } : {}),
+        ...(pending ? { profiles_pending: pending, pending_note: `${pending} people in this segment have not been checked against the profile service yet (per-call fetch budget). Call get_customer_avatar again with the SAME arguments to continue — everything already fetched is cached, so repeat calls are fast. Until then, the splits cover only the people checked so far.` } : {}),
         ...(fetch_errors ? { fetch_errors_retry_next_call: fetch_errors } : {}),
         gender: genders,
         age: {
@@ -4421,7 +4469,7 @@ if (GHL_ENABLED) INSIGHTS_TOOLS.push({
 // Customer avatar tool — registered only when the patient-profile service is configured.
 if (AVATAR_ENABLED) INSIGHTS_TOOLS.push({
     name: 'get_customer_avatar',
-    description: 'CUSTOMER AVATAR / demographics for a funnel segment: gender split, age stats + decade buckets (bad intake DOBs excluded), top cities and states. Sourced live from the patient intake-profile service keyed by email (identity-linked alternate emails tried automatically) and cached server-side, so repeat calls are fast. THREE ways to define the segment (pick ONE): (1) event segment — event_type + optional LA-timezone date range, optional purchase_source ("AI Bot", "Paid Ads", …); (2) journey-stage segment — reached_stages / not_reached_stages against each person\'s journey (e.g. reached ["attended"], not reached ["purchase"] = attended-but-didn\'t-buy; date range then means when they REGISTERED); (3) explicit emails list (compose with any other tool — get_journey_segment rosters, get_ghl_pipeline_status bucket lists). All segments cap at 500 (flagged). SET group_by_stage:true to ALSO split the same segment by how far each person got in the funnel (their furthest crm stage) with a mini-avatar per stage — the one-call answer to "who are they AND where are they in the funnel". Use for "who is my typical buyer", "average age of purchasers", "avatar of no-shows", source comparisons (one call per source). COVERAGE CAVEAT: profiles exist only for people who completed the intake form (mostly actual patients/buyers) — always report profiles_found vs segment_size and never extrapolate the splits to unmatched people. Registration-stage segments will match poorly; that is expected, not an error. For arbitrary SQL joins, the cached rows live in the contact_demographics table.',
+    description: 'CUSTOMER AVATAR / demographics for a funnel segment: gender split, age stats + decade buckets (bad intake DOBs excluded), top cities and states. Sourced live from the patient intake-profile service keyed by email (identity-linked alternate emails tried automatically) and cached server-side, so repeat calls are fast. THREE ways to define the segment (pick ONE): (1) event segment — event_type + optional LA-timezone date range, optional purchase_source ("AI Bot", "Paid Ads", …); (2) journey-stage segment — reached_stages / not_reached_stages against each person\'s journey (e.g. reached ["attended"], not reached ["purchase"] = attended-but-didn\'t-buy; date range then means when they REGISTERED); (3) explicit emails list (compose with any other tool — get_journey_segment rosters, get_ghl_pipeline_status bucket lists). Segments hold up to 2500 people (most recent kept + flagged beyond that). Large cold segments enrich in rounds: when the result carries profiles_pending > 0, call again with the SAME arguments to continue (cached, so repeats are fast) — and say the current splits are partial until pending reaches 0. SET group_by_stage:true to ALSO split the same segment by how far each person got in the funnel (their furthest crm stage) with a mini-avatar per stage — the one-call answer to "who are they AND where are they in the funnel". Use for "who is my typical buyer", "average age of purchasers", "avatar of no-shows", source comparisons (one call per source). COVERAGE CAVEAT: profiles exist only for people who completed the intake form (mostly actual patients/buyers) — always report profiles_found vs segment_size and never extrapolate the splits to unmatched people. Registration-stage segments will match poorly; that is expected, not an error. For arbitrary SQL joins, the cached rows live in the contact_demographics table.',
     input_schema: {
         type: 'object',
         properties: {
