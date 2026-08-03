@@ -2833,6 +2833,11 @@ const AVATAR_ENABLED = !!(PATIENT_PROFILE_URL && PATIENT_PROFILE_API_KEY);
 console.log(AVATAR_ENABLED
     ? `🧑‍⚕️ Customer avatar: enabled (${PATIENT_PROFILE_URL})`
     : '🧑‍⚕️ Customer avatar: DISABLED — set PATIENT_PROFILE_URL + PATIENT_PROFILE_API_KEY to enable get_customer_avatar');
+
+// Live Facebook Ads reporting (campaign/adset/ad structure + delivery) for AI
+// Insights. Reuses the spend-sync System User token; analytics funnel only
+// (native runs Taboola).
+const FB_ADS_ENABLED = !!(process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID);
 if (GHL_ENABLED) {
     // Prewarm the pipeline snapshots shortly after boot; thereafter the
     // stale-while-revalidate cache keeps chat tool calls near-instant.
@@ -4077,6 +4082,156 @@ async function getCustomerAvatar(funnel, input) {
     return result;
 }
 
+// ─── Facebook Ads: live campaign/adset/ad reporting ──────────────────────────
+// What's running RIGHT NOW and how it's delivering, straight from the Meta
+// Marketing API (same System User token as the spend sync). Entity listing +
+// per-entity insights over a date range in one call via field expansion, so
+// zero-delivery entities still appear (insights: null). Responses cached 5 min
+// per request signature. daily_metrics.fb_spend stays the canonical historical
+// spend; this is the live structural/performance view.
+
+const FB_ADS_CACHE_TTL_MS = 5 * 60 * 1000;
+const _fbAdsCache = new Map(); // signature → { at, json }
+
+async function fbGraphGet(pathOrUrl, params) {
+    let url;
+    if (String(pathOrUrl).startsWith('https://')) {
+        url = new URL(pathOrUrl); // paging.next — already carries params + token
+    } else {
+        url = new URL(`https://graph.facebook.com/${process.env.FB_API_VERSION || 'v23.0'}/${pathOrUrl}`);
+        for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
+        url.searchParams.set('access_token', process.env.FB_ACCESS_TOKEN);
+    }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20000);
+    try {
+        const res = await fetch(url.toString(), { signal: ctrl.signal });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok || json.error) throw new Error(json?.error?.message || `Facebook API HTTP ${res.status}`);
+        return json;
+    } catch (e) {
+        throw new Error(e.name === 'AbortError' ? 'Facebook API timeout' : e.message);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+const fbCents = (v) => (v === undefined || v === null || v === '') ? null : Math.round(parseInt(v, 10)) / 100;
+const fbNum = (v) => (v === undefined || v === null) ? null : Number(v);
+
+async function getFbAds(funnel, input) {
+    if (!FB_ADS_ENABLED) return { error: 'Facebook Ads not configured (FB_ACCESS_TOKEN / FB_AD_ACCOUNT_ID)' };
+    if (funnel !== 'analytics') return { error: 'Facebook Ads is connected to the Main (analytics) funnel only — the native funnel runs Taboola, not Facebook.' };
+
+    const level = String(input.level || 'campaign');
+    const EDGES = { campaign: 'campaigns', adset: 'adsets', ad: 'ads' };
+    if (!EDGES[level]) return { error: 'level must be "campaign", "adset", or "ad"' };
+    const status = String(input.status || 'active');
+    const STATUS_SETS = {
+        active: ['ACTIVE'],
+        paused: ['PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED'],
+        all: null,
+    };
+    if (!(status in STATUS_SETS)) return { error: 'status must be "active", "paused", or "all"' };
+
+    const dateOk = d => /^\d{4}-\d{2}-\d{2}$/.test(d);
+    const todayLA = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+    const weekAgoLA = new Date(Date.now() - 6 * 86400000).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+    const since = input.date_from || weekAgoLA;
+    const until = input.date_to || todayLA;
+    if (!dateOk(since) || !dateOk(until)) return { error: 'date_from/date_to must be YYYY-MM-DD' };
+
+    const FIELDS = {
+        campaign: 'id,name,effective_status,objective,daily_budget,lifetime_budget,start_time,stop_time',
+        adset: 'id,name,effective_status,campaign{name},daily_budget,lifetime_budget,optimization_goal',
+        ad: `id,name,effective_status,adset{name},campaign{name}${input.include_creative ? ',creative{title,body}' : ''}`,
+    };
+    const INSIGHT_FIELDS = 'impressions,reach,frequency,clicks,inline_link_clicks,ctr,cpc,cpm,spend';
+    const fields = `${FIELDS[level]},insights.time_range({"since":"${since}","until":"${until}"}){${INSIGHT_FIELDS}}`;
+
+    // parent_id scopes children: a campaign id for adsets/ads, or an adset id for ads.
+    const edgeBase = input.parent_id ? `${String(input.parent_id).replace(/[^\d_]/g, '')}/${EDGES[level]}` : `${process.env.FB_AD_ACCOUNT_ID}/${EDGES[level]}`;
+
+    const signature = `${edgeBase}|${status}|${since}|${until}|${input.include_creative ? 'c' : ''}`;
+    const hit = _fbAdsCache.get(signature);
+    let raw;
+    if (hit && Date.now() - hit.at < FB_ADS_CACHE_TTL_MS) {
+        raw = hit.json;
+    } else {
+        const params = { fields, limit: '100' };
+        if (STATUS_SETS[status]) params.filtering = JSON.stringify([{ field: 'effective_status', operator: 'IN', value: STATUS_SETS[status] }]);
+        raw = [];
+        let page = await fbGraphGet(edgeBase, params);
+        for (let i = 0; i < 3; i++) {
+            raw.push(...(page.data || []));
+            if (!page.paging?.next || raw.length >= 300) break;
+            page = await fbGraphGet(page.paging.next);
+        }
+        _fbAdsCache.set(signature, { at: Date.now(), json: raw });
+        if (_fbAdsCache.size > 30) _fbAdsCache.delete(_fbAdsCache.keys().next().value); // bound the cache
+    }
+
+    let entities = raw.map(e => {
+        const ins = e.insights?.data?.[0];
+        return {
+            id: e.id,
+            name: e.name,
+            status: e.effective_status,
+            ...(e.objective ? { objective: e.objective } : {}),
+            ...(e.optimization_goal ? { optimization_goal: e.optimization_goal } : {}),
+            ...(e.campaign?.name ? { campaign: e.campaign.name } : {}),
+            ...(e.adset?.name ? { adset: e.adset.name } : {}),
+            ...(fbCents(e.daily_budget) !== null ? { daily_budget_usd: fbCents(e.daily_budget) } : {}),
+            ...(fbCents(e.lifetime_budget) !== null ? { lifetime_budget_usd: fbCents(e.lifetime_budget) } : {}),
+            ...(e.start_time ? { start_time: e.start_time } : {}),
+            ...(e.stop_time ? { stop_time: e.stop_time } : {}),
+            ...(e.creative ? { creative: { title: e.creative.title || null, body: e.creative.body ? String(e.creative.body).slice(0, 300) : null } } : {}),
+            insights: ins ? {
+                impressions: fbNum(ins.impressions),
+                reach: fbNum(ins.reach),
+                frequency: ins.frequency ? Math.round(Number(ins.frequency) * 100) / 100 : null,
+                clicks: fbNum(ins.clicks),
+                link_clicks: fbNum(ins.inline_link_clicks),
+                ctr_pct: ins.ctr ? Math.round(Number(ins.ctr) * 100) / 100 : null,
+                cpc_usd: ins.cpc ? Math.round(Number(ins.cpc) * 100) / 100 : null,
+                cpm_usd: ins.cpm ? Math.round(Number(ins.cpm) * 100) / 100 : null,
+                spend_usd: fbNum(ins.spend),
+            } : null, // no delivery in the date range
+        };
+    });
+    if (input.name_filter) {
+        const want = String(input.name_filter).toLowerCase();
+        entities = entities.filter(e => e.name.toLowerCase().includes(want));
+    }
+    entities.sort((a, b) => (b.insights?.spend_usd || 0) - (a.insights?.spend_usd || 0));
+
+    const totals = { impressions: 0, clicks: 0, link_clicks: 0, spend_usd: 0 };
+    for (const e of entities) {
+        if (!e.insights) continue;
+        totals.impressions += e.insights.impressions || 0;
+        totals.clicks += e.insights.clicks || 0;
+        totals.link_clicks += e.insights.link_clicks || 0;
+        totals.spend_usd += e.insights.spend_usd || 0;
+    }
+    totals.spend_usd = Math.round(totals.spend_usd * 100) / 100;
+    if (totals.impressions > 0) {
+        totals.ctr_pct = Math.round(totals.clicks / totals.impressions * 10000) / 100;
+        totals.cpm_usd = Math.round(totals.spend_usd / totals.impressions * 100000) / 100;
+    }
+    if (totals.clicks > 0) totals.cpc_usd = Math.round(totals.spend_usd / totals.clicks * 100) / 100;
+
+    return {
+        READ_ME: 'Live from the Meta Marketing API. Budgets are USD (CBO campaigns hold budget at campaign level — their ad sets show none). insights:null = no delivery in the range. Totals sum the returned entities; reach is NOT totaled (audiences overlap). For canonical historical daily spend use get_metrics (fb_spend) — small discrepancies vs this tool are normal (attribution timing).',
+        level,
+        status_filter: status,
+        date_range: { since, until },
+        count: entities.length,
+        ...(raw.length >= 300 ? { truncated_at_300: true } : {}),
+        totals,
+        entities,
+    };
+}
+
 // ─── AI Insights: tool definitions ────────────────────────────────────────────
 const INSIGHTS_TOOLS = [
     {
@@ -4283,6 +4438,24 @@ if (AVATAR_ENABLED) INSIGHTS_TOOLS.push({
     },
 });
 
+// Facebook Ads tool — registered only when the ads token is configured.
+if (FB_ADS_ENABLED) INSIGHTS_TOOLS.push({
+    name: 'get_fb_ads',
+    description: 'LIVE Facebook Ads structure and delivery from the Meta Marketing API: which campaigns / ad sets / ads are running (or paused), with budgets, objectives, and per-entity performance over a date range — impressions, reach, frequency, clicks, link clicks, CTR, CPC, CPM, spend — plus recomputed totals. Use for "what ads are running right now", "which campaign gets the most impressions", "CTR by ad set", "what does our best ad say" (level:"ad" + include_creative for headline/body text). Defaults: active entities, last 7 days. Drill down with parent_id (a campaign id → its ad sets/ads). Sorted by spend. NOTE: historical daily spend questions should use get_metrics (fb_spend is canonical); this tool is for live structure and per-campaign/ad performance. Main funnel only (native runs Taboola). Results cached ~5 min.',
+    input_schema: {
+        type: 'object',
+        properties: {
+            level:            { type: 'string', enum: ['campaign', 'adset', 'ad'], description: 'Reporting level (default: campaign)' },
+            status:           { type: 'string', enum: ['active', 'paused', 'all'], description: 'Delivery status filter (default: active — what is currently running)' },
+            date_from:        { type: 'string', description: 'Insights range start YYYY-MM-DD (default: 7 days ago)' },
+            date_to:          { type: 'string', description: 'Insights range end YYYY-MM-DD (default: today)' },
+            parent_id:        { type: 'string', description: 'Scope to children of one entity: a campaign id (level adset/ad) or ad set id (level ad).' },
+            name_filter:      { type: 'string', description: 'Case-insensitive substring match on the entity name.' },
+            include_creative: { type: 'boolean', description: 'level "ad" only: include the creative headline + body text (truncated).' },
+        },
+    },
+});
+
 async function executeInsightsTool(name, input, ctx) {
     const { funnel, userId } = ctx;
     try {
@@ -4303,6 +4476,8 @@ async function executeInsightsTool(name, input, ctx) {
                 return await getGhlPipelineStatus(funnel, input || {});
             case 'get_customer_avatar':
                 return await getCustomerAvatar(funnel, input || {});
+            case 'get_fb_ads':
+                return await getFbAds(funnel, input || {});
             case 'get_journey_funnel':
                 return await getJourneyFunnel(funnel, input.date_from, input.date_to);
             case 'get_variant_funnel':
@@ -4450,6 +4625,7 @@ INSTRUCTIONS:
   • \`describe_journey_data\` — live schema + every \`events.metadata\` key (with samples) + enum values. Call it FIRST when unsure what's queryable, so you never guess a column or metadata key.${AVATAR_ENABLED ? `
   • \`get_customer_avatar\` — the demographic CUSTOMER AVATAR (gender split, age stats + buckets, top cities/states) for any segment: event_type + dates, purchase_source, journey-stage criteria (reached_stages/not_reached_stages — e.g. attended but never bought), or an email list from any other tool. Add group_by_stage:true to ALSO see where the same people sit in the funnel (furthest stage, with a mini-avatar per stage) — one call answers "who are they AND how far did they get". Use for "who is my typical buyer", "average age of purchasers", "avatar of no-shows", source comparisons (one call per source). ALWAYS quote profiles_found vs segment_size — people without an intake profile are absent from the splits, so never project the percentages onto them. The per-email data is joinable in run_sql via the contact_demographics table.` : ''}
   • \`run_sql\` against \`crm_people\` / \`events.metadata\` for anything else (webinar-slot popularity, attribution, cohorts). The journey snapshot above already answers the most common ones — cite it directly when it suffices.
+${FB_ADS_ENABLED ? `- LIVE FACEBOOK ADS: \`get_fb_ads\` shows what's actually running — campaigns / ad sets / ads with budgets and delivery (impressions, reach, CTR, CPC, CPM, spend) over any date range, plus ad creative text via include_creative. Use it for "what ads are running", "which campaign/ad performs best", "what's our CTR". For historical daily spend totals keep using get_metrics — daily_metrics.fb_spend is canonical. Main funnel only.` : ''}
 - For statistical work (forecasts, regressions, anomaly detection, t-tests), use the code execution tool. The data you've fetched is available as variables.
 - Give specific, data-backed insights. Reference actual numbers and dates.
 - When the user shares context worth remembering across chats (promos, definitions, business changes), use the \`remember\` tool silently.

@@ -60,7 +60,7 @@ Stages: `lead → registration → attended → replay → viewedcta → clicked
 | `PUT` | `/api/insights/conversations/:id` | Save/update a conversation |
 | `DELETE` | `/api/insights/conversations/:id` | Delete a conversation |
 
-The model's tools: `get_metrics`, `get_metrics_rollup`, `compare_periods`, `get_event_counts`, `list_custom_metrics`, `get_journey_funnel`, `get_variant_funnel`, `get_contact_journey`, `get_journey_segment`, `describe_journey_data`, `get_email_report`, `get_sales_page_visits`, `get_customer_avatar` (demographic avatar — gender/age/location — for a segment, via the CP4L1 patient‑profile service; cached in `contact_demographics`, needs `PATIENT_PROFILE_URL` + `PATIENT_PROFILE_API_KEY`), `run_sql` (read‑only), `remember`, `forget`.
+The model's tools: `get_metrics`, `get_metrics_rollup`, `compare_periods`, `get_event_counts`, `list_custom_metrics`, `get_journey_funnel`, `get_variant_funnel`, `get_contact_journey`, `get_journey_segment`, `describe_journey_data`, `get_email_report`, `get_sales_page_visits`, `get_customer_avatar` (demographic avatar — gender/age/location — for a segment, via the CP4L1 patient‑profile service; cached in `contact_demographics`, needs `PATIENT_PROFILE_URL` + `PATIENT_PROFILE_API_KEY`), `get_fb_ads` (live Meta Marketing API: running campaigns/ad sets/ads with budgets + impressions/CTR/CPC/CPM/spend and optional creative text; reuses the FB spend‑sync token; analytics funnel only), `run_sql` (read‑only), `remember`, `forget`.
 
 ---
 
