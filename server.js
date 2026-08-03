@@ -3899,13 +3899,38 @@ function avatarAge(rec) {
 async function getCustomerAvatar(funnel, input) {
     if (!AVATAR_ENABLED) return { error: 'Patient-profile service not configured (PATIENT_PROFILE_URL / PATIENT_PROFILE_API_KEY)' };
 
-    // Segment resolution — same shape as getGhlPipelineStatus, plus purchase_source.
+    // Segment resolution — same shape as getGhlPipelineStatus, plus purchase_source
+    // and journey-stage criteria (reached/not_reached → crm_people, like
+    // get_journey_segment) so "avatar of attended-but-didn't-buy" is one call.
     let emails, segmentLabel;
     let segmentCapped = false;
+    const stageFiltered = (Array.isArray(input.reached_stages) && input.reached_stages.length) || (Array.isArray(input.not_reached_stages) && input.not_reached_stages.length);
     if (Array.isArray(input.emails) && input.emails.length) {
         emails = [...new Set(input.emails.map(e => String(e).trim().toLowerCase()).filter(e => e.includes('@')))];
         if (emails.length > 500) { emails = emails.slice(0, 500); segmentCapped = true; }
         segmentLabel = `explicit list (${emails.length} emails)`;
+    } else if (stageFiltered) {
+        const mapStage = (s) => JOURNEY_STAGE_COL[String(s).toLowerCase().trim()];
+        const conds = ['TRUE'];
+        const bad = [];
+        for (const s of (input.reached_stages || [])) { const c = mapStage(s); if (c) conds.push(c); else bad.push(s); }
+        for (const s of (input.not_reached_stages || [])) { const c = mapStage(s); if (c) conds.push(`NOT ${c}`); else bad.push(s); }
+        if (bad.length) return { error: `Unknown stage(s): ${bad.join(', ')}. Valid: registration, attended, replay, viewedcta/saw_cta, clickedcta/clicked_cta, purchase` };
+        const dateOk = d => /^\d{4}-\d{2}-\d{2}$/.test(d);
+        if (input.date_from || input.date_to) {
+            // For stage segments the date range means WHEN THEY REGISTERED (the
+            // segment is people, not events — has_attended has no date of its own).
+            let sub = "SELECT lower(email) FROM events WHERE event_type='registrations' AND email IS NOT NULL";
+            if (input.date_from) { if (!dateOk(input.date_from)) return { error: 'date_from must be YYYY-MM-DD' }; sub += ` AND (event_time AT TIME ZONE 'America/Los_Angeles')::date >= '${input.date_from}'`; }
+            if (input.date_to) { if (!dateOk(input.date_to)) return { error: 'date_to must be YYYY-MM-DD' }; sub += ` AND (event_time AT TIME ZONE 'America/Los_Angeles')::date <= '${input.date_to}'`; }
+            conds.push(`email_key IN (${sub})`);
+        }
+        if (input.purchase_source) conds.push(`email_key IN (SELECT lower(email) FROM events WHERE event_type='purchases' AND metadata->>'source' ILIKE '${String(input.purchase_source).replace(/['\\;]/g, '')}' AND email IS NOT NULL)`);
+        const out = await runReadOnlySQL(funnel, `SELECT email_key AS email FROM crm_people WHERE ${conds.join(' AND ')}`);
+        if (out.error) return out;
+        emails = (out.rows || []).map(r => r.email);
+        segmentCapped = emails.length >= 500;
+        segmentLabel = `journey segment: reached [${(input.reached_stages || []).join(', ') || 'any'}]${(input.not_reached_stages || []).length ? `, not reached [${input.not_reached_stages.join(', ')}]` : ''}${input.date_from || input.date_to ? `, registered ${input.date_from || '…'} → ${input.date_to || '…'}` : ''}`;
     } else {
         const eventType = String(input.event_type || 'purchases');
         if (!AVATAR_JOINABLE_EVENTS.has(eventType)) return { error: `event_type must be one of: ${[...AVATAR_JOINABLE_EVENTS].join(', ')}` };
@@ -3993,6 +4018,55 @@ async function getCustomerAvatar(funnel, input) {
         top_states: [...stateCounts.values()].sort((a, b) => b.people - a.people).slice(0, 10),
         top_cities: [...cityCounts.values()].sort((a, b) => b.people - a.people).slice(0, 10),
     };
+    // Optional funnel-position breakdown: the same segment split by each
+    // person's FURTHEST stage (crm_people.stage), each bucket with a mini-avatar.
+    // Answers "who are they AND how far did they get" in one call.
+    if (input.group_by_stage) {
+        const stageByEmail = new Map();
+        for (let i = 0; i < emails.length; i += 100) {
+            const { data } = await clientFor(funnel).from('crm_people').select('email, stage').in('email', emails.slice(i, i + 100));
+            for (const r of data || []) stageByEmail.set(String(r.email).toLowerCase(), r.stage || 'lead');
+        }
+        const STAGE_ORDER = ['lead', 'registration', 'attended', 'replay', 'viewedcta', 'clickedcta', 'purchase', 'not_in_crm'];
+        const groups = new Map();
+        for (const e of emails) {
+            const st = stageByEmail.get(e) || 'not_in_crm';
+            if (!groups.has(st)) groups.set(st, []);
+            groups.get(st).push(e);
+        }
+        result.funnel_stages = {};
+        const keys = [...groups.keys()].sort((a, b) => {
+            const ia = STAGE_ORDER.indexOf(a), ib = STAGE_ORDER.indexOf(b);
+            return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+        });
+        for (const st of keys) {
+            const gEmails = groups.get(st);
+            const gFound = gEmails.map(e => records.get(e)).filter(r => r && r.found);
+            const g = { people: gEmails.length, with_profile: gFound.length };
+            if (gFound.length) {
+                const gg = {}; const ga = []; const gs = new Map();
+                for (const r of gFound) {
+                    const k = (r.gender || '').trim().toLowerCase() || 'unknown';
+                    gg[k] = (gg[k] || 0) + 1;
+                    const a = avatarAge(r);
+                    if (a !== null && a >= 18 && a <= 105) ga.push(a);
+                    const stt = (r.state || '').trim();
+                    if (stt) {
+                        const kk = stt.toLowerCase();
+                        const cur = gs.get(kk) || { state: stt, people: 0 };
+                        cur.people++; gs.set(kk, cur);
+                    }
+                }
+                ga.sort((x, y) => x - y);
+                g.gender = gg;
+                if (ga.length) g.median_age = ga[Math.floor(ga.length / 2)];
+                const topSt = [...gs.values()].sort((a, b) => b.people - a.people)[0];
+                if (topSt) g.top_state = `${topSt.state} (${topSt.people})`;
+            }
+            result.funnel_stages[st] = g;
+        }
+        result.funnel_stages_note = 'Buckets are each person\'s FURTHEST stage — they sum to segment_size. Demographics inside a bucket cover only with_profile people.';
+    }
     if (input.include_people) {
         result.people = found.slice(0, 100).map(r => ({
             email: r.email, gender: r.gender, age: avatarAge(r), city: r.city, state: r.state,
@@ -4192,16 +4266,19 @@ if (GHL_ENABLED) INSIGHTS_TOOLS.push({
 // Customer avatar tool — registered only when the patient-profile service is configured.
 if (AVATAR_ENABLED) INSIGHTS_TOOLS.push({
     name: 'get_customer_avatar',
-    description: 'CUSTOMER AVATAR / demographics for a funnel segment: gender split, age stats + decade buckets (bad intake DOBs excluded), top cities and states. Sourced live from the patient intake-profile service keyed by email (identity-linked alternate emails tried automatically) and cached server-side, so repeat calls are fast. Give it a segment like get_ghl_pipeline_status: event_type + optional LA-timezone date range (e.g. purchases in the last 7 days), optional purchase_source ("AI Bot", "Paid Ads", …), or an explicit emails list (capped at 500, flagged when hit). Use for "who is my typical buyer", "average age of purchasers", "where are my customers", "compare the avatar of AI Bot vs Paid Ads buyers" (two calls). COVERAGE CAVEAT: profiles exist only for people who completed the intake form (mostly actual patients/buyers) — always report profiles_found vs segment_size and never extrapolate the splits to unmatched people. Registration-stage segments will match poorly; that is expected, not an error. For arbitrary SQL joins, the cached rows live in the contact_demographics table.',
+    description: 'CUSTOMER AVATAR / demographics for a funnel segment: gender split, age stats + decade buckets (bad intake DOBs excluded), top cities and states. Sourced live from the patient intake-profile service keyed by email (identity-linked alternate emails tried automatically) and cached server-side, so repeat calls are fast. THREE ways to define the segment (pick ONE): (1) event segment — event_type + optional LA-timezone date range, optional purchase_source ("AI Bot", "Paid Ads", …); (2) journey-stage segment — reached_stages / not_reached_stages against each person\'s journey (e.g. reached ["attended"], not reached ["purchase"] = attended-but-didn\'t-buy; date range then means when they REGISTERED); (3) explicit emails list (compose with any other tool — get_journey_segment rosters, get_ghl_pipeline_status bucket lists). All segments cap at 500 (flagged). SET group_by_stage:true to ALSO split the same segment by how far each person got in the funnel (their furthest crm stage) with a mini-avatar per stage — the one-call answer to "who are they AND where are they in the funnel". Use for "who is my typical buyer", "average age of purchasers", "avatar of no-shows", source comparisons (one call per source). COVERAGE CAVEAT: profiles exist only for people who completed the intake form (mostly actual patients/buyers) — always report profiles_found vs segment_size and never extrapolate the splits to unmatched people. Registration-stage segments will match poorly; that is expected, not an error. For arbitrary SQL joins, the cached rows live in the contact_demographics table.',
     input_schema: {
         type: 'object',
         properties: {
-            event_type:      { type: 'string', enum: ['purchases', 'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta'], description: 'Funnel segment (default: purchases)' },
-            date_from:       { type: 'string', description: 'Inclusive start date YYYY-MM-DD (LA timezone). Omit for all time.' },
-            date_to:         { type: 'string', description: 'Inclusive end date YYYY-MM-DD (LA timezone). Omit for all time.' },
-            purchase_source: { type: 'string', description: 'Only with event_type "purchases": restrict to one source, e.g. "AI Bot", "Paid Ads", "Sales A".' },
-            emails:          { type: 'array', items: { type: 'string' }, description: 'Explicit emails instead of event_type + dates (e.g. a list from get_journey_segment or get_ghl_pipeline_status).' },
-            include_people:  { type: 'boolean', description: 'Also return the per-person list (email, gender, age, city, state; capped at 100). Default false — only set when the user wants WHO, not just the aggregate.' },
+            event_type:         { type: 'string', enum: ['purchases', 'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta'], description: 'Event segment (default: purchases). Ignored when reached_stages/not_reached_stages or emails are given.' },
+            date_from:          { type: 'string', description: 'Inclusive start date YYYY-MM-DD (LA timezone). For stage segments this filters by REGISTRATION date. Omit for all time.' },
+            date_to:            { type: 'string', description: 'Inclusive end date YYYY-MM-DD (LA timezone). Omit for all time.' },
+            purchase_source:    { type: 'string', description: 'Restrict to one purchase source, e.g. "AI Bot", "Paid Ads", "Sales A".' },
+            reached_stages:     { type: 'array', items: { type: 'string' }, description: 'Journey stages the person MUST have reached: registration, attended, replay, viewedcta, clickedcta, purchase.' },
+            not_reached_stages: { type: 'array', items: { type: 'string' }, description: 'Stages the person must NOT have reached (e.g. ["purchase"] with reached ["attended"] = attended but never bought).' },
+            emails:             { type: 'array', items: { type: 'string' }, description: 'Explicit emails instead of a segment (e.g. a list from get_journey_segment or get_ghl_pipeline_status).' },
+            group_by_stage:     { type: 'boolean', description: 'Also break the segment down by each person\'s furthest funnel stage, with people count + mini-avatar (gender, median age, top state) per stage.' },
+            include_people:     { type: 'boolean', description: 'Also return the per-person list (email, gender, age, city, state; capped at 100). Default false — only set when the user wants WHO, not just the aggregate.' },
         },
     },
 });
@@ -4371,7 +4448,7 @@ INSTRUCTIONS:
   • \`get_email_report\` — email-marketing performance by source (clicks → people → buyers → conversion %, traffic_source=email). Use for "which emails convert best".
   • \`get_sales_page_visits\` — how many people hit each NAMED sales/checkout page (e.g. "Sales Page B" = /checkout2): distinct stitched people + raw visits per page, optional date range. Use for "how many people hit Sales Page B / checkout2", sales-page traffic. Labels are admin-configurable (see describe_journey_data → sales_pages).
   • \`describe_journey_data\` — live schema + every \`events.metadata\` key (with samples) + enum values. Call it FIRST when unsure what's queryable, so you never guess a column or metadata key.${AVATAR_ENABLED ? `
-  • \`get_customer_avatar\` — the demographic CUSTOMER AVATAR (gender split, age stats + buckets, top cities/states) for any segment: event_type + dates, purchase_source, or an email list. Use for "who is my typical buyer", "average age of purchasers", "where are customers located", or avatar comparisons between sources (one call per source). ALWAYS quote profiles_found vs segment_size — people without an intake profile are absent from the splits, so never project the percentages onto them. The per-email data is joinable in run_sql via the contact_demographics table.` : ''}
+  • \`get_customer_avatar\` — the demographic CUSTOMER AVATAR (gender split, age stats + buckets, top cities/states) for any segment: event_type + dates, purchase_source, journey-stage criteria (reached_stages/not_reached_stages — e.g. attended but never bought), or an email list from any other tool. Add group_by_stage:true to ALSO see where the same people sit in the funnel (furthest stage, with a mini-avatar per stage) — one call answers "who are they AND how far did they get". Use for "who is my typical buyer", "average age of purchasers", "avatar of no-shows", source comparisons (one call per source). ALWAYS quote profiles_found vs segment_size — people without an intake profile are absent from the splits, so never project the percentages onto them. The per-email data is joinable in run_sql via the contact_demographics table.` : ''}
   • \`run_sql\` against \`crm_people\` / \`events.metadata\` for anything else (webinar-slot popularity, attribution, cohorts). The journey snapshot above already answers the most common ones — cite it directly when it suffices.
 - For statistical work (forecasts, regressions, anomaly detection, t-tests), use the code execution tool. The data you've fetched is available as variables.
 - Give specific, data-backed insights. Reference actual numbers and dates.
