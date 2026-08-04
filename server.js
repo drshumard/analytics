@@ -84,6 +84,7 @@ function resolveFunnel(req, fallback = 'analytics') {
 const cache = {
     byFunnel: {}, // funnel → { dedupCounts, dedupTimestamps, metricsResponse, ... }
     metricsTTL: 60_000,   // 60 seconds
+    aliasTTL: 600_000,    // 10 minutes — identity-graph maps (stitch aliases, tracked phones) drift slowly
     insightsTTL: 300_000, // 5 minutes
 
     // Global hit/miss stats — aggregated across funnels for /api/health
@@ -180,32 +181,60 @@ async function getIdentityLinks(funnel) {
     return map;
 }
 
+// ─── Stale-while-revalidate bucket maps ──────────────────────────────────────
+// The identity-graph maps below (tracked phones, stitch aliases) are expensive to
+// build but drift slowly, so a dashboard request must NEVER wait on a rebuild:
+// serve the cached copy instantly (even past aliasTTL) and refresh in the
+// background. Only the very first call after boot blocks (nothing to serve yet),
+// and warmCaches() usually pays that before real traffic arrives. A failed
+// rebuild keeps the previous copy — a transient Supabase blip must not wipe
+// variant attribution until the next TTL — and retries after another aliasTTL.
+// Admin identity-link routes force an immediate rebuild via b.<key> = undefined.
+async function swrMap(funnel, key, build) {
+    const b = getCacheBucket(funnel);
+    const atKey = key + 'At', inflightKey = key + 'Inflight';
+    if (b[key] !== undefined && (Date.now() - (b[atKey] || 0)) < cache.aliasTTL) return b[key];
+    if (!b[inflightKey]) {
+        b[inflightKey] = build(funnel)
+            .then(v => { b[key] = v; })
+            .catch(e => {
+                console.warn(`⚠️  ${key} rebuild failed [${funnel}]${b[key] ? ' (keeping previous copy)' : ''}:`, e.message);
+                if (b[key] === undefined) b[key] = {}; // cold start: degrade to empty until the TTL retry
+            })
+            .finally(() => { b[atKey] = Date.now(); b[inflightKey] = null; });
+    }
+    if (b[key] !== undefined) return b[key]; // stale copy — serve now, refresh runs behind
+    await b[inflightKey];                    // first build since boot — block once
+    return b[key];
+}
+
 // email (lowercased) → normalized phone, harvested from shumard tracking_contacts. Lets
 // variant matching use the phone WE TRACKED even when the funnel webhook event carried
 // none (e.g. a checkout that posted only email + name) — the whole point of tracking the
-// phone. Cached briefly on the bucket (refreshes on the metrics cadence).
-async function getTrackingPhones(funnel) {
-    const b = getCacheBucket(funnel);
-    const now = Date.now();
-    if (b.trackingPhones && (now - (b.trackingPhonesAt || 0)) < cache.metricsTTL) return b.trackingPhones;
+// phone. Served stale-while-revalidate (see swrMap) so requests never block on the crawl.
+async function buildTrackingPhones(funnel) {
     const map = {};
-    try {
-        let from = 0; const page = 1000;
-        for (;;) {
-            const { data } = await clientFor(funnel).from('tracking_contacts')
-                .select('email, phone').not('phone', 'is', null).range(from, from + page - 1);
-            if (!data || !data.length) break;
-            for (const r of data) {
-                const e = (r.email || '').toLowerCase().trim();
-                const p = normalizePhoneKey(r.phone);
-                if (e && p && !(e in map)) map[e] = p;
-            }
-            if (data.length < page) break;
-            from += page;
+    let from = 0; const page = 1000;
+    for (;;) {
+        const { data, error } = await clientFor(funnel).from('tracking_contacts')
+            .select('email, phone').not('phone', 'is', null).range(from, from + page - 1);
+        if (error) {
+            if (/does not exist/i.test(error.message)) return map; // schema has no tracking tables → no enrichment
+            throw new Error(`tracking_contacts phones fetch failed: ${error.message}`); // transient → keep previous copy
         }
-    } catch { /* table missing → no enrichment */ }
-    b.trackingPhones = map; b.trackingPhonesAt = now;
+        if (!data || !data.length) break;
+        for (const r of data) {
+            const e = (r.email || '').toLowerCase().trim();
+            const p = normalizePhoneKey(r.phone);
+            if (e && p && !(e in map)) map[e] = p;
+        }
+        if (data.length < page) break;
+        from += page;
+    }
     return map;
+}
+async function getTrackingPhones(funnel) {
+    return swrMap(funnel, 'trackingPhones', buildTrackingPhones);
 }
 
 // Ambient-graph "variant-via-stitch": from the shumard identity graph, derive aliases
@@ -217,70 +246,84 @@ async function getTrackingPhones(funnel) {
 //
 // Guards against bad fan-out: only clusters that contain a tagged registrant produce
 // aliases; we map to the EARLIEST tagged registrant's email; manual links always win
-// (merged on top by getCombinedAliases). Cached on the metrics cadence.
-async function getStitchAliases(funnel) {
-    const b = getCacheBucket(funnel);
-    const now = Date.now();
-    if (b.stitchAliases && (now - (b.stitchAliasesAt || 0)) < cache.metricsTTL) return b.stitchAliases;
+// (merged on top by getCombinedAliases). Served stale-while-revalidate (see swrMap).
+async function buildStitchAliases(funnel) {
     const aliases = {};
-    try {
-        const sb = clientFor(funnel);
-        // 1) Tagged registrants (small set) → earliest variant registration per email/phone.
-        const { data: regs } = await sb.from('events')
-            .select('email, phone, event_time, metadata')
-            .eq('event_type', 'registrations')
-            .or('metadata->>variant.eq.A,metadata->>variant.eq.B');
-        const regByEmail = {}, regByPhone = {};
-        for (const r of (regs || []).sort((a, c) => new Date(a.event_time) - new Date(c.event_time))) {
-            const e = (r.email || '').toLowerCase().trim();
-            const since = new Date(r.event_time).getTime();
-            if (e && !(e in regByEmail)) regByEmail[e] = { email: e, since };
-            const p = normalizePhoneKey(r.phone);
-            if (p && e && !(p in regByPhone)) regByPhone[p] = { email: e, since };
-        }
-        if (Object.keys(regByEmail).length === 0 && Object.keys(regByPhone).length === 0) {
-            b.stitchAliases = {}; b.stitchAliasesAt = now; return {};
-        }
-        // 2) Pull the contact graph and group emails/phones by merge-root.
-        const rows = [];
+    const sb = clientFor(funnel);
+    // 1) Tagged registrants (small set) → earliest variant registration per email/phone.
+    const { data: regs, error: regsError } = await sb.from('events')
+        .select('email, phone, event_time, metadata')
+        .eq('event_type', 'registrations')
+        .or('metadata->>variant.eq.A,metadata->>variant.eq.B');
+    if (regsError) throw new Error(`tagged registrations fetch failed: ${regsError.message}`);
+    const regByEmail = {}, regByPhone = {};
+    for (const r of (regs || []).sort((a, c) => new Date(a.event_time) - new Date(c.event_time))) {
+        const e = (r.email || '').toLowerCase().trim();
+        const since = new Date(r.event_time).getTime();
+        if (e && !(e in regByEmail)) regByEmail[e] = { email: e, since };
+        const p = normalizePhoneKey(r.phone);
+        if (p && e && !(p in regByPhone)) regByPhone[p] = { email: e, since };
+    }
+    if (Object.keys(regByEmail).length === 0 && Object.keys(regByPhone).length === 0) {
+        return aliases;
+    }
+    // 2) Pull the alias-relevant slice of the contact graph in ONE round-trip:
+    //    stitch_cluster_contacts() returns merge-chain rows plus never-merged rows
+    //    carrying both email AND phone (the only rows that can influence an alias —
+    //    verified equivalent to the full table for this computation). As a single
+    //    jsonb statement it's also an atomic snapshot, unlike the old 146-request
+    //    positional crawl, which could drop rows shifted by concurrent writes.
+    let rows;
+    const { data: rpcRows, error: rpcError } = await sb.rpc('stitch_cluster_contacts');
+    if (!rpcError && Array.isArray(rpcRows)) {
+        rows = rpcRows;
+    } else {
+        // RPC not in this schema (migration not applied) → legacy full-table paging.
+        rows = [];
         let from = 0; const page = 1000;
         for (;;) {
-            const { data } = await sb.from('tracking_contacts')
+            const { data, error } = await sb.from('tracking_contacts')
                 .select('contact_id, email, phone, merged_into').range(from, from + page - 1);
+            if (error) {
+                if (/does not exist/i.test(error.message)) return aliases; // schema has no tracking tables
+                throw new Error(`tracking_contacts fetch failed: ${error.message}`); // transient → keep previous copy
+            }
             if (!data || !data.length) break;
             rows.push(...data);
             if (data.length < page) break;
             from += page;
         }
-        const byId = {};
-        for (const r of rows) byId[r.contact_id] = r;
-        const rootOf = (id) => {
-            let cur = id; const guard = new Set();
-            while (cur && byId[cur] && byId[cur].merged_into && !guard.has(cur)) { guard.add(cur); cur = byId[cur].merged_into; }
-            return cur;
-        };
-        const clusters = {}; // rootId → { emails:Set, phones:Set }
-        for (const r of rows) {
-            const root = rootOf(r.contact_id) || r.contact_id;
-            const c = clusters[root] || (clusters[root] = { emails: new Set(), phones: new Set() });
-            const e = (r.email || '').toLowerCase().trim(); if (e) c.emails.add(e);
-            const p = normalizePhoneKey(r.phone); if (p) c.phones.add(p);
+    }
+    const byId = {};
+    for (const r of rows) byId[r.contact_id] = r;
+    const rootOf = (id) => {
+        let cur = id; const guard = new Set();
+        while (cur && byId[cur] && byId[cur].merged_into && !guard.has(cur)) { guard.add(cur); cur = byId[cur].merged_into; }
+        return cur;
+    };
+    const clusters = {}; // rootId → { emails:Set, phones:Set }
+    for (const r of rows) {
+        const root = rootOf(r.contact_id) || r.contact_id;
+        const c = clusters[root] || (clusters[root] = { emails: new Set(), phones: new Set() });
+        const e = (r.email || '').toLowerCase().trim(); if (e) c.emails.add(e);
+        const p = normalizePhoneKey(r.phone); if (p) c.phones.add(p);
+    }
+    // 3) Per cluster: find the earliest tagged registrant member; alias the cluster's
+    //    OTHER (non-registrant) emails to that registrant's email.
+    for (const root in clusters) {
+        const c = clusters[root];
+        let best = null;
+        for (const e of c.emails) { const r = regByEmail[e]; if (r && (!best || r.since < best.since)) best = r; }
+        for (const p of c.phones) { const r = regByPhone[p]; if (r && (!best || r.since < best.since)) best = r; }
+        if (!best) continue;
+        for (const e of c.emails) {
+            if (e !== best.email && !(e in regByEmail) && !(e in aliases)) aliases[e] = best.email;
         }
-        // 3) Per cluster: find the earliest tagged registrant member; alias the cluster's
-        //    OTHER (non-registrant) emails to that registrant's email.
-        for (const root in clusters) {
-            const c = clusters[root];
-            let best = null;
-            for (const e of c.emails) { const r = regByEmail[e]; if (r && (!best || r.since < best.since)) best = r; }
-            for (const p of c.phones) { const r = regByPhone[p]; if (r && (!best || r.since < best.since)) best = r; }
-            if (!best) continue;
-            for (const e of c.emails) {
-                if (e !== best.email && !(e in regByEmail) && !(e in aliases)) aliases[e] = best.email;
-            }
-        }
-    } catch { /* tables missing → no stitch aliases */ }
-    b.stitchAliases = aliases; b.stitchAliasesAt = now;
+    }
     return aliases;
+}
+async function getStitchAliases(funnel) {
+    return swrMap(funnel, 'stitchAliases', buildStitchAliases);
 }
 
 // Combined email-canonicalization map for variant attribution: ambient stitch aliases
@@ -2384,6 +2427,8 @@ app.post('/api/cache/clear', requireAuth, async (req, res) => {
     const daysBefore = Object.keys(bucket.dedupCounts).length;
     bucket.dedupCounts = {};
     bucket.dedupTimestamps = {};
+    bucket.stitchAliases = undefined;   // identity-graph maps too — "clear" means
+    bucket.trackingPhones = undefined;  // recompute everything (next request rebuilds)
     invalidateMetricsCache(req.funnel);
     invalidateInsightsCache(req.funnel);
     console.log(`🧹 Cache[${req.funnel}]: full clear by ${req.user.email} (${daysBefore} days flushed)`);
