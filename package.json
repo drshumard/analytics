@@ -27,6 +27,7 @@
     "node-cron": "^3.0.3",
     "react-datepicker": "^9.1.0",
     "supabase": "^2.106.0",
+    "thinking-orbs": "^0.2.0",
     "ws": "^8.21.0"
   },
   "devDependencies": {
