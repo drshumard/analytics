@@ -219,7 +219,8 @@ async function buildTrackingPhones(funnel) {
         const { data, error } = await clientFor(funnel).from('tracking_contacts')
             .select('email, phone').not('phone', 'is', null).range(from, from + page - 1);
         if (error) {
-            if (/does not exist/i.test(error.message)) return map; // schema has no tracking tables → no enrichment
+            // Postgres says "does not exist"; PostgREST says "Could not find the table … in the schema cache"
+            if (/does not exist|could not find the table/i.test(error.message)) return map; // schema has no tracking tables → no enrichment
             throw new Error(`tracking_contacts phones fetch failed: ${error.message}`); // transient → keep previous copy
         }
         if (!data || !data.length) break;
@@ -285,7 +286,8 @@ async function buildStitchAliases(funnel) {
             const { data, error } = await sb.from('tracking_contacts')
                 .select('contact_id, email, phone, merged_into').range(from, from + page - 1);
             if (error) {
-                if (/does not exist/i.test(error.message)) return aliases; // schema has no tracking tables
+                // Postgres says "does not exist"; PostgREST says "Could not find the table … in the schema cache"
+                if (/does not exist|could not find the table/i.test(error.message)) return aliases; // schema has no tracking tables
                 throw new Error(`tracking_contacts fetch failed: ${error.message}`); // transient → keep previous copy
             }
             if (!data || !data.length) break;
