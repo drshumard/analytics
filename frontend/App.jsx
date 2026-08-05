@@ -837,6 +837,9 @@ export default function App() {
   const [delCM, setDelCM] = useState(null);
   const [editRow, setEditRow] = useState(null);
   const [search, setSearch] = useState("");
+  useEffect(() => {
+    if (isMobile) setSearch("");
+  }, [isMobile]);
   const [events, setEvents] = useState([]);
   const [evFilter, setEvFilter] = useState("");
   // CRM (people spine: tracking_contacts ⋈ events by email)
@@ -1720,22 +1723,26 @@ export default function App() {
                     ))}
                   </div>
                 )}
-                {isAdmin && (activeFunnel === "native" || activeFunnel === "analytics") && (
-                  <SplitTestSettings start={abTestStart} onStartNow={startAbTestNow} onClear={clearAbTest} onRegPages={() => setRegMapOpen(true)} />
-                )}
-                <button style={S.btnLight} onClick={() => setColEditorOpen(true)}><I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" size={14} stroke="var(--ds-gray-700)" /> Edit Columns</button>
-                <div
-                  className="lens-menu-root"
-                  ref={lensMenuRef}
-                  onBlur={() => requestAnimationFrame(() => { if (!lensMenuRef.current?.contains(document.activeElement)) setLensMenuOpen(false); })}
-                  onKeyDown={event => {
-                    if (event.key !== "Escape" || !lensMenuOpen) return;
-                    event.preventDefault();
-                    event.stopPropagation();
-                    lensMenuRef.current?.querySelector(".lens-menu-trigger")?.focus();
-                    setLensMenuOpen(false);
-                  }}
-                >
+                <div className="overview-utility-actions">
+                  {isAdmin && (activeFunnel === "native" || activeFunnel === "analytics") && (
+                    <SplitTestSettings start={abTestStart} onStartNow={startAbTestNow} onClear={clearAbTest} onRegPages={() => setRegMapOpen(true)} />
+                  )}
+                  <button type="button" className="column-editor-trigger" style={S.btnLight} aria-label="Edit columns" title="Edit columns" onClick={() => setColEditorOpen(true)}>
+                    <I d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" size={14} stroke="var(--ds-gray-700)" />
+                    <span className="toolbar-action-label">Edit Columns</span>
+                  </button>
+                  <div
+                    className="lens-menu-root"
+                    ref={lensMenuRef}
+                    onBlur={() => requestAnimationFrame(() => { if (!lensMenuRef.current?.contains(document.activeElement)) setLensMenuOpen(false); })}
+                    onKeyDown={event => {
+                      if (event.key !== "Escape" || !lensMenuOpen) return;
+                      event.preventDefault();
+                      event.stopPropagation();
+                      lensMenuRef.current?.querySelector(".lens-menu-trigger")?.focus();
+                      setLensMenuOpen(false);
+                    }}
+                  >
                   <button
                     type="button"
                     className="lens-menu-trigger"
@@ -1743,12 +1750,18 @@ export default function App() {
                     aria-haspopup="dialog"
                     aria-expanded={lensMenuOpen}
                     aria-controls="lens-menu-popover"
+                    aria-label={`Metric lens: ${activeLens.name}`}
+                    title={`Metric lens: ${activeLens.name}`}
                     onClick={() => {
                       const nextOpen = !lensMenuOpen;
                       setLensMenuOpen(nextOpen);
                       if (nextOpen) requestAnimationFrame(() => lensMenuRef.current?.querySelector(".lens-menu-popover button")?.focus());
                     }}
-                  ><I d="M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" size={14} stroke="var(--ds-gray-700)" /> {activeLens.name} ▾</button>
+                  >
+                    <I d="M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" size={14} stroke="var(--ds-gray-700)" />
+                    <span className="toolbar-action-label">{activeLens.name}</span>
+                    <span className="toolbar-action-caret" aria-hidden="true">▾</span>
+                  </button>
                   {lensMenuOpen && (
                     <div id="lens-menu-popover" className="lens-menu-popover" role="dialog" aria-label="Metric lenses">
                       <div style={{ padding: "6px 14px", fontSize: 10, fontWeight: 700, color: "var(--ds-gray-600)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Lenses</div>
@@ -1772,8 +1785,9 @@ export default function App() {
                       )}
                     </div>
                   )}
+                  </div>
                 </div>
-                <div className="search-wrap" style={S.searchWrap}><I d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" size={15} stroke="var(--ds-gray-600)" /><input aria-label="Search records" style={S.searchInput} placeholder="Search records…" value={search} onChange={e => setSearch(e.target.value)} /></div>
+                {!isMobile && <div className="search-wrap overview-search" style={S.searchWrap}><I d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" size={15} stroke="var(--ds-gray-600)" /><input aria-label="Search records" style={S.searchInput} placeholder="Search records…" value={search} onChange={e => setSearch(e.target.value)} /></div>}
               </div>
             </div>
 
@@ -4730,6 +4744,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--ds-border-hover)!impo
 .toolbar-row{padding:12px;background:var(--ds-background-100);border:1px solid var(--ds-border);border-radius:var(--ds-radius-large)}
 .overview-toolbar{justify-content:center!important;align-items:center!important}
 .overview-toolbar .toolbar-controls{justify-content:center!important}
+.overview-utility-actions{display:contents}
 .list-board-toggle,.variant-toggle{min-height:34px}
 .list-board-toggle button,.variant-toggle button{border:0;margin:0;min-height:28px}
 .search-wrap:focus-within{border-color:var(--ds-border-hover)!important;box-shadow:0 0 0 3px rgba(0,0,0,.06)!important}
@@ -4851,10 +4866,19 @@ code,pre{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
   .summary-card{min-height:138px}
   .summary-sparkline{width:calc(100% + 28px);height:58px;margin:6px -14px -12px}
   .toolbar-row{padding:10px!important}
-  .overview-toolbar .toolbar-controls{display:flex!important;justify-content:center!important;grid-template-columns:none!important}
-  .overview-toolbar .search-wrap{flex:1 1 100%}
-  .overview-toolbar .split-test-settings{flex:1 1 100%;display:flex;justify-content:center}
-  .overview-toolbar .lens-menu-root{flex:1 1 100%;display:flex;justify-content:center}
+  .overview-toolbar .toolbar-controls{display:flex!important;justify-content:center!important;align-items:center!important;gap:8px!important;grid-template-columns:none!important}
+  .overview-toolbar .overview-search{display:none!important}
+  .overview-utility-actions{position:relative;display:flex;flex:1 1 100%;align-items:center;justify-content:center;gap:8px}
+  .overview-utility-actions .column-editor-trigger{order:1}
+  .overview-utility-actions .split-test-settings{position:static;order:2;flex:0 0 auto;display:block}
+  .overview-utility-actions .lens-menu-root{position:static;order:3;flex:0 0 auto;display:block}
+  .overview-utility-actions .column-editor-trigger,.overview-utility-actions .lens-menu-trigger{
+    width:34px;min-width:34px;height:34px;min-height:34px;padding:0!important;justify-content:center;gap:0
+  }
+  .overview-utility-actions .toolbar-action-label,.overview-utility-actions .toolbar-action-caret{display:none}
+  .overview-utility-actions .split-test-popover,.overview-utility-actions .lens-menu-popover{
+    left:50%;right:auto;max-width:calc(100vw - 48px);transform:translateX(-50%)
+  }
   .overview-table-wrap{width:calc(100% + 28px)!important;margin-inline:-14px}
   .variant-toggle{display:flex!important;width:100%;overflow-x:auto}
   .variant-toggle button{flex:1;justify-content:center;white-space:nowrap}
