@@ -708,9 +708,10 @@ function SplitTestSettings({ start, onStartNow, onClear, onRegPages }) {
 
   return (
     <div ref={rootRef} className={`split-test-settings${open ? " is-open" : ""}`} onBlur={() => requestAnimationFrame(() => { if (!rootRef.current?.contains(document.activeElement)) setOpen(false); })}>
-      <button ref={triggerRef} type="button" className="split-test-trigger" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(current => !current)}>
+      <button ref={triggerRef} type="button" className="split-test-trigger" aria-label="A/B test settings" title="A/B test settings" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(current => !current)}>
         <I d="M4 7h10M18 7h2M4 17h2m4 0h10M14 4v6M8 14v6" size={14} />
-        <span>A/B settings</span>
+        <span className="split-test-label-desktop">A/B settings</span>
+        <span className="split-test-label-mobile" aria-hidden="true">A/B</span>
         <I d="M6 9l6 6 6-6" size={12} />
       </button>
       {open && (
@@ -4591,6 +4592,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--ds-border-hover)!impo
   font-size:12px;font-weight:550;box-shadow:var(--ds-shadow-small)
 }
 .split-test-trigger:hover,.split-test-settings.is-open .split-test-trigger{border-color:var(--ds-border-hover);background:var(--ds-gray-100);color:var(--ds-gray-900)}
+.split-test-label-mobile{display:none}
 .split-test-trigger>svg:last-child{transition:transform 150ms ease}
 .split-test-settings.is-open .split-test-trigger>svg:last-child{transform:rotate(180deg)}
 .split-test-popover{
@@ -4866,9 +4868,10 @@ code,pre{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
   .summary-card{min-height:138px}
   .summary-sparkline{width:calc(100% + 28px);height:58px;margin:6px -14px -12px}
   .toolbar-row{padding:10px!important}
-  .overview-toolbar .toolbar-controls{display:flex!important;justify-content:center!important;align-items:center!important;gap:8px!important;grid-template-columns:none!important}
+  .overview-toolbar{position:relative;padding:6px!important}
+  .overview-toolbar .toolbar-controls{display:flex!important;flex-wrap:nowrap!important;justify-content:center!important;align-items:center!important;gap:6px!important;grid-template-columns:none!important}
   .overview-toolbar .overview-search{display:none!important}
-  .overview-utility-actions{position:relative;display:flex;flex:1 1 100%;align-items:center;justify-content:center;gap:8px}
+  .overview-utility-actions{position:static;display:flex;flex:0 0 auto;align-items:center;justify-content:center;gap:4px}
   .overview-utility-actions .column-editor-trigger{order:1}
   .overview-utility-actions .split-test-settings{position:static;order:2;flex:0 0 auto;display:block}
   .overview-utility-actions .lens-menu-root{position:static;order:3;flex:0 0 auto;display:block}
@@ -4876,12 +4879,17 @@ code,pre{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
     width:34px;min-width:34px;height:34px;min-height:34px;padding:0!important;justify-content:center;gap:0
   }
   .overview-utility-actions .toolbar-action-label,.overview-utility-actions .toolbar-action-caret{display:none}
+  .overview-utility-actions .split-test-trigger{padding:0 7px;gap:5px}
+  .overview-utility-actions .split-test-label-desktop{display:none}
+  .overview-utility-actions .split-test-label-mobile{display:inline}
+  .overview-utility-actions .split-test-trigger>svg:last-child{display:none}
   .overview-utility-actions .split-test-popover,.overview-utility-actions .lens-menu-popover{
     left:50%;right:auto;max-width:calc(100vw - 48px);transform:translateX(-50%)
   }
   .overview-table-wrap{width:calc(100% + 28px)!important;margin-inline:-14px}
-  .variant-toggle{display:flex!important;width:100%;overflow-x:auto}
-  .variant-toggle button{flex:1;justify-content:center;white-space:nowrap}
+  .variant-toggle{display:flex!important;flex:0 1 auto;width:auto!important;min-width:0;overflow:visible;padding:2px!important;gap:1px!important}
+  .variant-toggle button{flex:0 0 auto!important;height:28px;padding:0 6px!important;justify-content:center;white-space:nowrap;font-size:11.5px!important}
+  .variant-toggle button:nth-child(2),.variant-toggle button:nth-child(3){width:28px;padding-inline:0!important}
   .boardGrid{grid-template-columns:1fr!important}
   .form-section-grid{grid-template-columns:1fr}
   .repeater-row{flex-wrap:wrap}
@@ -4907,8 +4915,19 @@ code,pre{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
   .floating-insights-chat{height:100%!important}
 }
 @media (max-width:480px){
-  .variant-toggle{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));overflow:visible}
-  .variant-toggle button{width:100%}
+  .overview-toolbar .variant-toggle{display:flex!important}
+  .overview-toolbar .variant-toggle button{width:auto}
+  .overview-toolbar .variant-toggle button:nth-child(2),.overview-toolbar .variant-toggle button:nth-child(3){width:28px}
+}
+@media (max-width:360px){
+  .overview-toolbar .toolbar-controls{gap:4px!important}
+  .overview-utility-actions{gap:3px}
+  .overview-utility-actions .column-editor-trigger,.overview-utility-actions .lens-menu-trigger,.overview-utility-actions .split-test-trigger{
+    width:32px;min-width:32px;height:32px;min-height:32px;padding:0!important
+  }
+  .overview-utility-actions .split-test-label-mobile{display:none}
+  .overview-toolbar .variant-toggle button{height:27px;padding-inline:5px!important;font-size:11px!important}
+  .overview-toolbar .variant-toggle button:nth-child(2),.overview-toolbar .variant-toggle button:nth-child(3){width:27px;padding-inline:0!important}
 }
 @media (max-width:380px){
   .summary-strip{grid-template-columns:1fr!important}
