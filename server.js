@@ -4213,6 +4213,80 @@ async function fbGraphGet(pathOrUrl, params) {
 
 const fbCents = (v) => (v === undefined || v === null || v === '') ? null : Math.round(parseInt(v, 10)) / 100;
 const fbNum = (v) => (v === undefined || v === null) ? null : Number(v);
+const fbRound2 = (v) => Math.round(v * 100) / 100;
+
+const FB_BREAKDOWNS = ['age', 'gender', 'publisher_platform', 'platform_position', 'device_platform', 'country', 'region'];
+
+// Meta's actions list holds 30+ overlapping action types (purchase ≈ omni_purchase
+// ≈ offsite_conversion.fb_pixel_purchase). Keep only the canonical rollups so
+// nothing double-counts.
+const FB_ACTION_KEYS = {
+    purchase: 'purchases',
+    lead: 'leads',
+    complete_registration: 'registrations',
+    landing_page_view: 'landing_page_views',
+    initiate_checkout: 'checkouts_started',
+};
+function fbConversions(ins, spendUsd) {
+    const out = {};
+    for (const a of ins.actions || []) {
+        const key = FB_ACTION_KEYS[a.action_type];
+        if (key) out[key] = (out[key] || 0) + Number(a.value || 0);
+    }
+    const tp = ins.video_thruplay_watched_actions?.[0];
+    if (tp) out.thruplays = Number(tp.value || 0);
+    if (spendUsd > 0) {
+        if (out.purchases) out.cost_per_purchase_usd = fbRound2(spendUsd / out.purchases);
+        if (out.leads) out.cost_per_lead_usd = fbRound2(spendUsd / out.leads);
+        if (out.registrations) out.cost_per_registration_usd = fbRound2(spendUsd / out.registrations);
+    }
+    return Object.keys(out).length ? out : null;
+}
+
+// Ad set targeting, compacted: the audience definition without Meta's sprawl.
+function fbTargeting(t) {
+    if (!t) return null;
+    const g = t.geo_locations || {};
+    const aud = (t.custom_audiences || []).map(a => a.name).filter(Boolean);
+    const excl = (t.excluded_custom_audiences || []).map(a => a.name).filter(Boolean);
+    return {
+        age: `${t.age_min || 18}-${!t.age_max || t.age_max >= 65 ? '65+' : t.age_max}`,
+        gender: !t.genders?.length || (t.genders.includes(1) && t.genders.includes(2)) ? 'all' : t.genders.includes(1) ? 'male' : 'female',
+        ...(g.countries?.length ? { countries: g.countries } : {}),
+        ...(g.regions?.length ? { regions: g.regions.map(r => r.name).slice(0, 10) } : {}),
+        ...(g.cities?.length ? { cities: g.cities.map(c => c.name).slice(0, 10) } : {}),
+        ...(t.publisher_platforms?.length ? { platforms: t.publisher_platforms } : {}),
+        ...(aud.length ? { custom_audiences: aud.slice(0, 6) } : {}),
+        ...(excl.length ? { excluded_audiences: excl.slice(0, 6) } : {}),
+    };
+}
+
+// Creative content, compacted: what the ad actually says and where it sends
+// people. Dynamic creatives (asset_feed_spec) surface their variant texts too.
+// Image/thumbnail URLs are omitted on purpose — huge signed URLs, no analytical value.
+function fbCreative(c) {
+    if (!c) return null;
+    const oss = c.object_story_spec || {};
+    const story = oss.link_data || oss.video_data || {};
+    const cta = story.call_to_action || {};
+    const afs = c.asset_feed_spec || {};
+    const trunc = (s, n = 300) => s ? String(s).slice(0, n) : null;
+    const media = oss.video_data ? 'video'
+        : oss.link_data ? (oss.link_data.child_attachments?.length ? 'carousel' : 'image')
+        : (afs.videos?.length ? 'video' : afs.images?.length ? 'image' : null);
+    const out = {
+        headline: c.title || story.name || afs.titles?.[0]?.text || null,
+        body: trunc(c.body || story.message || afs.bodies?.[0]?.text),
+        ...(cta.type ? { cta: cta.type } : {}),
+        ...(cta.value?.link || story.link ? { destination: cta.value?.link || story.link } : {}),
+        ...(media ? { media } : {}),
+    };
+    const altHeadlines = (afs.titles || []).slice(1, 4).map(t => t.text).filter(Boolean);
+    const altBodies = (afs.bodies || []).slice(1, 3).map(b => trunc(b.text, 200)).filter(Boolean);
+    if (altHeadlines.length) out.alt_headlines = altHeadlines;
+    if (altBodies.length) out.alt_bodies = altBodies;
+    return out;
+}
 
 async function getFbAds(funnel, input) {
     if (!FB_ADS_ENABLED) return { error: 'Facebook Ads not configured (FB_ACCESS_TOKEN / FB_AD_ACCOUNT_ID)' };
@@ -4236,18 +4310,22 @@ async function getFbAds(funnel, input) {
     const until = input.date_to || todayLA;
     if (!dateOk(since) || !dateOk(until)) return { error: 'date_from/date_to must be YYYY-MM-DD' };
 
+    const breakdown = input.breakdown ? String(input.breakdown) : null;
+    if (breakdown && !FB_BREAKDOWNS.includes(breakdown)) return { error: `breakdown must be one of: ${FB_BREAKDOWNS.join(', ')}` };
+
     const FIELDS = {
         campaign: 'id,name,effective_status,objective,daily_budget,lifetime_budget,start_time,stop_time',
-        adset: 'id,name,effective_status,campaign{name},daily_budget,lifetime_budget,optimization_goal',
-        ad: `id,name,effective_status,adset{name},campaign{name}${input.include_creative ? ',creative{title,body}' : ''}`,
+        adset: 'id,name,effective_status,campaign{name},daily_budget,lifetime_budget,optimization_goal,targeting{age_min,age_max,genders,geo_locations{countries,regions,cities},publisher_platforms,custom_audiences,excluded_custom_audiences}',
+        ad: `id,name,effective_status,adset{name},campaign{name}${input.include_creative ? ',creative{title,body,object_story_spec,asset_feed_spec}' : ''}`,
     };
-    const INSIGHT_FIELDS = 'impressions,reach,frequency,clicks,inline_link_clicks,ctr,cpc,cpm,spend';
-    const fields = `${FIELDS[level]},insights.time_range({"since":"${since}","until":"${until}"}){${INSIGHT_FIELDS}}`;
+    // reach/frequency don't sum across breakdown segments — only request them unsplit.
+    const INSIGHT_FIELDS = `impressions,clicks,inline_link_clicks,ctr,cpc,cpm,spend,actions,video_thruplay_watched_actions${breakdown ? '' : ',reach,frequency'}`;
+    const fields = `${FIELDS[level]},insights.time_range({"since":"${since}","until":"${until}"})${breakdown ? `.breakdowns(${breakdown}).limit(50)` : ''}{${INSIGHT_FIELDS}}`;
 
     // parent_id scopes children: a campaign id for adsets/ads, or an adset id for ads.
     const edgeBase = input.parent_id ? `${String(input.parent_id).replace(/[^\d_]/g, '')}/${EDGES[level]}` : `${process.env.FB_AD_ACCOUNT_ID}/${EDGES[level]}`;
 
-    const signature = `${edgeBase}|${status}|${since}|${until}|${input.include_creative ? 'c' : ''}`;
+    const signature = `${edgeBase}|${status}|${since}|${until}|${input.include_creative ? 'c' : ''}|${breakdown || ''}`;
     const hit = _fbAdsCache.get(signature);
     let raw;
     if (hit && Date.now() - hit.at < FB_ADS_CACHE_TTL_MS) {
@@ -4266,8 +4344,51 @@ async function getFbAds(funnel, input) {
         if (_fbAdsCache.size > 30) _fbAdsCache.delete(_fbAdsCache.keys().next().value); // bound the cache
     }
 
+    const mapRow = (ins) => ({
+        impressions: fbNum(ins.impressions),
+        ...(ins.reach !== undefined ? { reach: fbNum(ins.reach) } : {}),
+        ...(ins.frequency ? { frequency: fbRound2(Number(ins.frequency)) } : {}),
+        clicks: fbNum(ins.clicks),
+        link_clicks: fbNum(ins.inline_link_clicks),
+        ctr_pct: ins.ctr ? fbRound2(Number(ins.ctr)) : null,
+        cpc_usd: ins.cpc ? fbRound2(Number(ins.cpc)) : null,
+        cpm_usd: ins.cpm ? fbRound2(Number(ins.cpm)) : null,
+        spend_usd: fbNum(ins.spend),
+        conversions: fbConversions(ins, Number(ins.spend) || 0),
+    });
+
     let entities = raw.map(e => {
-        const ins = e.insights?.data?.[0];
+        const rows = e.insights?.data || [];
+        let insights = null, bySegment;
+        if (!breakdown) {
+            if (rows[0]) insights = mapRow(rows[0]);
+        } else if (rows.length) {
+            // sum the segment rows for the entity summary, keep the split alongside
+            const sum = { impressions: 0, clicks: 0, inline_link_clicks: 0, spend: 0, actions: [], video_thruplay_watched_actions: [] };
+            for (const r of rows) {
+                sum.impressions += Number(r.impressions) || 0;
+                sum.clicks += Number(r.clicks) || 0;
+                sum.inline_link_clicks += Number(r.inline_link_clicks) || 0;
+                sum.spend += Number(r.spend) || 0;
+                sum.actions.push(...(r.actions || []));
+                if (r.video_thruplay_watched_actions?.[0]) sum.video_thruplay_watched_actions.push(...r.video_thruplay_watched_actions);
+            }
+            sum.video_thruplay_watched_actions = sum.video_thruplay_watched_actions.length
+                ? [{ value: sum.video_thruplay_watched_actions.reduce((t, a) => t + (Number(a.value) || 0), 0) }]
+                : [];
+            sum.spend = fbRound2(sum.spend);
+            if (sum.impressions > 0) { sum.ctr = sum.clicks / sum.impressions * 100; sum.cpm = sum.spend / sum.impressions * 1000; }
+            if (sum.clicks > 0) sum.cpc = sum.spend / sum.clicks;
+            insights = mapRow(sum);
+            bySegment = rows.map(r => ({
+                segment: r[breakdown],
+                impressions: fbNum(r.impressions),
+                clicks: fbNum(r.clicks),
+                link_clicks: fbNum(r.inline_link_clicks),
+                spend_usd: fbNum(r.spend),
+                conversions: fbConversions(r, Number(r.spend) || 0),
+            }));
+        }
         return {
             id: e.id,
             name: e.name,
@@ -4280,18 +4401,10 @@ async function getFbAds(funnel, input) {
             ...(fbCents(e.lifetime_budget) !== null ? { lifetime_budget_usd: fbCents(e.lifetime_budget) } : {}),
             ...(e.start_time ? { start_time: e.start_time } : {}),
             ...(e.stop_time ? { stop_time: e.stop_time } : {}),
-            ...(e.creative ? { creative: { title: e.creative.title || null, body: e.creative.body ? String(e.creative.body).slice(0, 300) : null } } : {}),
-            insights: ins ? {
-                impressions: fbNum(ins.impressions),
-                reach: fbNum(ins.reach),
-                frequency: ins.frequency ? Math.round(Number(ins.frequency) * 100) / 100 : null,
-                clicks: fbNum(ins.clicks),
-                link_clicks: fbNum(ins.inline_link_clicks),
-                ctr_pct: ins.ctr ? Math.round(Number(ins.ctr) * 100) / 100 : null,
-                cpc_usd: ins.cpc ? Math.round(Number(ins.cpc) * 100) / 100 : null,
-                cpm_usd: ins.cpm ? Math.round(Number(ins.cpm) * 100) / 100 : null,
-                spend_usd: fbNum(ins.spend),
-            } : null, // no delivery in the date range
+            ...(e.targeting ? { targeting: fbTargeting(e.targeting) } : {}),
+            ...(e.creative ? { creative: fbCreative(e.creative) } : {}),
+            insights, // null = no delivery in the date range
+            ...(bySegment ? { [`by_${breakdown}`]: bySegment } : {}),
         };
     });
     if (input.name_filter) {
@@ -4301,28 +4414,67 @@ async function getFbAds(funnel, input) {
     entities.sort((a, b) => (b.insights?.spend_usd || 0) - (a.insights?.spend_usd || 0));
 
     const totals = { impressions: 0, clicks: 0, link_clicks: 0, spend_usd: 0 };
+    const totalConv = {};
+    const sumConv = (acc, conv) => {
+        for (const [k, v] of Object.entries(conv || {})) {
+            if (k.startsWith('cost_per_')) continue;
+            acc[k] = (acc[k] || 0) + v;
+        }
+    };
     for (const e of entities) {
         if (!e.insights) continue;
         totals.impressions += e.insights.impressions || 0;
         totals.clicks += e.insights.clicks || 0;
         totals.link_clicks += e.insights.link_clicks || 0;
         totals.spend_usd += e.insights.spend_usd || 0;
+        sumConv(totalConv, e.insights.conversions);
     }
-    totals.spend_usd = Math.round(totals.spend_usd * 100) / 100;
+    totals.spend_usd = fbRound2(totals.spend_usd);
     if (totals.impressions > 0) {
-        totals.ctr_pct = Math.round(totals.clicks / totals.impressions * 10000) / 100;
-        totals.cpm_usd = Math.round(totals.spend_usd / totals.impressions * 100000) / 100;
+        totals.ctr_pct = fbRound2(totals.clicks / totals.impressions * 100);
+        totals.cpm_usd = fbRound2(totals.spend_usd / totals.impressions * 1000);
     }
-    if (totals.clicks > 0) totals.cpc_usd = Math.round(totals.spend_usd / totals.clicks * 100) / 100;
+    if (totals.clicks > 0) totals.cpc_usd = fbRound2(totals.spend_usd / totals.clicks);
+    if (Object.keys(totalConv).length) {
+        if (totalConv.purchases) totalConv.cost_per_purchase_usd = fbRound2(totals.spend_usd / totalConv.purchases);
+        if (totalConv.leads) totalConv.cost_per_lead_usd = fbRound2(totals.spend_usd / totalConv.leads);
+        if (totalConv.registrations) totalConv.cost_per_registration_usd = fbRound2(totals.spend_usd / totalConv.registrations);
+        totals.conversions = totalConv;
+    }
+
+    // Account-wide split across all returned entities, per breakdown segment —
+    // the direct answer to "which age bucket / placement actually converts".
+    let totalsBySegment;
+    if (breakdown) {
+        const seg = new Map();
+        for (const e of entities) {
+            for (const r of e[`by_${breakdown}`] || []) {
+                const s = seg.get(r.segment) || { segment: r.segment, impressions: 0, clicks: 0, link_clicks: 0, spend_usd: 0, conversions: {} };
+                s.impressions += r.impressions || 0;
+                s.clicks += r.clicks || 0;
+                s.link_clicks += r.link_clicks || 0;
+                s.spend_usd += r.spend_usd || 0;
+                sumConv(s.conversions, r.conversions);
+                seg.set(r.segment, s);
+            }
+        }
+        totalsBySegment = [...seg.values()].sort((a, b) => b.spend_usd - a.spend_usd).map(s => ({
+            ...s,
+            spend_usd: fbRound2(s.spend_usd),
+            conversions: Object.keys(s.conversions).length ? s.conversions : null,
+        }));
+    }
 
     return {
-        READ_ME: 'Live from the Meta Marketing API. Budgets are USD (CBO campaigns hold budget at campaign level — their ad sets show none). insights:null = no delivery in the range. Totals sum the returned entities; reach is NOT totaled (audiences overlap). For canonical historical daily spend use get_metrics (fb_spend) — small discrepancies vs this tool are normal (attribution timing).',
+        READ_ME: 'Live from the Meta Marketing API. Budgets are USD (CBO campaigns hold budget at campaign level — their ad sets show none). insights:null = no delivery in the range. Totals sum the returned entities; reach is NOT totaled (audiences overlap). conversions are META-ATTRIBUTED pixel events (purchases/leads/registrations…) — useful for relative performance, but the funnel database (get_metrics) stays canonical for spend, registrations, and purchases; discrepancies are normal (attribution windows).',
         level,
         status_filter: status,
         date_range: { since, until },
+        ...(breakdown ? { breakdown } : {}),
         count: entities.length,
         ...(raw.length >= 300 ? { truncated_at_300: true } : {}),
         totals,
+        ...(totalsBySegment ? { totals_by_segment: totalsBySegment } : {}),
         entities,
     };
 }
@@ -4536,17 +4688,18 @@ if (AVATAR_ENABLED) INSIGHTS_TOOLS.push({
 // Facebook Ads tool — registered only when the ads token is configured.
 if (FB_ADS_ENABLED) INSIGHTS_TOOLS.push({
     name: 'get_fb_ads',
-    description: 'LIVE Facebook Ads structure and delivery from the Meta Marketing API: which campaigns / ad sets / ads are running (or paused), with budgets, objectives, and per-entity performance over a date range — impressions, reach, frequency, clicks, link clicks, CTR, CPC, CPM, spend — plus recomputed totals. Use for "what ads are running right now", "which campaign gets the most impressions", "CTR by ad set", "what does our best ad say" (level:"ad" + include_creative for headline/body text). Defaults: active entities, last 7 days. Drill down with parent_id (a campaign id → its ad sets/ads). Sorted by spend. NOTE: historical daily spend questions should use get_metrics (fb_spend is canonical); this tool is for live structure and per-campaign/ad performance. Main funnel only (native runs Taboola). Results cached ~5 min.',
+    description: 'LIVE Facebook Ads from the Meta Marketing API at EVERY level of the hierarchy: campaigns → ad sets → individual ads and their creatives. Per entity over any date range: impressions, reach, frequency, clicks, link clicks, CTR, CPC, CPM, spend, PLUS Meta-pixel conversions (purchases, leads, registrations, landing-page views, checkouts started, video thruplays) with cost-per-purchase/lead/registration. Level "adset" includes the audience targeting (age, gender, geo, platforms, custom/lookalike audiences). Level "ad" + include_creative returns the full creative: headline, body text, CTA, destination URL, media type, and dynamic-creative variants. Optional breakdown splits every entity by age, gender, publisher_platform, platform_position, device_platform, country, or region — with account-wide totals_by_segment. DRILL DOWN rather than stopping at campaigns: answer "which audience/ad/creative works" by calling level:"adset" or level:"ad" (parent_id scopes to one campaign or ad set), and demographic/placement questions with breakdown. Defaults: active entities, last 7 days, sorted by spend. NOTE: conversions here are Meta-attributed; get_metrics (fb_spend, registrations, purchases) stays canonical for historical funnel numbers. Main funnel only (native runs Taboola). Results cached ~5 min.',
     input_schema: {
         type: 'object',
         properties: {
-            level:            { type: 'string', enum: ['campaign', 'adset', 'ad'], description: 'Reporting level (default: campaign)' },
+            level:            { type: 'string', enum: ['campaign', 'adset', 'ad'], description: 'Reporting level (default: campaign). Use "adset" for audiences/targeting, "ad" for individual ads and creatives.' },
             status:           { type: 'string', enum: ['active', 'paused', 'all'], description: 'Delivery status filter (default: active — what is currently running)' },
             date_from:        { type: 'string', description: 'Insights range start YYYY-MM-DD (default: 7 days ago)' },
             date_to:          { type: 'string', description: 'Insights range end YYYY-MM-DD (default: today)' },
             parent_id:        { type: 'string', description: 'Scope to children of one entity: a campaign id (level adset/ad) or ad set id (level ad).' },
             name_filter:      { type: 'string', description: 'Case-insensitive substring match on the entity name.' },
-            include_creative: { type: 'boolean', description: 'level "ad" only: include the creative headline + body text (truncated).' },
+            include_creative: { type: 'boolean', description: 'level "ad" only: include the full creative (headline, body, CTA, destination link, media type, dynamic-creative variants).' },
+            breakdown:        { type: 'string', enum: ['age', 'gender', 'publisher_platform', 'platform_position', 'device_platform', 'country', 'region'], description: 'Split each entity\'s delivery by this dimension (adds by_<breakdown> per entity + account-wide totals_by_segment). E.g. "which age group buys" → breakdown:"age".' },
         },
     },
 });
@@ -4738,7 +4891,7 @@ INSTRUCTIONS:
   • \`describe_journey_data\` — live schema + every \`events.metadata\` key (with samples) + enum values. Call it FIRST when unsure what's queryable, so you never guess a column or metadata key.${AVATAR_ENABLED ? `
   • \`get_customer_avatar\` — the demographic CUSTOMER AVATAR (gender split, age stats + buckets, top cities/states) for any segment: event_type + dates, purchase_source, journey-stage criteria (reached_stages/not_reached_stages — e.g. attended but never bought), or an email list from any other tool. Add group_by_stage:true to ALSO see where the same people sit in the funnel (furthest stage, with a mini-avatar per stage) — one call answers "who are they AND how far did they get". Use for "who is my typical buyer", "average age of purchasers", "avatar of no-shows", source comparisons (one call per source). ALWAYS quote profiles_found vs segment_size — people without an intake profile are absent from the splits, so never project the percentages onto them. The per-email data is joinable in run_sql via the contact_demographics table.` : ''}
   • \`run_sql\` against \`crm_people\` / \`events.metadata\` for anything else (webinar-slot popularity, attribution, cohorts). The journey snapshot above already answers the most common ones — cite it directly when it suffices.
-${FB_ADS_ENABLED ? `- LIVE FACEBOOK ADS: \`get_fb_ads\` shows what's actually running — campaigns / ad sets / ads with budgets and delivery (impressions, reach, CTR, CPC, CPM, spend) over any date range, plus ad creative text via include_creative. Use it for "what ads are running", "which campaign/ad performs best", "what's our CTR". For historical daily spend totals keep using get_metrics — daily_metrics.fb_spend is canonical. Main funnel only.` : ''}
+${FB_ADS_ENABLED ? `- LIVE FACEBOOK ADS: \`get_fb_ads\` sees the WHOLE ads hierarchy, not just campaigns — ad sets (with their audience targeting: age/gender/geo/platforms/custom + lookalike audiences), individual ads, and full creatives (headline, body copy, CTA, destination URL) — each with delivery metrics AND Meta-pixel conversions (purchases/leads/registrations + cost-per). DIG DOWN by default: for any "what's working / what's not / why" question go past campaign level — call level:"adset" to compare audiences, level:"ad" with include_creative:true to compare the actual ads and quote their copy, parent_id to zoom into one campaign's children, and breakdown:"age"/"gender"/"publisher_platform"/"platform_position"/etc. for demographic and placement splits. A strong ads answer usually takes 2-3 calls at different levels (e.g. campaigns → the leader's ad sets → its best ads' creatives). Meta's conversion counts are Meta-attributed — for canonical spend/registrations/purchases keep using get_metrics; small gaps between the two are normal. Main funnel only.` : ''}
 - For statistical work (forecasts, regressions, anomaly detection, t-tests), use the code execution tool. The data you've fetched is available as variables.
 - Give specific, data-backed insights. Reference actual numbers and dates.
 - When the user shares context worth remembering across chats (promos, definitions, business changes), use the \`remember\` tool silently.
