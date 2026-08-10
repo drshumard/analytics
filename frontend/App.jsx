@@ -3938,6 +3938,11 @@ function InsightsChat({ flash, isMobile, activeFunnel, userId, mode = "insights"
       saveChat(chatId, fullMsgs);
     } catch (e) {
       flash(e.message, "err");
+      // Leave the failure in the thread — a toast alone reads as "no response".
+      const errMsgs = [...newMsgs, { role: "assistant", content: `⚠️ ${e.message}` }];
+      if (deletedChatIdsRef.current.has(chatId)) return;
+      if (activeIdRef.current === chatId) setChatMsgs(errMsgs);
+      saveChat(chatId, errMsgs);
     } finally {
       setChatLoading(false);
     }

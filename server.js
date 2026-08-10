@@ -3347,6 +3347,19 @@ async function getInsightsMetrics(funnel, from, to) {
     return all.filter(r => (!from || r.date >= from) && (!to || r.date <= to));
 }
 
+// Daily rows are wide; the AI chat asking for "all time" day-by-day once blew
+// the context window. Ranges beyond ~6 months must come pre-aggregated.
+const INSIGHTS_METRICS_MAX_DAYS = 190;
+async function getInsightsMetricsGuarded(funnel, from, to) {
+    const days = (from && to) ? (new Date(to) - new Date(from)) / 86400000 + 1 : Infinity;
+    if (days > INSIGHTS_METRICS_MAX_DAYS) {
+        return {
+            error: `Range too wide for daily rows (${from || 'open'} → ${to || 'open'} is over ${INSIGHTS_METRICS_MAX_DAYS} days). For long ranges or "all time": use get_metrics_rollup (period "week"/"month"), or run_sql with SUM/GROUP BY over daily_metrics (e.g. SELECT SUM(purchases_aibot), SUM(purchases_aibot_b) FROM daily_metrics). Daily get_metrics is for ranges up to ~6 months.`,
+        };
+    }
+    return getInsightsMetrics(funnel, from, to);
+}
+
 // Aggregates daily metrics into weekly or monthly rollups. Sums additive
 // columns; recomputes ratios from the sums so they stay correct.
 async function getInsightsRollup(funnel, period, from, to) {
@@ -4483,7 +4496,7 @@ async function getFbAds(funnel, input) {
 const INSIGHTS_TOOLS = [
     {
         name: 'get_metrics',
-        description: 'Fetch daily funnel metrics for any date range in the historical data. Returns spend, registrations, attendance, CTA stages, and purchases broken down by source. Dates use YYYY-MM-DD format in Los Angeles timezone. Safe to call with multi-month ranges; result is one row per day.',
+        description: 'Fetch daily funnel metrics for a date range up to ~6 months. Returns spend, registrations, attendance, CTA stages, and purchases broken down by source — one row per day. Dates use YYYY-MM-DD format in Los Angeles timezone. For longer ranges or "all time" questions do NOT call this: use get_metrics_rollup (weekly/monthly buckets) or run_sql with SUM/GROUP BY over daily_metrics — day-level rows over years are too large to return.',
         input_schema: {
             type: 'object',
             properties: {
@@ -4704,12 +4717,53 @@ if (FB_ADS_ENABLED) INSIGHTS_TOOLS.push({
     },
 });
 
+// Serialize a tool result under a hard size budget so no single tool call can
+// blow past the model's context window (an all-time get_metrics once returned
+// ~90k tokens; two in one turn → "prompt is too long" 400 and a dead chat).
+// Oversized results get their largest array sliced down to fit, with an explicit
+// marker so the model re-queries narrower instead of totaling partial rows.
+const TOOL_RESULT_CAP_CHARS = 100_000; // ≈25-30k tokens
+function capToolResult(out, capChars = TOOL_RESULT_CAP_CHARS) {
+    const str = JSON.stringify(out);
+    if (str.length <= capChars) return str;
+    const wrap = (obj, arrKey, total, kept) => JSON.stringify({
+        ...obj,
+        RESULT_TRUNCATED: `TRUNCATED: ${arrKey} held ${total} items; only the first ${kept} fit the size budget. Do NOT sum or extrapolate from these partial rows — re-query with a narrower date range or pre-aggregated (get_metrics_rollup, run_sql with GROUP BY/SUM).`,
+    });
+    const shrink = (obj, arrKey) => {
+        const arr = obj[arrKey];
+        let lo = 1, hi = arr.length;
+        while (lo < hi) { // largest prefix that fits
+            const mid = Math.ceil((lo + hi) / 2);
+            if (wrap({ ...obj, [arrKey]: arr.slice(0, mid) }, arrKey, arr.length, mid).length <= capChars) lo = mid; else hi = mid - 1;
+        }
+        return wrap({ ...obj, [arrKey]: arr.slice(0, lo) }, arrKey, arr.length, lo);
+    };
+    if (Array.isArray(out)) return shrink({ rows: out }, 'rows');
+    if (out && typeof out === 'object') {
+        const arrKey = Object.keys(out)
+            .filter(k => Array.isArray(out[k]) && out[k].length > 1)
+            .sort((a, b) => JSON.stringify(out[b]).length - JSON.stringify(out[a]).length)[0];
+        if (arrKey) return shrink(out, arrKey);
+    }
+    return JSON.stringify({ RESULT_TRUNCATED: 'Result was too large to return. Re-query narrower or pre-aggregated.', preview: str.slice(0, 2000) });
+}
+
+// Turn an Anthropic error body into something a business owner can act on.
+function friendlyClaudeError(errBody) {
+    const s = String(errBody);
+    if (s.includes('prompt is too long')) return 'That question pulled more data than the AI can hold at once. Ask for a narrower date range, or for summaries (weekly/monthly) instead of day-by-day detail.';
+    if (s.includes('rate_limit_error')) return 'The AI is temporarily rate-limited. Wait a minute and ask again.';
+    if (s.includes('overloaded_error')) return 'The AI service is briefly overloaded. Try again in a moment.';
+    return 'AI service error — try again, or rephrase the question.';
+}
+
 async function executeInsightsTool(name, input, ctx) {
     const { funnel, userId } = ctx;
     try {
         switch (name) {
             case 'get_metrics':
-                return await getInsightsMetrics(funnel, input.date_from, input.date_to);
+                return await getInsightsMetricsGuarded(funnel, input.date_from, input.date_to);
             case 'get_metrics_rollup':
                 return await getInsightsRollup(funnel, input.period, input.date_from, input.date_to);
             case 'compare_periods':
@@ -4878,6 +4932,7 @@ DATA INTEGRITY (non-negotiable — users act on your numbers at face value):
 INSTRUCTIONS:
 - Use tools to fetch only the data you need. Don't ask the user for date ranges — pick reasonable ones (last 7/14/30 days, last 3/6 months) based on the question.
 - For multi-week or multi-month trends, prefer \`get_metrics_rollup\` over \`get_metrics\` — fewer rows, cleaner trend.
+- "All time" totals or comparisons (lifetime purchases by source, total spend ever): NEVER pull daily rows — one \`run_sql\` with SUM/GROUP BY over daily_metrics (e.g. SELECT SUM(purchases_aibot) AS a, SUM(purchases_aibot_b) AS b FROM daily_metrics), or \`get_metrics_rollup\` with period "month".
 - For "X vs Y" or "this vs last" questions, use \`compare_periods\` — it returns deltas and % change for free.
 - For analytical questions the named tools don't cover (day-of-week patterns, hour-of-day, joins, custom aggregations), use \`run_sql\` with a SELECT. Don't be shy about it — it's the escape hatch.${GHL_ENABLED ? `
 - Pipeline-stage / appointment / opportunity questions (Day 1, testing, report of findings, started, refunds…) live ONLY in GoHighLevel — see the GOHIGHLEVEL section. Segment × pipeline joins ("everyone who purchased in July") → one get_ghl_pipeline_status call. Ad-hoc single-contact lookups → ghl MCP tools. Never answer stage questions from funnel data alone.` : ''}
@@ -4987,7 +5042,7 @@ ${VIZ_FORMAT_GUIDE}`;
             if (!response.ok) {
                 const errBody = await response.text();
                 console.error('❌ Claude API error:', response.status, errBody);
-                return res.status(502).json({ error: 'AI service error', detail: errBody });
+                return res.status(502).json({ error: friendlyClaudeError(errBody), detail: errBody });
             }
 
             const result = await response.json();
@@ -5024,7 +5079,7 @@ ${VIZ_FORMAT_GUIDE}`;
                     toolResults.push({
                         type: 'tool_result',
                         tool_use_id: tu.id,
-                        content: JSON.stringify(out),
+                        content: capToolResult(out),
                     });
                 }
 
@@ -5717,7 +5772,7 @@ ${VIZ_FORMAT_GUIDE}
             if (!response.ok) {
                 const errBody = await response.text();
                 console.error('❌ Claude API error (worker):', response.status, errBody);
-                return res.status(502).json({ error: 'AI service error', detail: errBody });
+                return res.status(502).json({ error: friendlyClaudeError(errBody), detail: errBody });
             }
 
             const result = await response.json();
@@ -5746,7 +5801,7 @@ ${VIZ_FORMAT_GUIDE}
                     toolResults.push({
                         type: 'tool_result',
                         tool_use_id: tu.id,
-                        content: JSON.stringify(out),
+                        content: capToolResult(out),
                     });
                 }
 
