@@ -19,7 +19,7 @@ Base URL: `https://analytics.drshumard.com`
 | `POST` | `/api/metrics/set` | Set a field to an absolute value (e.g. FB running spend total) |
 | `POST` | `/api/fb-sync` | Force a Facebook spend sync now |
 
-`increment` body: `{ "field": "registrations", "count": 1, "email": "...", "name": "...", "phone": "..." }`. Valid `field`: `fb_spend`, `fb_link_clicks`, `registrations`, `replays`, `viewedcta`, `clickedcta`, `purchases`, `attended`, `stayeduntil`. Purchases route by `metadata.source` (`Paid Ads`/`Native`/`Youtube`/`AI Bot`/`AI Bot B`/`CPA Traffic`/`Sales A`/`Sales B`/`Retargeting`; Post‑Webinar auto‑detected). Registrations dedupe by email + webinar day; other events dedupe within 5 minutes. Each event is also written to the `events` table.
+`increment` body: `{ "field": "registrations", "count": 1, "email": "...", "name": "...", "phone": "..." }`. Valid `field`: `fb_spend`, `fb_link_clicks`, `registrations`, `replays`, `viewedcta`, `clickedcta`, `purchases`, `attended`, `stayeduntil`. Purchases route by `metadata.source` (`Paid Ads`/`Native`/`Youtube`/`AI Bot`/`AI Bot B`/`CPA Traffic`/`Sales A`/`Sales B`/`Retargeting`/`Post Webinar`; an explicit `Post Webinar` is trusted verbatim, otherwise Paid Ads / Sales A / Sales B sales auto‑detect Post‑Webinar (12h+ after last webinar engagement)). Registrations dedupe by email + webinar day; other events dedupe within 5 minutes. Each event is also written to the `events` table.
 
 ---
 

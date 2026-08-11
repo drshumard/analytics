@@ -857,6 +857,9 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             'Sales A':     'purchases_sales_a',
             'Sales B':     'purchases_sales_b',
             'Retargeting': 'purchases_retargeting',
+            // Explicit tag — trusted verbatim, skips the 12h auto-detection
+            // (which otherwise re-routes Paid Ads / Sales A / Sales B).
+            'Post Webinar': 'purchases_postwebinar',
         };
 
         // ── Webinar engagement milestone mapping ─────────────────────────
@@ -4897,7 +4900,7 @@ THE FUNNEL STAGES (in order):
    - purchases_youtube (Youtube) — from Youtube campaigns
    - purchases_aibot (AI Chat Bot) — from AI chatbot interactions
    - purchases_aibot_b (AI Chat Bot B) — second AI chatbot source (webhook source:"AI Bot B")
-   - purchases_postwebinar (Post Webinar) — Paid Ads / Sales A / Sales B purchases made 12+ hours AFTER attending a webinar
+   - purchases_postwebinar (Post Webinar) — Paid Ads / Sales A / Sales B purchases made 12+ hours AFTER attending a webinar (auto-detected; webhooks can also tag source:"Post Webinar" explicitly)
    - purchases_cpa (CPA Traffic Funnel) — purchases attributed to the CPA Traffic source
    - purchases_sales_a (Sales A) — purchases attributed to the Sales A source
    - purchases_sales_b (Sales B) — purchases attributed to the Sales B source
