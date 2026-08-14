@@ -847,7 +847,7 @@ export default function App() {
   const [newPass2, setNewPass2] = useState("");
   const [pwError, setPwError] = useState("");
   const [pwSubmitting, setPwSubmitting] = useState(false);
-  const [resetSending, setResetSending] = useState(false);
+  const [forgotOpen, setForgotOpen] = useState(false);
   const [metrics, setMetrics] = useState([]);
   const [customs, setCustoms] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -1202,19 +1202,6 @@ export default function App() {
     setUserRole(null);
   };
 
-  const handleForgotPassword = async () => {
-    if (!authEmail) { setAuthError("Enter your email above first, then tap “Forgot password?”"); return; }
-    setAuthError("");
-    setResetSending(true);
-    try {
-      const { error } = await supabase.auth.resetPasswordForEmail(authEmail, { redirectTo: window.location.origin });
-      if (error) setAuthError(error.message);
-      else setAuthNotice(`Password reset link sent to ${authEmail}. Open it promptly — links are single-use.`);
-    } finally {
-      setResetSending(false);
-    }
-  };
-
   const handleSetPassword = async (e) => {
     e.preventDefault();
     setPwError("");
@@ -1545,7 +1532,7 @@ export default function App() {
           </div>
           <button type="submit" disabled={authSubmitting} aria-busy={authSubmitting} style={{ ...S.btnDark, width: "100%", justifyContent: "center", padding: "11px 0", borderRadius: 8, fontSize: 14, fontWeight: 600 }}>{authSubmitting ? "Signing in…" : "Sign in"}</button>
           <div style={{ textAlign: "center", marginTop: 12 }}>
-            <button type="button" onClick={handleForgotPassword} disabled={resetSending} style={{ background: "none", border: "none", padding: 0, fontSize: 13, color: "var(--ds-gray-600)", cursor: "pointer", textDecoration: "underline", textUnderlineOffset: 3 }}>{resetSending ? "Sending reset link…" : "Forgot password?"}</button>
+            <button type="button" onClick={() => { setAuthError(""); setForgotOpen(true); }} style={{ background: "none", border: "none", padding: 0, fontSize: 13, color: "var(--ds-gray-600)", cursor: "pointer", textDecoration: "underline", textUnderlineOffset: 3 }}>Forgot password?</button>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "20px 0" }}>
             <div style={{ flex: 1, height: 1, background: "var(--ds-border)" }} />
@@ -1558,6 +1545,7 @@ export default function App() {
           </button>
         </form>
       </div>
+      {forgotOpen && <ForgotPasswordModal initialEmail={authEmail} onCancel={() => setForgotOpen(false)} onSent={em => { setForgotOpen(false); setAuthNotice(`Password reset link sent to ${em}. Open it promptly — links are single-use.`); }} />}
     </div>
   );
 
@@ -2636,6 +2624,41 @@ function ColumnEditor({ columns, onSave, onCancel, isAdmin }) {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function ForgotPasswordModal({ initialEmail, onCancel, onSent }) {
+  useEscapeKey(onCancel);
+  const dialogRef = useDialogFocus();
+  const [email, setEmail] = useState(initialEmail || "");
+  const [err, setErr] = useState("");
+  const [sending, setSending] = useState(false);
+  const send = async (e) => {
+    e.preventDefault();
+    setErr("");
+    setSending(true);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), { redirectTo: window.location.origin });
+      if (error) setErr(error.message);
+      else onSent(email.trim());
+    } finally {
+      setSending(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop" style={S.overlay} onClick={onCancel}>
+      <form ref={dialogRef} tabIndex={-1} className="modal-inner" role="dialog" aria-modal="true" aria-label="Reset password" style={{ ...S.modal, maxWidth: 400, textAlign: "left" }} onClick={e => e.stopPropagation()} onSubmit={send}>
+        <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Reset your password</div>
+        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 18, lineHeight: 1.5 }}>Enter your account email and we'll send you a link to set a new password.</div>
+        {err && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 14, border: "1px solid #F5B7B7" }}>{err}</div>}
+        <label htmlFor="forgot-email" style={{ display: "block", fontSize: 13, fontWeight: 500, color: "#333", marginBottom: 6 }}>Email</label>
+        <input id="forgot-email" data-dialog-initial-focus type="email" autoComplete="email" value={email} onChange={e => setEmail(e.target.value)} required style={{ width: "100%", padding: "10px 14px", borderRadius: 8, border: "1px solid var(--ds-border-hover)", fontSize: 14, outline: "none", boxSizing: "border-box", marginBottom: 20 }} />
+        <div style={{ display: "flex", gap: 10 }}>
+          <button type="button" style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
+          <button type="submit" disabled={sending} aria-busy={sending} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{sending ? "Sending…" : "Send reset link"}</button>
+        </div>
+      </form>
     </div>
   );
 }
