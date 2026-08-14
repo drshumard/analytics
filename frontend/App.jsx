@@ -11,6 +11,22 @@ import { createClient } from "@supabase/supabase-js";
 import { ThinkingOrb } from "thinking-orbs";
 
 // ─── Supabase Client ─────────────────────────────────────────────────────────
+// Auth links (password recovery, magic links) land as hash params — either
+// tokens (#access_token=…&type=recovery) or an error (#error_code=otp_expired
+// when the one-time link was already consumed, e.g. by an email security
+// scanner). Read the hash BEFORE createClient: detectSessionInUrl strips it.
+const AUTH_HASH = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+const LANDED_FROM_RECOVERY = AUTH_HASH.get("type") === "recovery";
+const AUTH_LINK_ERROR_MSG = (() => {
+  if (!AUTH_HASH.get("error") && !AUTH_HASH.get("error_code")) return "";
+  const code = AUTH_HASH.get("error_code") || "";
+  const desc = AUTH_HASH.get("error_description") || "";
+  if (code === "otp_expired" || /expired|invalid/i.test(desc))
+    return "That link has expired or was already used — some email security scanners consume links before you click them. Use “Forgot password?” below to send a fresh one, and open it promptly.";
+  return desc || "Sign-in link error — request a fresh link below.";
+})();
+if (AUTH_LINK_ERROR_MSG) window.history.replaceState(null, "", window.location.pathname + window.location.search);
+
 const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
   import.meta.env.VITE_SUPABASE_ANON_KEY
@@ -823,6 +839,15 @@ export default function App() {
   const [authPass, setAuthPass] = useState("");
   const [authError, setAuthError] = useState("");
   const [authSubmitting, setAuthSubmitting] = useState(false);
+  // Password-recovery flow: arriving via a reset link must show a set-new-password
+  // screen before the dashboard — otherwise the person never gets to choose one.
+  const [recoveryMode, setRecoveryMode] = useState(LANDED_FROM_RECOVERY);
+  const [authNotice, setAuthNotice] = useState(AUTH_LINK_ERROR_MSG);
+  const [newPass, setNewPass] = useState("");
+  const [newPass2, setNewPass2] = useState("");
+  const [pwError, setPwError] = useState("");
+  const [pwSubmitting, setPwSubmitting] = useState(false);
+  const [resetSending, setResetSending] = useState(false);
   const [metrics, setMetrics] = useState([]);
   const [customs, setCustoms] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -1050,6 +1075,7 @@ export default function App() {
       else setAuthLoading(false);
     });
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, s) => {
+      if (_event === "PASSWORD_RECOVERY") setRecoveryMode(true);
       setSession(s);
       if (s) fetchRole(s.access_token);
       else { setUserRole(null); setAuthLoading(false); }
@@ -1174,6 +1200,38 @@ export default function App() {
     await supabase.auth.signOut();
     setSession(null);
     setUserRole(null);
+  };
+
+  const handleForgotPassword = async () => {
+    if (!authEmail) { setAuthError("Enter your email above first, then tap “Forgot password?”"); return; }
+    setAuthError("");
+    setResetSending(true);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(authEmail, { redirectTo: window.location.origin });
+      if (error) setAuthError(error.message);
+      else setAuthNotice(`Password reset link sent to ${authEmail}. Open it promptly — links are single-use.`);
+    } finally {
+      setResetSending(false);
+    }
+  };
+
+  const handleSetPassword = async (e) => {
+    e.preventDefault();
+    setPwError("");
+    if (newPass.length < 8) { setPwError("Use at least 8 characters."); return; }
+    if (newPass !== newPass2) { setPwError("Passwords don't match."); return; }
+    setPwSubmitting(true);
+    try {
+      const { error } = await supabase.auth.updateUser({ password: newPass });
+      if (error) setPwError(error.message);
+      else {
+        setRecoveryMode(false);
+        setNewPass(""); setNewPass2("");
+        flash("Password updated — you're signed in");
+      }
+    } finally {
+      setPwSubmitting(false);
+    }
   };
 
   useEffect(() => { loadData(); fetchLenses(); }, [loadData]);
@@ -1438,6 +1496,33 @@ export default function App() {
     </div>
   );
 
+  // Set-new-password screen — arriving via a recovery link signs the person in
+  // with a one-time session; they MUST set a password here before the dashboard.
+  if (session && recoveryMode) return (
+    <div style={S.app}><style>{CSS}</style>
+      <div className="auth-shell" style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100dvh", padding: "32px 16px" }}>
+        <form onSubmit={handleSetPassword} className="login-form" style={{ width: "100%", maxWidth: 380, background: "#fff", borderRadius: 16, padding: "48px 36px", boxShadow: "0 8px 32px rgba(0,0,0,0.08)", border: "1px solid var(--ds-border)" }}>
+          <div style={{ textAlign: "center", marginBottom: 32 }}>
+            <img src="https://portal-drshumard.b-cdn.net/trans_sized.png" alt="Logo" style={{ height: 36, objectFit: "contain", marginBottom: 16 }} />
+            <h1 style={{ fontSize: 24, fontWeight: 600, color: "#171717", margin: 0, letterSpacing: "-0.03em" }}>Set a new password</h1>
+            <p style={{ fontSize: 14, color: "#666", marginTop: 8 }}>for {session.user?.email}</p>
+          </div>
+          {pwError && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16, border: "1px solid #F5B7B7" }}>{pwError}</div>}
+          <div style={{ marginBottom: 16 }}>
+            <label htmlFor="new-password" style={{ display: "block", fontSize: 13, fontWeight: 500, color: "#333", marginBottom: 6 }}>New password</label>
+            <input id="new-password" type="password" autoComplete="new-password" value={newPass} onChange={e => setNewPass(e.target.value)} required minLength={8} style={{ width: "100%", padding: "10px 14px", borderRadius: 8, border: "1px solid var(--ds-border-hover)", fontSize: 14, outline: "none", boxSizing: "border-box" }} />
+          </div>
+          <div style={{ marginBottom: 24 }}>
+            <label htmlFor="new-password-2" style={{ display: "block", fontSize: 13, fontWeight: 500, color: "#333", marginBottom: 6 }}>Confirm new password</label>
+            <input id="new-password-2" type="password" autoComplete="new-password" value={newPass2} onChange={e => setNewPass2(e.target.value)} required minLength={8} style={{ width: "100%", padding: "10px 14px", borderRadius: 8, border: "1px solid var(--ds-border-hover)", fontSize: 14, outline: "none", boxSizing: "border-box" }} />
+          </div>
+          <button type="submit" disabled={pwSubmitting} aria-busy={pwSubmitting} style={{ ...S.btnDark, width: "100%", justifyContent: "center", padding: "11px 0", borderRadius: 8, fontSize: 14, fontWeight: 600 }}>{pwSubmitting ? "Saving…" : "Save password"}</button>
+          <p style={{ fontSize: 12, color: "var(--ds-gray-600)", textAlign: "center", marginTop: 16, marginBottom: 0 }}>At least 8 characters. You'll stay signed in after saving.</p>
+        </form>
+      </div>
+    </div>
+  );
+
   // Login screen
   if (!session) return (
     <div style={S.app}><style>{CSS}</style>
@@ -1448,6 +1533,7 @@ export default function App() {
             <h1 style={{ fontSize: 24, fontWeight: 600, color: "#171717", margin: 0, letterSpacing: "-0.03em" }}>Welcome back</h1>
             <p style={{ fontSize: 14, color: "#666", marginTop: 8 }}>Sign in to Shumard Analytics</p>
           </div>
+          {authNotice && <div role="status" style={{ background: "#F0F7FF", color: "#0A4A8F", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16, border: "1px solid #BBD6F5" }}>{authNotice}</div>}
           {authError && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16, border: "1px solid #F5B7B7" }}>{authError}</div>}
           <div style={{ marginBottom: 16 }}>
             <label htmlFor="auth-email" style={{ display: "block", fontSize: 13, fontWeight: 500, color: "#333", marginBottom: 6 }}>Email</label>
@@ -1458,6 +1544,9 @@ export default function App() {
             <input id="auth-password" type="password" autoComplete="current-password" value={authPass} onChange={e => setAuthPass(e.target.value)} required style={{ width: "100%", padding: "10px 14px", borderRadius: 8, border: "1px solid var(--ds-border-hover)", fontSize: 14, outline: "none", boxSizing: "border-box" }} />
           </div>
           <button type="submit" disabled={authSubmitting} aria-busy={authSubmitting} style={{ ...S.btnDark, width: "100%", justifyContent: "center", padding: "11px 0", borderRadius: 8, fontSize: 14, fontWeight: 600 }}>{authSubmitting ? "Signing in…" : "Sign in"}</button>
+          <div style={{ textAlign: "center", marginTop: 12 }}>
+            <button type="button" onClick={handleForgotPassword} disabled={resetSending} style={{ background: "none", border: "none", padding: 0, fontSize: 13, color: "var(--ds-gray-600)", cursor: "pointer", textDecoration: "underline", textUnderlineOffset: 3 }}>{resetSending ? "Sending reset link…" : "Forgot password?"}</button>
+          </div>
           <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "20px 0" }}>
             <div style={{ flex: 1, height: 1, background: "var(--ds-border)" }} />
             <span style={{ fontSize: 12, color: "var(--ds-gray-600)", fontWeight: 500 }}>or</span>
