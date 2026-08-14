@@ -2443,6 +2443,33 @@ app.post('/api/cache/clear', requireAuth, async (req, res) => {
     res.json({ success: true, message: `Cache cleared (${daysBefore} days flushed)` });
 });
 
+// POST /api/admin/reset-link — Admin: generate a single-use password-reset link
+// for a dashboard user, to hand to them directly (text/Slack). Bypasses email
+// delivery entirely — the project has no custom SMTP, and Supabase's built-in
+// mailer only reaches Supabase-org members. The link opens the app's
+// set-a-new-password screen. Single-use, ~1h expiry.
+app.post('/api/admin/reset-link', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const email = String(req.body?.email || '').trim().toLowerCase();
+        if (!email || !email.includes('@')) return res.status(400).json({ error: 'A valid email is required' });
+        const r = await fetch(`${SUPABASE_URL}/auth/v1/admin/generate_link`, {
+            method: 'POST',
+            headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: 'recovery', email }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok || !body.action_link) {
+            const msg = body.msg || body.error_description || body.message || 'Could not generate a link';
+            return res.status(r.status === 404 ? 404 : 502).json({ error: /not found/i.test(msg) ? `No dashboard user with the email ${email}` : msg });
+        }
+        console.log(`🔑 Admin ${req.user.email} generated a password-reset link for ${email}`);
+        return res.json({ email, link: body.action_link });
+    } catch (err) {
+        console.error('❌ POST /api/admin/reset-link error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // POST /api/admin/finalize-past-days — One-shot backfill.
 // Walks every daily_metrics row with date < today and finalized_at IS NULL,
 // runs finalizeDailyMetricsForDate on each, and reports the result. Safe to

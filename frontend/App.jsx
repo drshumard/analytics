@@ -188,6 +188,13 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Worker chat failed: ${res.status}`); }
     return res.json();
   },
+  async adminResetLink(email, funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/reset-link`, { method: "POST", headers, body: JSON.stringify({ email }) });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `Failed: ${res.status}`);
+    return body;
+  },
   async getConversations(funnel) {
     const headers = await getAuthHeaders(funnel);
     const res = await fetch(`${API_BASE}/api/insights/conversations`, { headers });
@@ -848,6 +855,7 @@ export default function App() {
   const [pwError, setPwError] = useState("");
   const [pwSubmitting, setPwSubmitting] = useState(false);
   const [forgotOpen, setForgotOpen] = useState(false);
+  const [resetLinkOpen, setResetLinkOpen] = useState(false);
   const [metrics, setMetrics] = useState([]);
   const [customs, setCustoms] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -1664,6 +1672,7 @@ export default function App() {
                 <div className="navbar-popover account-popover">
                   <div className="account-popover-identity"><strong>{session?.user?.email?.split("@")[0] || "Account"}</strong><span>{session?.user?.email || ""}</span><small>{isAdmin ? "Administrator" : "Viewer"}</small></div>
                   <div className="navbar-popover-divider" />
+                  {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} /><span>Password reset link</span></button>}
                   <button onClick={handleLogout}><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={15} /><span>Sign out</span></button>
                 </div>
               </details>
@@ -1688,7 +1697,7 @@ export default function App() {
                   ))}
                 </nav>
                 <div className="nav-menu-footer">
-                  <div className="nav-menu-utilities"><button onClick={() => { setMobileMenuOpen(false); clearCache(); }}><I d="M3 6h18M8 6V4h8v2m-9 0l1 15h8l1-15" size={15} />Clear cache</button>{isAdmin && <button disabled={finalizing} onClick={() => { setMobileMenuOpen(false); finalizePastDays(); }}><I d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14" size={15} />{finalizing ? "Finalizing…" : "Finalize data"}</button>}</div>
+                  <div className="nav-menu-utilities"><button onClick={() => { setMobileMenuOpen(false); clearCache(); }}><I d="M3 6h18M8 6V4h8v2m-9 0l1 15h8l1-15" size={15} />Clear cache</button>{isAdmin && <button disabled={finalizing} onClick={() => { setMobileMenuOpen(false); finalizePastDays(); }}><I d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14" size={15} />{finalizing ? "Finalizing…" : "Finalize data"}</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} />Password reset link</button>}</div>
                   <div className="nav-menu-account"><span className="account-avatar">{(session?.user?.email || "U").charAt(0).toUpperCase()}</span><div><strong>{session?.user?.email?.split("@")[0] || "Account"}</strong><span>{isAdmin ? "Administrator" : "Viewer"}</span></div><button onClick={handleLogout} aria-label="Sign out" title="Sign out"><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={16} /></button></div>
                 </div>
               </div>
@@ -2214,6 +2223,7 @@ export default function App() {
         </section>
       </div>
 
+      {resetLinkOpen && <ResetLinkModal funnel={activeFunnel} onCancel={() => setResetLinkOpen(false)} />}
       {delConfirm && <Modal title="Delete entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
       {delCM && <Modal title="Delete custom metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
       {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
@@ -2657,6 +2667,50 @@ function ForgotPasswordModal({ initialEmail, onCancel, onSent }) {
         <div style={{ display: "flex", gap: 10 }}>
           <button type="button" style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
           <button type="submit" disabled={sending} aria-busy={sending} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{sending ? "Sending…" : "Send reset link"}</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ResetLinkModal({ funnel, onCancel }) {
+  useEscapeKey(onCancel);
+  const dialogRef = useDialogFocus();
+  const [email, setEmail] = useState("");
+  const [result, setResult] = useState(null); // { email, link }
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const generate = async (e) => {
+    e.preventDefault();
+    setErr(""); setResult(null); setCopied(false);
+    setBusy(true);
+    try { setResult(await api.adminResetLink(email.trim(), funnel)); }
+    catch (ex) { setErr(ex.message); }
+    finally { setBusy(false); }
+  };
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(result.link); setCopied(true); setTimeout(() => setCopied(false), 2000); }
+    catch { setErr("Copy failed — select the link text and copy manually."); }
+  };
+  return (
+    <div className="modal-backdrop" style={S.overlay} onClick={onCancel}>
+      <form ref={dialogRef} tabIndex={-1} className="modal-inner" role="dialog" aria-modal="true" aria-label="Password reset link" style={{ ...S.modal, maxWidth: 460, textAlign: "left" }} onClick={e => e.stopPropagation()} onSubmit={generate}>
+        <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Password reset link</div>
+        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 18, lineHeight: 1.5 }}>Generate a link you can send to a user directly (text, Slack, …). It opens the set-a-new-password screen. Single-use, expires in about an hour.</div>
+        {err && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 14, border: "1px solid #F5B7B7" }}>{err}</div>}
+        <label htmlFor="reset-link-email" style={{ display: "block", fontSize: 13, fontWeight: 500, color: "#333", marginBottom: 6 }}>User's email</label>
+        <input id="reset-link-email" data-dialog-initial-focus type="email" autoComplete="off" value={email} onChange={e => setEmail(e.target.value)} required style={{ width: "100%", padding: "10px 14px", borderRadius: 8, border: "1px solid var(--ds-border-hover)", fontSize: 14, outline: "none", boxSizing: "border-box", marginBottom: 16 }} />
+        {result && (
+          <div style={{ background: "var(--ds-gray-100)", border: "1px solid var(--ds-border)", borderRadius: 8, padding: "10px 12px", marginBottom: 16 }}>
+            <div style={{ fontSize: 12, color: "var(--ds-gray-600)", marginBottom: 6 }}>Reset link for {result.email}</div>
+            <div style={{ fontSize: 12, fontFamily: "monospace", wordBreak: "break-all", color: "var(--ds-gray-900)", marginBottom: 10, userSelect: "all" }}>{result.link}</div>
+            <button type="button" onClick={copy} style={{ ...S.btnDark, padding: "7px 14px", fontSize: 13 }}>{copied ? "Copied ✓" : "Copy link"}</button>
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 10 }}>
+          <button type="button" style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>{result ? "Done" : "Cancel"}</button>
+          <button type="submit" disabled={busy} aria-busy={busy} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{busy ? "Generating…" : result ? "Generate another" : "Generate link"}</button>
         </div>
       </form>
     </div>
