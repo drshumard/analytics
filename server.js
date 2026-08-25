@@ -744,7 +744,7 @@ app.post('/api/metrics', webhookLimiter, async (req, res) => {
 
         // Only include purchase source columns if explicitly provided
         // Prevents admin form edits from clobbering webhook-sourced data to 0
-        const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting'];
+        const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo'];
         for (const col of PURCHASE_COLS) {
             if (body[col] !== undefined && body[col] !== '' && body[col] !== null) {
                 row[col] = parseInt(body[col]) || 0;
@@ -807,7 +807,7 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
                 attended: parseInt(entry.attended) || 0,
             };
             // Only include purchase columns if explicitly provided (prevents clobbering)
-            const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting'];
+            const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo'];
             for (const col of PURCHASE_COLS) {
                 if (entry[col] !== undefined && entry[col] !== '' && entry[col] !== null) {
                     row[col] = parseInt(entry[col]) || 0;
@@ -857,6 +857,7 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
             'Sales A':     'purchases_sales_a',
             'Sales B':     'purchases_sales_b',
             'Retargeting': 'purchases_retargeting',
+            'Promo':       'purchases_promo',
             // Explicit tag — trusted verbatim, skips the 12h auto-detection
             // (which otherwise re-routes Paid Ads / Sales A / Sales B).
             'Post Webinar': 'purchases_postwebinar',
@@ -1106,7 +1107,7 @@ app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, re
     try {
         const supabase = clientFor(req.funnel);
         const { field, value, date: dateInput } = req.body;
-        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'stayed_45', 'stayed_60', 'stayed_80', 'attended'];
+        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo', 'stayed_45', 'stayed_60', 'stayed_80', 'attended'];
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -1484,6 +1485,7 @@ const PURCHASE_DEDUP_MAP = {
     'Sales A':       'purchases_sales_a',
     'Sales B':       'purchases_sales_b',
     'Retargeting':   'purchases_retargeting',
+    'Promo':         'purchases_promo',
 };
 
 // Allowed variant buckets. 'all' is computed as the sum of the others.
@@ -1824,7 +1826,7 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
         'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
         'purchases_fb', 'purchases_native', 'purchases_youtube',
         'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa',
-        'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting',
+        'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo',
         'stayed_45', 'stayed_60', 'stayed_80',
     ];
 
@@ -1834,7 +1836,7 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
         purchases_fb: 'purchases', purchases_native: 'purchases',
         purchases_youtube: 'purchases', purchases_aibot: 'purchases', purchases_aibot_b: 'purchases',
         purchases_postwebinar: 'purchases', purchases_cpa: 'purchases',
-        purchases_sales_a: 'purchases', purchases_sales_b: 'purchases', purchases_retargeting: 'purchases',
+        purchases_sales_a: 'purchases', purchases_sales_b: 'purchases', purchases_retargeting: 'purchases', purchases_promo: 'purchases',
         stayed_45: 'stayeduntil', stayed_60: 'stayeduntil', stayed_80: 'stayeduntil',
     };
 
@@ -2110,10 +2112,10 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
 
         const DEDUP_COLS = new Set([
             'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
-            'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting',
+            'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo',
             'stayed_45', 'stayed_60', 'stayed_80',
         ]);
-        const PURCHASE_SUB = ['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting'];
+        const PURCHASE_SUB = ['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo'];
 
         // Convert to frontend format (MM/DD/YYYY)
         const formatted = (data || []).map(row => {
@@ -2162,6 +2164,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                     purchases_sales_a: pickV('purchases_sales_a', vnt),
                     purchases_sales_b: pickV('purchases_sales_b', vnt),
                     purchases_retargeting: pickV('purchases_retargeting', vnt),
+                    purchases_promo: pickV('purchases_promo', vnt),
                     stayed_45: pickV('stayed_45', vnt),
                     stayed_60: pickV('stayed_60', vnt),
                     stayed_80: pickV('stayed_80', vnt),
@@ -2231,7 +2234,7 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
 
         // Only write to overrides — raw columns stay as the automated data source.
         // This prevents overrides from drifting separately from raw columns (#6).
-        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'stayed_45', 'stayed_60', 'stayed_80'];
+        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo', 'stayed_45', 'stayed_60', 'stayed_80'];
         const newOverrides = {};
         for (const f of OVERRIDE_FIELDS) {
             if (body[f] !== undefined) {
@@ -2574,7 +2577,7 @@ app.post('/api/admin/backfill-variant-splits', requireAuth, requireAdmin, async 
         const FIELDS = [
             'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
             'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b',
-            'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting',
+            'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo',
             'stayed_45', 'stayed_60', 'stayed_80',
         ];
         let updated = 0;
@@ -3325,7 +3328,7 @@ async function loadAllInsightsMetrics(funnel) {
     const dates = rawRows.filter(r => !r.finalized_at).map(r => String(r.date).substring(0, 10));
     const dedupMap = await getDedupCounts(funnel, dates);
 
-    const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'stayed_45', 'stayed_60', 'stayed_80']);
+    const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo', 'stayed_45', 'stayed_60', 'stayed_80']);
     const metrics = rawRows.map(r => {
         const dateStr = String(r.date).substring(0, 10);
         const deduped = dedupMap[dateStr] || {};
@@ -3358,13 +3361,14 @@ async function loadAllInsightsMetrics(funnel) {
             purchases_sales_a: pick('purchases_sales_a') || 0,
             purchases_sales_b: pick('purchases_sales_b') || 0,
             purchases_retargeting: pick('purchases_retargeting') || 0,
+            purchases_promo: pick('purchases_promo') || 0,
             stayed_45: pick('stayed_45') || 0,
             stayed_60: pick('stayed_60') || 0,
             stayed_80: pick('stayed_80') || 0,
             total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
                              (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) + (pick('purchases_aibot_b') || 0) +
                              (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0) +
-                             (pick('purchases_sales_a') || 0) + (pick('purchases_sales_b') || 0) + (pick('purchases_retargeting') || 0),
+                             (pick('purchases_sales_a') || 0) + (pick('purchases_sales_b') || 0) + (pick('purchases_retargeting') || 0) + (pick('purchases_promo') || 0),
         };
     });
 
@@ -3414,7 +3418,7 @@ async function getInsightsRollup(funnel, period, from, to) {
     };
 
     const buckets = new Map();
-    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta','purchases_fb','purchases_native','purchases_youtube','purchases_aibot','purchases_aibot_b','purchases_postwebinar','purchases_cpa','purchases_sales_a','purchases_sales_b','purchases_retargeting','stayed_45','stayed_60','stayed_80','total_purchases'];
+    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta','purchases_fb','purchases_native','purchases_youtube','purchases_aibot','purchases_aibot_b','purchases_postwebinar','purchases_cpa','purchases_sales_a','purchases_sales_b','purchases_retargeting','purchases_promo','stayed_45','stayed_60','stayed_80','total_purchases'];
 
     for (const r of rows) {
         const k = bucketKey(r.date);
@@ -3449,7 +3453,7 @@ async function compareInsightsPeriods(funnel, aFrom, aTo, bFrom, bTo) {
         getInsightsMetrics(funnel, bFrom, bTo),
     ]);
 
-    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta','purchases_fb','purchases_native','purchases_youtube','purchases_aibot','purchases_aibot_b','purchases_postwebinar','purchases_cpa','purchases_sales_a','purchases_sales_b','purchases_retargeting','total_purchases'];
+    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta','purchases_fb','purchases_native','purchases_youtube','purchases_aibot','purchases_aibot_b','purchases_postwebinar','purchases_cpa','purchases_sales_a','purchases_sales_b','purchases_retargeting','purchases_promo','total_purchases'];
     const sumOf = (rows) => {
         const t = { days: rows.length };
         ADDITIVE.forEach(c => t[c] = rows.reduce((s, r) => s + (Number(r[c]) || 0), 0));
@@ -4932,6 +4936,7 @@ THE FUNNEL STAGES (in order):
    - purchases_sales_a (Sales A) — purchases attributed to the Sales A source
    - purchases_sales_b (Sales B) — purchases attributed to the Sales B source
    - purchases_retargeting (Retargeting) — purchases attributed to the Retargeting source (webhook source:"Retargeting")
+   - purchases_promo (Promo) — purchases attributed to the Promo source (webhook source:"Promo")
    - total_purchases — sum of all purchase sources above
 
 KEY METRICS:
@@ -5400,7 +5405,7 @@ async function workerUpdateEvent(funnel, input, ctx) {
     return { ok: true, event_id: id, before: { email: ev.email, name: ev.name, phone: ev.phone }, applied: patch, ...tail };
 }
 
-const WORKER_OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'stayed_45', 'stayed_60', 'stayed_80'];
+const WORKER_OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo', 'stayed_45', 'stayed_60', 'stayed_80'];
 
 async function workerSetOverride(funnel, input) {
     const sb = clientFor(funnel);
@@ -5712,7 +5717,7 @@ TODAY'S DATE: ${today} (Los Angeles timezone)
 HOW THE DATA WORKS (respect this model or numbers WILL drift):
 - \`events\` is the source of truth — one row per funnel action (event_type, email, event_time in UTC, metadata jsonb). \`daily_metrics\` holds denormalized per-day counters, one column per stage / purchase source. The dashboard prefers DEDUPLICATED event counts for recent days; past days are frozen ("finalized") into canonical columns.
 - Therefore a day's numbers = its events. add_sale / add_event / delete_event handle the FULL flow for you: event row + the right daily column for the sale's LA calendar day + re-finalize if the day was frozen + cache invalidation. NEVER manipulate events via run_sql_write when a dedicated tool fits.
-- Purchase sources → columns: Paid Ads→purchases_fb, Native→purchases_native, Youtube→purchases_youtube, AI Bot→purchases_aibot, AI Bot B→purchases_aibot_b, CPA Traffic→purchases_cpa, Sales A→purchases_sales_a, Sales B→purchases_sales_b, Retargeting→purchases_retargeting, Post Webinar→purchases_postwebinar. The GHL "AI CHAT BOT" pipeline corresponds to source "AI Bot". add_sale auto-detects Post Webinar (Paid Ads / Sales A / Sales B sale 12h+ after the buyer's last webinar engagement).
+- Purchase sources → columns: Paid Ads→purchases_fb, Native→purchases_native, Youtube→purchases_youtube, AI Bot→purchases_aibot, AI Bot B→purchases_aibot_b, CPA Traffic→purchases_cpa, Sales A→purchases_sales_a, Sales B→purchases_sales_b, Retargeting→purchases_retargeting, Promo→purchases_promo, Post Webinar→purchases_postwebinar. The GHL "AI CHAT BOT" pipeline corresponds to source "AI Bot". add_sale auto-detects Post Webinar (Paid Ads / Sales A / Sales B sale 12h+ after the buyer's last webinar engagement).
 - One purchase per email per LA day is the dedup rule. add_sale reports duplicates instead of double-recording; use skip_dedup only after the user confirms a genuine second sale.
 - Cosmetic corrections to a day's DISPLAYED numbers ("show 5 registrations for Jul 3") go through set_metric_override — overrides sit on top and never touch raw data. A MISSED real sale/event goes through add_sale/add_event so the person actually exists in the data.
 
