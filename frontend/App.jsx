@@ -543,7 +543,7 @@ function GeistSelect({ value, options, onChange, ariaLabel, className = "", icon
   };
 
   return (
-    <div ref={rootRef} className={`geist-select${open ? " is-open" : ""}${className ? ` ${className}` : ""}`} onBlur={() => requestAnimationFrame(() => { if (!rootRef.current?.contains(document.activeElement)) setOpen(false); })}>
+    <div ref={rootRef} className={`geist-select${open ? " is-open" : ""}${className ? ` ${className}` : ""}`} onBlur={e => { if (e.relatedTarget && !rootRef.current?.contains(e.relatedTarget)) setOpen(false); }}>
       <button
         ref={triggerRef}
         type="button"
@@ -649,7 +649,7 @@ function GeistDateRangePicker({ filter, onFilterChange, range, onRangeChange }) 
   })();
 
   return (
-    <div ref={rootRef} className={`geist-date-picker${open ? " is-open" : ""}${draftFilter === "custom" ? " shows-calendar" : ""}`} onBlur={() => requestAnimationFrame(() => { if (!rootRef.current?.contains(document.activeElement)) setOpen(false); })}>
+    <div ref={rootRef} className={`geist-date-picker${open ? " is-open" : ""}${draftFilter === "custom" ? " shows-calendar" : ""}`} onBlur={e => { if (e.relatedTarget && !rootRef.current?.contains(e.relatedTarget)) setOpen(false); }}>
       <button
         ref={triggerRef}
         type="button"
@@ -732,7 +732,7 @@ function SplitTestSettings({ start, onStartNow, onClear, onRegPages }) {
     : "All time";
 
   return (
-    <div ref={rootRef} className={`split-test-settings${open ? " is-open" : ""}`} onBlur={() => requestAnimationFrame(() => { if (!rootRef.current?.contains(document.activeElement)) setOpen(false); })}>
+    <div ref={rootRef} className={`split-test-settings${open ? " is-open" : ""}`} onBlur={e => { if (e.relatedTarget && !rootRef.current?.contains(e.relatedTarget)) setOpen(false); }}>
       <button ref={triggerRef} type="button" className="split-test-trigger" aria-label="A/B test settings" title="A/B test settings" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(current => !current)}>
         <I d="M4 7h10M18 7h2M4 17h2m4 0h10M14 4v6M8 14v6" size={14} />
         <span className="split-test-label-desktop">A/B settings</span>
@@ -1823,7 +1823,7 @@ export default function App() {
                   <div
                     className="lens-menu-root"
                     ref={lensMenuRef}
-                    onBlur={() => requestAnimationFrame(() => { if (!lensMenuRef.current?.contains(document.activeElement)) setLensMenuOpen(false); })}
+                    onBlur={e => { if (e.relatedTarget && !lensMenuRef.current?.contains(e.relatedTarget)) setLensMenuOpen(false); }}
                     onKeyDown={event => {
                       if (event.key !== "Escape" || !lensMenuOpen) return;
                       event.preventDefault();
@@ -4528,6 +4528,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 a:focus-visible{outline:2px solid var(--ds-focus);outline-offset:3px;border-radius:2px}
 ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--ds-gray-400);border-radius:3px}::-webkit-scrollbar-thumb:hover{background:var(--ds-gray-500)}
 @keyframes fu{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fo{from{opacity:0}to{opacity:1}}
 .fi{animation:fu 300ms cubic-bezier(0.16, 1, 0.3, 1)}
 .trow:hover{background:var(--ds-background-200)!important}
 .trow:hover .rowBtn{opacity:1}
@@ -5036,6 +5037,8 @@ code,pre{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
   .menu-workspace-geist-select .geist-select-menu{position:static;width:100%;max-width:none;margin-top:6px}
   .overview-date-controls{width:100%}
   .geist-date-picker,.geist-date-picker-trigger{width:100%}
+  .geist-date-picker-panel{position:fixed;left:14px;right:14px;top:70px;width:auto;max-height:calc(100dvh - 110px)}
+  .fi{animation-name:fo}
   .main-content{padding:20px 14px 48px!important}
   .summary-strip{grid-template-columns:repeat(2,minmax(0,1fr))!important}
   .summary-card{min-height:138px}
