@@ -381,7 +381,7 @@ const DATE_FILTER_OPTIONS = [
   { value: "yesterday", label: "Yesterday" },
   { value: "7", label: "Last 7 days" },
   { value: "30", label: "Last 30 days" },
-  { value: "all", label: "All time" },
+  { value: "mtd", label: "This Month" },
   { value: "custom", label: "Custom range" },
 ];
 
@@ -1399,6 +1399,7 @@ export default function App() {
     if (dateFilter === "yesterday" && d.getTime() !== subDays(today, 1).getTime()) return false;
     if (dateFilter === "7" && d < subDays(today, 7)) return false;
     if (dateFilter === "30" && d < subDays(today, 30)) return false;
+    if (dateFilter === "mtd" && d < new Date(today.getFullYear(), today.getMonth(), 1)) return false;
     if (dateFilter === "custom") {
       const [start, end] = dateRange;
       if (start && d < startOfDay(start)) return false;
