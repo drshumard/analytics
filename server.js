@@ -103,8 +103,14 @@ async function refreshFunnelConfig(force = false) {
         if (error || !rows?.length) throw error || new Error('funnels registry empty');
         const sources = new Map();
         await Promise.all(rows.map(async r => {
-            const { data: srcRows } = await clientForSchema(r.schema_name)
+            let { data: srcRows } = await clientForSchema(r.schema_name)
                 .from('purchase_sources').select('*').eq('is_active', true).order('sort_order');
+            if (!srcRows?.length && /^[a-z][a-z0-9_]{0,30}$/.test(r.schema_name)) {
+                // Schema not yet exposed to PostgREST (fresh provision) — the
+                // public ai_run_sql RPC can still read it with qualification.
+                const { data: viaRpc } = await supabasePublic.rpc('ai_run_sql', { query: `SELECT * FROM ${r.schema_name}.purchase_sources WHERE is_active ORDER BY sort_order` });
+                if (Array.isArray(viaRpc) && viaRpc.length) srcRows = viaRpc;
+            }
             sources.set(r.key, srcRows?.length ? srcRows : FALLBACK_SOURCES);
         }));
         funnelConfig.funnels = new Map(rows.map(r => [r.key, r]));
