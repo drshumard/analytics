@@ -2243,15 +2243,9 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             // Build the per-bucket event-count fields incl. derived purchase totals.
             const buildVals = (vnt) => {
                 const o = {
-                    registrations: pickV('registrations', vnt),
-                    replays: pickV('replays', vnt),
-                    viewedcta: pickV('viewedcta', vnt),
-                    clickedcta: pickV('clickedcta', vnt),
+                    ...Object.fromEntries(eventCols(funnel).map(c => [c, pickV(c, vnt)])),
                     ...Object.fromEntries(PURCHASE_SUB.map(c => [c, pickV(c, vnt)])),
-                    stayed_45: pickV('stayed_45', vnt),
-                    stayed_60: pickV('stayed_60', vnt),
-                    stayed_80: pickV('stayed_80', vnt),
-                    attended: pickV('attended', vnt),
+                    ...Object.fromEntries(milestoneCols(funnel).map(c => [c, pickV(c, vnt)])),
                 };
                 const tp = PURCHASE_SUB.reduce((s, k) => s + (o[k] || 0), 0);
                 o.total_purchases = tp;
