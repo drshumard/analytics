@@ -200,6 +200,13 @@ const api = {
     if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
     return data;
   },
+  async adminAddEventType(body, funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/event-types`, { method: "POST", headers, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
+    return data;
+  },
   async adminAddPurchaseSource(body, funnel) {
     const headers = await getAuthHeaders(funnel);
     const res = await fetch(`${API_BASE}/api/admin/purchase-sources`, { method: "POST", headers, body: JSON.stringify(body) });
@@ -314,19 +321,38 @@ const DEFAULT_SOURCES = [
   { column_name: "purchases_retargeting", source_label: "Retargeting", display_label: "Retargeting" },
   { column_name: "purchases_promo", source_label: "Promo", display_label: "Promo" },
 ];
+const DEFAULT_EVENTS = [
+  { column_name: "registrations", display_label: "Registrations" },
+  { column_name: "attended", display_label: "Attended" },
+  { column_name: "replays", display_label: "Replays" },
+  { column_name: "viewedcta", display_label: "Viewed CTA" },
+  { column_name: "clickedcta", display_label: "Clicked CTA" },
+];
 let FUNNEL_SOURCES = DEFAULT_SOURCES;
-const FUNNEL_META = {}; // funnel key → { label, has_fb, sources } from /api/me/funnels
-const MK_PREFIX = ["fb_spend", "fb_link_clicks", "reg_page_visits", "registrations", "replays", "viewedcta", "clickedcta", "purchases"];
-const MK_SUFFIX = ["stayed_45", "stayed_60", "stayed_80", "total_purchases", "attended"];
+let FUNNEL_EVENTS = DEFAULT_EVENTS;
+let FUNNEL_MILESTONES = true;
+const FUNNEL_META = {}; // funnel key → { label, has_fb, sources, events, webinar_milestones } from /api/me/funnels
+const MK_HEAD = ["fb_spend", "fb_link_clicks", "reg_page_visits"];
+const MILESTONE_COLS = ["stayed_45", "stayed_60", "stayed_80"];
 const STATIC_COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", reg_page_visits: "Page Views", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", stayed_45: "45 min", stayed_60: "60 min", stayed_80: "80 min", total_purchases: "Total Purchases" };
 const MK = [];
 const COL_LABELS = {};
-function applyFunnelColumns(sources) {
-  if (Array.isArray(sources) && sources.length) FUNNEL_SOURCES = sources;
+function applyFunnelColumns(meta) {
+  if (meta) {
+    if (Array.isArray(meta.sources) && meta.sources.length) FUNNEL_SOURCES = meta.sources;
+    if (Array.isArray(meta.events) && meta.events.length) FUNNEL_EVENTS = meta.events;
+    if (meta.webinar_milestones !== undefined) FUNNEL_MILESTONES = !!meta.webinar_milestones;
+  }
   MK.length = 0;
-  MK.push(...MK_PREFIX, ...FUNNEL_SOURCES.map(s => s.column_name), ...MK_SUFFIX);
+  MK.push(...MK_HEAD, ...FUNNEL_EVENTS.map(e => e.column_name), "purchases", ...FUNNEL_SOURCES.map(s => s.column_name), ...(FUNNEL_MILESTONES ? MILESTONE_COLS : []), "total_purchases");
   Object.keys(COL_LABELS).forEach(k => delete COL_LABELS[k]);
-  Object.assign(COL_LABELS, STATIC_COL_LABELS, Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, s.display_label])));
+  Object.assign(
+    COL_LABELS,
+    Object.fromEntries(FUNNEL_EVENTS.map(e => [e.column_name, e.display_label])),
+    STATIC_COL_LABELS,
+    Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, s.display_label]))
+  );
+  if (!FUNNEL_MILESTONES) for (const k of MILESTONE_COLS) delete COL_LABELS[k];
 }
 applyFunnelColumns(null);
 const DEFAULT_HIDDEN = [];
@@ -342,16 +368,14 @@ const DEFAULT_SUMMARY_CARDS = [
 const summaryMetricOptions = () => [
   { key: "fb_spend", label: "FB Spend", defaultFormat: "currency" },
   { key: "fb_link_clicks", label: "Reg. Page Visits", defaultFormat: "number" },
-  { key: "registrations", label: "Registrations", defaultFormat: "number" },
-  { key: "attended", label: "Attended", defaultFormat: "number" },
-  { key: "replays", label: "Replays", defaultFormat: "number" },
-  { key: "viewedcta", label: "Viewed CTA", defaultFormat: "number" },
-  { key: "clickedcta", label: "Clicked CTA", defaultFormat: "number" },
+  ...FUNNEL_EVENTS.map(e => ({ key: e.column_name, label: e.display_label, defaultFormat: "number" })),
   { key: "purchases", label: "Total Purchases", defaultFormat: "number" },
   ...FUNNEL_SOURCES.map(s => ({ key: s.column_name, label: s.display_label, defaultFormat: "number" })),
-  { key: "stayed_45", label: "45 min", defaultFormat: "number" },
-  { key: "stayed_60", label: "60 min", defaultFormat: "number" },
-  { key: "stayed_80", label: "80 min", defaultFormat: "number" },
+  ...(FUNNEL_MILESTONES ? [
+    { key: "stayed_45", label: "45 min", defaultFormat: "number" },
+    { key: "stayed_60", label: "60 min", defaultFormat: "number" },
+    { key: "stayed_80", label: "80 min", defaultFormat: "number" },
+  ] : []),
   { key: "total_purchases", label: "Total Purchases (alt)", defaultFormat: "number" },
 ];
 const evalFormula = (f, row, ctx = {}) => { try { let e = f.trim(); for (const k of MK) e = e.replace(new RegExp(`\\b${k}\\b`, "gi"), String(Number(row[k]) || 0)); for (const [k, v] of Object.entries(ctx)) e = e.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi"), String(Number(v) || 0)); if (/[^0-9+\-*/().%\s]/.test(e)) return null; e = e.replace(/[_%]/g, m => m === '%' ? '/100*' : ''); const r = Function('"use strict"; return (' + e + ")")(); return isFinite(r) ? Math.round(r * 100) / 100 : null; } catch { return null; } };
@@ -1160,7 +1184,7 @@ export default function App() {
         setActiveFunnelLS(active);
         setActiveFunnelState(active);
       }
-      applyFunnelColumns(FUNNEL_META[active]?.sources);
+      applyFunnelColumns(FUNNEL_META[active]);
 
       // ── Step 2: Now safely call /api/me with a valid funnel ─────────
       const res = await fetch(`${API_BASE}/api/me`, {
@@ -1184,7 +1208,7 @@ export default function App() {
   const switchFunnel = useCallback((f) => {
     if (f === activeFunnel) return;
     if (!allowedFunnels.includes(f)) return;
-    applyFunnelColumns(FUNNEL_META[f]?.sources);
+    applyFunnelColumns(FUNNEL_META[f]);
     setActiveFunnelLS(f);
     setActiveFunnelState(f);
   }, [activeFunnel, allowedFunnels]);
@@ -1719,7 +1743,7 @@ export default function App() {
                   <div className="account-popover-identity"><strong>{session?.user?.email?.split("@")[0] || "Account"}</strong><span>{session?.user?.email || ""}</span><small>{isAdmin ? "Administrator" : "Viewer"}</small></div>
                   <div className="navbar-popover-divider" />
                   {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} /><span>New funnel</span></button>}
-                  {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} /><span>Purchase columns</span></button>}
+                  {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} /><span>Columns</span></button>}
                   {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} /><span>Password reset link</span></button>}
                   <button onClick={handleLogout}><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={15} /><span>Sign out</span></button>
                 </div>
@@ -1745,7 +1769,7 @@ export default function App() {
                   ))}
                 </nav>
                 <div className="nav-menu-footer">
-                  <div className="nav-menu-utilities"><button onClick={() => { setMobileMenuOpen(false); clearCache(); }}><I d="M3 6h18M8 6V4h8v2m-9 0l1 15h8l1-15" size={15} />Clear cache</button>{isAdmin && <button disabled={finalizing} onClick={() => { setMobileMenuOpen(false); finalizePastDays(); }}><I d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14" size={15} />{finalizing ? "Finalizing…" : "Finalize data"}</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} />New funnel</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} />Purchase columns</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} />Password reset link</button>}</div>
+                  <div className="nav-menu-utilities"><button onClick={() => { setMobileMenuOpen(false); clearCache(); }}><I d="M3 6h18M8 6V4h8v2m-9 0l1 15h8l1-15" size={15} />Clear cache</button>{isAdmin && <button disabled={finalizing} onClick={() => { setMobileMenuOpen(false); finalizePastDays(); }}><I d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14" size={15} />{finalizing ? "Finalizing…" : "Finalize data"}</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} />New funnel</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} />Columns</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} />Password reset link</button>}</div>
                   <div className="nav-menu-account"><span className="account-avatar">{(session?.user?.email || "U").charAt(0).toUpperCase()}</span><div><strong>{session?.user?.email?.split("@")[0] || "Account"}</strong><span>{isAdmin ? "Administrator" : "Viewer"}</span></div><button onClick={handleLogout} aria-label="Sign out" title="Sign out"><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={16} /></button></div>
                 </div>
               </div>
@@ -2735,6 +2759,8 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
   const [fbId, setFbId] = useState("");
   const [fbCheck, setFbCheck] = useState(null); // {ok, name} | {ok:false, error}
   const [checkingFb, setCheckingFb] = useState(false);
+  const [useStandardEvents, setUseStandardEvents] = useState(true);
+  const [customEvents, setCustomEvents] = useState([{ event_type: "", display_label: "" }]);
   const [picked, setPicked] = useState(() => new Set(FUNNEL_SOURCES.map(s => s.source_label)));
   const [customs, setCustoms] = useState([]); // [{source_label, display_label}]
   const [err, setErr] = useState("");
@@ -2759,10 +2785,14 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
       ...customs.filter(c => c.source_label.trim()).map(c => ({ source_label: c.source_label.trim(), display_label: (c.display_label || "").trim() || c.source_label.trim() })),
     ];
     if (!sources.length) { setErr("Pick or add at least one purchase source."); return; }
+    const events = useStandardEvents ? undefined : customEvents
+      .filter(e => e.event_type.trim())
+      .map(e => ({ event_type: e.event_type.trim(), display_label: (e.display_label || "").trim() || e.event_type.trim() }));
+    if (!useStandardEvents && (!events || !events.length)) { setErr("Define at least one event, or use the standard webinar stages."); return; }
     if (fbId.trim() && !fbCheck?.ok) { setErr("Validate the Facebook ad account first (or clear the field)."); return; }
     setBusy(true);
     try {
-      const r = await api.adminCreateFunnel({ key: key.trim(), label: label.trim(), fb_ad_account_id: fbId.trim() || undefined, sources }, funnel);
+      const r = await api.adminCreateFunnel({ key: key.trim(), label: label.trim(), fb_ad_account_id: fbId.trim() || undefined, sources, events, webinar_milestones: useStandardEvents }, funnel);
       setResult(r);
       onCreated?.();
     } catch (ex) { setErr(ex.message); }
@@ -2778,7 +2808,7 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
         <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Funnel "{result.label}" is live</div>
         <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>
           Schema, tables, and dashboard are provisioned{result.fb_ad_account ? <> · Facebook spend syncs from <strong>{result.fb_ad_account.name}</strong></> : " · no Facebook account linked"}.
-          Columns: {result.columns.map(c => c.display_label).join(", ")}.
+          Events: {(result.events || []).map(e => e.display_label).join(", ")} · Purchase columns: {result.columns.map(c => c.display_label).join(", ")}.
         </div>
         {result.manual_step && (
           <div style={{ background: "#FFF4ED", border: "1px solid #F5C6A5", borderRadius: 8, padding: "10px 12px", marginBottom: 14 }}>
@@ -2824,6 +2854,26 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
             : <div style={{ fontSize: 12, color: "#C00", marginTop: 6 }}>{fbCheck.error}</div>)}
           <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginTop: 4 }}>The system-user token must have access to this account (same Business Manager).</div>
         </div>
+        <div style={{ marginBottom: 14 }}>
+          <div style={fieldLabel}>Funnel events</div>
+          <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, color: "var(--ds-gray-800)", cursor: "pointer", marginBottom: 6 }}>
+            <input type="checkbox" checked={useStandardEvents} onChange={e => setUseStandardEvents(e.target.checked)} />
+            Standard webinar stages ({DEFAULT_EVENTS.map(e => e.display_label).join(", ")}) + stay-time milestones
+          </label>
+          {!useStandardEvents && (
+            <div>
+              <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginBottom: 6 }}>Define this funnel's own events. The event name is what webhooks send as <code>field</code> and becomes the column name (lowercase/underscores).</div>
+              {customEvents.map((e, i) => (
+                <div key={i} style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+                  <input value={e.event_type} onChange={ev => setCustomEvents(cs => cs.map((x, j) => j === i ? { ...x, event_type: ev.target.value } : x))} placeholder='Event name (e.g. "leads")' style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }} />
+                  <input value={e.display_label} onChange={ev => setCustomEvents(cs => cs.map((x, j) => j === i ? { ...x, display_label: ev.target.value } : x))} placeholder="Column label (optional)" style={{ ...inputStyle, flex: 1 }} />
+                  <button type="button" aria-label="Remove event" onClick={() => setCustomEvents(cs => cs.filter((_, j) => j !== i))} style={{ ...S.btnLight, padding: "0 10px" }}>✕</button>
+                </div>
+              ))}
+              <button type="button" onClick={() => setCustomEvents(cs => [...cs, { event_type: "", display_label: "" }])} style={{ background: "none", border: "none", padding: 0, fontSize: 13, color: "var(--ds-blue-700)", cursor: "pointer", fontWeight: 600 }}>+ Add an event</button>
+            </div>
+          )}
+        </div>
         <div style={{ marginBottom: 6 }}>
           <div style={fieldLabel}>Purchase columns</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px", marginBottom: 8 }}>
@@ -2843,7 +2893,7 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
           ))}
           <button type="button" onClick={() => setCustoms(cs => [...cs, { source_label: "", display_label: "" }])} style={{ background: "none", border: "none", padding: 0, fontSize: 13, color: "var(--ds-blue-700)", cursor: "pointer", fontWeight: 600 }}>+ Add a new source</button>
         </div>
-        <div style={{ fontSize: 11, color: "var(--ds-gray-600)", margin: "10px 0 16px" }}>Every funnel also gets the standard stages (registrations, attended, replays, CTA, webinar milestones) — pick which purchase sources it tracks.</div>
+        <div style={{ fontSize: 11, color: "var(--ds-gray-600)", margin: "10px 0 16px" }}>Purchases are always tracked; events and purchase sources define the funnel's own columns. Dashboard, webhooks, editors, and the AI all pick them up automatically.</div>
         <div style={{ display: "flex", gap: 10 }}>
           <button type="button" style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
           <button type="submit" disabled={busy} aria-busy={busy} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{busy ? "Provisioning…" : "Create funnel"}</button>
@@ -2858,9 +2908,22 @@ function ManageColumnsModal({ funnel, onCancel, onChanged }) {
   const dialogRef = useDialogFocus();
   const [srcLabel, setSrcLabel] = useState("");
   const [dispLabel, setDispLabel] = useState("");
+  const [evName, setEvName] = useState("");
+  const [evLabel, setEvLabel] = useState("");
   const [err, setErr] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const addEvent = async () => {
+    setErr(""); setNotice("");
+    setBusy(true);
+    try {
+      const r = await api.adminAddEventType({ event_type: evName.trim(), display_label: evLabel.trim() || undefined }, funnel);
+      setNotice(`Added event "${r.display_label}" (${r.column_name}). ${r.note}`);
+      setEvName(""); setEvLabel("");
+      onChanged?.();
+    } catch (ex) { setErr(ex.message); }
+    finally { setBusy(false); }
+  };
   const add = async (e) => {
     e.preventDefault();
     setErr(""); setNotice("");
@@ -2876,21 +2939,40 @@ function ManageColumnsModal({ funnel, onCancel, onChanged }) {
   return (
     <div className="modal-backdrop" style={S.overlay} onClick={onCancel}>
       <form ref={dialogRef} tabIndex={-1} className="modal-inner" role="dialog" aria-modal="true" aria-label="Purchase columns" style={{ ...S.modal, maxWidth: 480, textAlign: "left" }} onClick={e => e.stopPropagation()} onSubmit={add}>
-        <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Purchase columns — {FUNNEL_META[funnel]?.label || funnel}</div>
-        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>Add a purchase source: the column is created in the database and webhooks can use the source immediately. Dashboards, editors, and the AI pick it up automatically.</div>
+        <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Columns — {FUNNEL_META[funnel]?.label || funnel}</div>
+        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>Add event columns or purchase sources: the column is created in the database and webhooks can use it immediately. Dashboards, editors, and the AI pick it up automatically.</div>
         {err && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 12, border: "1px solid #F5B7B7" }}>{err}</div>}
         {notice && <div role="status" style={{ background: "#F0FDF4", color: "#166534", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 12, border: "1px solid #BBF7D0" }}>{notice}</div>}
-        <div style={{ marginBottom: 14, maxHeight: 180, overflowY: "auto", border: "1px solid var(--ds-border)", borderRadius: 8, padding: "8px 12px" }}>
+        <div style={{ marginBottom: 14, maxHeight: 200, overflowY: "auto", border: "1px solid var(--ds-border)", borderRadius: 8, padding: "8px 12px" }}>
+          <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "var(--ds-gray-600)", padding: "2px 0" }}>Events</div>
+          {(FUNNEL_META[funnel]?.events || FUNNEL_EVENTS).map(e => (
+            <div key={e.column_name} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "3px 0" }}>
+              <span>{e.display_label}</span>
+              <span style={{ color: "var(--ds-gray-500)", fontFamily: "monospace", fontSize: 11 }}>field:{e.column_name}</span>
+            </div>
+          ))}
+          <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "var(--ds-gray-600)", padding: "6px 0 2px", borderTop: "1px solid var(--ds-border)", marginTop: 6 }}>Purchase sources</div>
           {(FUNNEL_META[funnel]?.sources || FUNNEL_SOURCES).map(s => (
-            <div key={s.column_name} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "4px 0" }}>
+            <div key={s.column_name} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "3px 0" }}>
               <span>{s.display_label}</span>
               <span style={{ color: "var(--ds-gray-500)", fontFamily: "monospace", fontSize: 11 }}>{s.source_label} → {s.column_name}</span>
             </div>
           ))}
         </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 10, marginBottom: 14, alignItems: "end" }}>
+          <div>
+            <label htmlFor="ev-name" style={fieldLabel}>New event name</label>
+            <input id="ev-name" value={evName} onChange={e => setEvName(e.target.value)} placeholder='e.g. "leads"' style={{ ...inputStyle, fontFamily: "monospace" }} />
+          </div>
+          <div>
+            <label htmlFor="ev-label" style={fieldLabel}>Column label (optional)</label>
+            <input id="ev-label" value={evLabel} onChange={e => setEvLabel(e.target.value)} placeholder="defaults to name" style={inputStyle} />
+          </div>
+          <button type="button" disabled={busy || !evName.trim()} onClick={addEvent} style={{ ...S.btnDark, padding: "9px 14px", fontSize: 13 }}>Add event</button>
+        </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
           <div>
-            <label htmlFor="pc-src" style={fieldLabel}>Webhook source value</label>
+            <label htmlFor="pc-src" style={fieldLabel}>New purchase source (webhook value)</label>
             <input id="pc-src" data-dialog-initial-focus value={srcLabel} onChange={e => setSrcLabel(e.target.value)} required placeholder='e.g. "TikTok"' style={inputStyle} />
           </div>
           <div>
@@ -3269,16 +3351,16 @@ function EmailDrillModal({ drill, loading, onClose, onOpenContact }) {
 function EntryForm({ initial, onSubmit, onCancel, isMobile }) {
   const today = getLADate();
   const defaults = initial
-    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, registrations: initial.registrations ?? 0, replays: initial.replays ?? 0, viewedcta: initial.viewedcta ?? 0, clickedcta: initial.clickedcta ?? 0, ...Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, initial[s.column_name] ?? 0])), stayed_45: initial.stayed_45 ?? 0, stayed_60: initial.stayed_60 ?? 0, stayed_80: initial.stayed_80 ?? 0, attended: initial.attended ?? 0 }
-    : { fb_spend: "", fb_link_clicks: "", registrations: "", replays: "", viewedcta: "", clickedcta: "", ...Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, ""])), stayed_45: "", stayed_60: "", stayed_80: "", attended: "" };
+    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, ...Object.fromEntries(FUNNEL_EVENTS.map(e => [e.column_name, initial[e.column_name] ?? 0])), ...Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, initial[s.column_name] ?? 0])), ...Object.fromEntries((FUNNEL_MILESTONES ? MILESTONE_COLS : []).map(k => [k, initial[k] ?? 0])) }
+    : { fb_spend: "", fb_link_clicks: "", ...Object.fromEntries(FUNNEL_EVENTS.map(e => [e.column_name, ""])), ...Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, ""])), ...Object.fromEntries((FUNNEL_MILESTONES ? MILESTONE_COLS : []).map(k => [k, ""])) };
   const [f, setF] = useState({ date: initial?.date || today, ...defaults });
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
-  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, ...Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, parseInt(f[s.column_name]) || 0])), stayed_45: parseInt(f.stayed_45) || 0, stayed_60: parseInt(f.stayed_60) || 0, stayed_80: parseInt(f.stayed_80) || 0, attended: parseInt(f.attended) || 0 });
+  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, ...Object.fromEntries(FUNNEL_EVENTS.map(e => [e.column_name, parseInt(f[e.column_name]) || 0])), ...Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, parseInt(f[s.column_name]) || 0])), ...Object.fromEntries((FUNNEL_MILESTONES ? MILESTONE_COLS : []).map(k => [k, parseInt(f[k]) || 0])) });
   const fieldGroups = [
-    { title: "Traffic", description: "Spend, visits, and registrations", fields: [{ k: "fb_spend", l: "Facebook spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Registration page visits", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }] },
-    { title: "Engagement", description: "Attendance and call-to-action behavior", fields: [{ k: "attended", l: "Attended", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }] },
+    { title: "Traffic", description: "Ad spend and page visits", fields: [{ k: "fb_spend", l: "Facebook spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Registration page visits", ph: "0" }] },
+    { title: "Funnel events", description: "This funnel's event counts", fields: FUNNEL_EVENTS.map(e => ({ k: e.column_name, l: e.display_label, ph: "0" })) },
     { title: "Purchase sources", description: "Attribute purchases to their source", fields: FUNNEL_SOURCES.map(s => ({ k: s.column_name, l: s.display_label, ph: "0" })) },
-    { title: "Retention", description: "How long attendees stayed", fields: [{ k: "stayed_45", l: "Stayed 45 minutes", ph: "0" }, { k: "stayed_60", l: "Stayed 60 minutes", ph: "0" }, { k: "stayed_80", l: "Stayed 80 minutes", ph: "0" }] },
+    ...(FUNNEL_MILESTONES ? [{ title: "Retention", description: "How long attendees stayed", fields: [{ k: "stayed_45", l: "Stayed 45 minutes", ph: "0" }, { k: "stayed_60", l: "Stayed 60 minutes", ph: "0" }, { k: "stayed_80", l: "Stayed 80 minutes", ph: "0" }] }] : []),
   ];
   return (
     <div className="fi form-container" style={S.fc}>

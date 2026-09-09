@@ -65,6 +65,18 @@ const FALLBACK_SOURCES = [
     { column_name: 'purchases_promo',       source_label: 'Promo',        display_label: 'Promo',              sort_order: 110 },
 ];
 
+// The webinar stages are the DEFAULT event set (seeded for the original
+// funnels) — not a fixed skeleton. Funnels define their own event columns in
+// <schema>.event_types (e.g. the eboov funnel's stages).
+const FALLBACK_EVENTS = [
+    { column_name: 'registrations', display_label: 'Registrations', sort_order: 10 },
+    { column_name: 'attended',      display_label: 'Attended',      sort_order: 20 },
+    { column_name: 'replays',       display_label: 'Replays',       sort_order: 30 },
+    { column_name: 'viewedcta',     display_label: 'Viewed CTA',    sort_order: 40 },
+    { column_name: 'clickedcta',    display_label: 'Clicked CTA',   sort_order: 50 },
+];
+const STANDARD_EVENT_COLS = FALLBACK_EVENTS.map(e => e.column_name);
+
 const supabasePublic = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
     realtime: { transport: ws },
 });
@@ -84,13 +96,18 @@ function clientForSchema(schema) {
 const funnelConfig = {
     funnels: new Map(FALLBACK_FUNNELS.map(f => [f.key, f])),
     sources: new Map(FALLBACK_FUNNELS.map(f => [f.key, FALLBACK_SOURCES])),
+    events: new Map(FALLBACK_FUNNELS.map(f => [f.key, FALLBACK_EVENTS])),
     sourceMaps: new Map(), // funnel → { source_label: column_name }, precomputed
+    eventSets: new Map(),  // funnel → Set(column_name), precomputed
     loadedAt: 0,
     fromRegistry: false,
 };
 function rebuildSourceMaps() {
     funnelConfig.sourceMaps = new Map(
         [...funnelConfig.sources.entries()].map(([k, rows]) => [k, Object.fromEntries(rows.map(s => [s.source_label, s.column_name]))])
+    );
+    funnelConfig.eventSets = new Map(
+        [...funnelConfig.events.entries()].map(([k, rows]) => [k, new Set(rows.map(e => e.column_name))])
     );
 }
 rebuildSourceMaps();
@@ -102,19 +119,29 @@ async function refreshFunnelConfig(force = false) {
         const { data: rows, error } = await supabasePublic.from('funnels').select('*').eq('is_active', true).order('created_at');
         if (error || !rows?.length) throw error || new Error('funnels registry empty');
         const sources = new Map();
-        await Promise.all(rows.map(async r => {
-            let { data: srcRows } = await clientForSchema(r.schema_name)
-                .from('purchase_sources').select('*').eq('is_active', true).order('sort_order');
-            if (!srcRows?.length && /^[a-z][a-z0-9_]{0,30}$/.test(r.schema_name)) {
+        const events = new Map();
+        const readCfg = async (schema, table) => {
+            let { data } = await clientForSchema(schema)
+                .from(table).select('*').eq('is_active', true).order('sort_order');
+            if (!data?.length && /^[a-z][a-z0-9_]{0,30}$/.test(schema)) {
                 // Schema not yet exposed to PostgREST (fresh provision) — the
                 // public ai_run_sql RPC can still read it with qualification.
-                const { data: viaRpc } = await supabasePublic.rpc('ai_run_sql', { query: `SELECT * FROM ${r.schema_name}.purchase_sources WHERE is_active ORDER BY sort_order` });
-                if (Array.isArray(viaRpc) && viaRpc.length) srcRows = viaRpc;
+                const { data: viaRpc } = await supabasePublic.rpc('ai_run_sql', { query: `SELECT * FROM ${schema}.${table} WHERE is_active ORDER BY sort_order` });
+                if (Array.isArray(viaRpc) && viaRpc.length) data = viaRpc;
             }
-            sources.set(r.key, srcRows?.length ? srcRows : FALLBACK_SOURCES);
+            return data || [];
+        };
+        await Promise.all(rows.map(async r => {
+            const [srcRows, evRows] = await Promise.all([
+                readCfg(r.schema_name, 'purchase_sources'),
+                readCfg(r.schema_name, 'event_types'),
+            ]);
+            sources.set(r.key, srcRows.length ? srcRows : FALLBACK_SOURCES);
+            events.set(r.key, evRows.length ? evRows : FALLBACK_EVENTS);
         }));
         funnelConfig.funnels = new Map(rows.map(r => [r.key, r]));
         funnelConfig.sources = sources;
+        funnelConfig.events = events;
         rebuildSourceMaps();
         funnelConfig.fromRegistry = true;
     } catch (e) {
@@ -136,6 +163,12 @@ function purchaseSources(funnel) { return funnelConfig.sources.get(funnel) || FA
 function purchaseSourceMap(funnel) { return funnelConfig.sourceMaps.get(funnel) || funnelConfig.sourceMaps.get('analytics') || {}; }
 function purchaseSubCols(funnel) { return purchaseSources(funnel).map(s => s.column_name); }
 function purchaseCols(funnel) { return ['purchases', ...purchaseSubCols(funnel)]; }
+function eventTypes(funnel) { return funnelConfig.events.get(funnel) || FALLBACK_EVENTS; }
+function eventCols(funnel) { return eventTypes(funnel).map(e => e.column_name); }
+function eventColSet(funnel) { return funnelConfig.eventSets.get(funnel) || new Set(STANDARD_EVENT_COLS); }
+function hasStandardEvents(funnel) { const s = eventColSet(funnel); return STANDARD_EVENT_COLS.every(c => s.has(c)); }
+function hasMilestones(funnel) { const f = funnelConfig.funnels.get(funnel); return f ? f.webinar_milestones !== false : true; }
+function milestoneCols(funnel) { return hasMilestones(funnel) ? ['stayed_45', 'stayed_60', 'stayed_80'] : []; }
 
 function clientFor(funnel) {
     const f = funnelConfig.funnels.get(funnel);
@@ -919,7 +952,7 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
         const { field, count = 1, name, email, phone, execution_id, ...rest } = req.body;
         // Purchase source columns are NOT in validFields — purchases must always go through
         // field:'purchases' with a 'source' param so source routing and Post Webinar detection run.
-        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'stayeduntil'];
+        const validFields = ['fb_spend', 'fb_link_clicks', 'purchases', ...eventCols(req.funnel), ...(hasMilestones(req.funnel) ? ['stayeduntil'] : [])];
 
         // ── Purchase source mapping (registry-driven; 'Post Webinar' is an
         // explicit tag that skips the 12h auto-detection) ─────────────────
@@ -1169,7 +1202,7 @@ app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, re
     try {
         const supabase = clientFor(req.funnel);
         const { field, value, date: dateInput } = req.body;
-        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', ...purchaseSubCols(req.funnel), 'stayed_45', 'stayed_60', 'stayed_80', 'attended'];
+        const validFields = ['fb_spend', 'fb_link_clicks', ...eventCols(req.funnel), 'purchases', ...purchaseSubCols(req.funnel), ...milestoneCols(req.funnel)];
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -1325,6 +1358,9 @@ app.get('/api/me/funnels', dashboardLimiter, async (req, res) => {
                 label: brandFor(k).funnelName,
                 has_fb: !!fbAccountFor(k),
                 sources: purchaseSources(k).map(({ column_name, source_label, display_label }) => ({ column_name, source_label, display_label })),
+                events: eventTypes(k).map(({ column_name, display_label }) => ({ column_name, display_label })),
+                webinar_milestones: hasMilestones(k),
+                standard_events: hasStandardEvents(k),
             })),
         });
     } catch (err) {
@@ -1544,7 +1580,7 @@ app.delete('/api/lenses/:id', dashboardLimiter, requireAuth, async (req, res) =>
 // Computes deduplicated event counts per day. Past days are cached forever
 // (their counts can't change). Today's counts are recomputed when invalidated
 // by a webhook. This eliminates ~95% of Supabase events-table egress.
-const EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'stayeduntil'];
+// Event types to fetch = the funnel's configured events + purchases + stayeduntil.
 
 // stayeduntil events use metadata.stayeduntil (45|60|80) as the sub-key
 const STAYED_DEDUP_MAP = { 45: 'stayed_45', 60: 'stayed_60', 80: 'stayed_80' };
@@ -1712,7 +1748,7 @@ async function fetchEventsForDateRange(funnel, minDate, maxDate) {
         const { data: batch, error } = await supabase
             .from('events')
             .select('event_type, email, name, phone, event_time, metadata')
-            .in('event_type', EVENT_TYPES)
+            .in('event_type', [...eventCols(funnel), 'purchases', 'stayeduntil'])
             .gte('event_time', `${minDate}T00:00:00`)
             .lte('event_time', `${maxDatePadded}T23:59:59`)
             .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
@@ -1886,14 +1922,13 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
     }
 
     const FIELDS = [
-        'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
+        ...eventCols(funnel),
         ...purchaseSubCols(funnel),
-        'stayed_45', 'stayed_60', 'stayed_80',
+        ...milestoneCols(funnel),
     ];
 
     const FIELD_PARENT = {
-        registrations: 'registrations', attended: 'attended', replays: 'replays',
-        viewedcta: 'viewedcta', clickedcta: 'clickedcta',
+        ...Object.fromEntries(eventCols(funnel).map(c => [c, c])),
         ...Object.fromEntries(purchaseSubCols(funnel).map(c => [c, 'purchases'])),
         stayed_45: 'stayeduntil', stayed_60: 'stayeduntil', stayed_80: 'stayeduntil',
     };
@@ -2170,9 +2205,9 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
 
         const PURCHASE_SUB = purchaseSubCols(funnel);
         const DEDUP_COLS = new Set([
-            'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
+            ...eventCols(funnel),
             ...PURCHASE_SUB,
-            'stayed_45', 'stayed_60', 'stayed_80',
+            ...milestoneCols(funnel),
         ]);
 
         // Convert to frontend format (MM/DD/YYYY)
@@ -2282,7 +2317,7 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
 
         // Only write to overrides — raw columns stay as the automated data source.
         // This prevents overrides from drifting separately from raw columns (#6).
-        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', ...purchaseSubCols(req.funnel), 'stayed_45', 'stayed_60', 'stayed_80'];
+        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', ...eventCols(req.funnel), 'purchases', ...purchaseSubCols(req.funnel), ...milestoneCols(req.funnel)];
         const newOverrides = {};
         for (const f of OVERRIDE_FIELDS) {
             if (body[f] !== undefined) {
@@ -2601,7 +2636,7 @@ app.get('/api/admin/fb-account', dashboardLimiter, requireAuth, requireAdmin, as
 // POST /api/admin/funnels — provision a complete new funnel.
 // Body: { key, label, fb_ad_account_id?, sources: [{ source_label, display_label? }] }
 app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
-    const { key: rawKey, label, fb_ad_account_id, sources: rawSources } = req.body || {};
+    const { key: rawKey, label, fb_ad_account_id, sources: rawSources, events: rawEvents, webinar_milestones: rawMilestones } = req.body || {};
     const key = String(rawKey || '').trim().toLowerCase();
     try {
         await refreshFunnelConfig(true);
@@ -2623,6 +2658,24 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
             sources.push({ column_name: column, source_label: srcLabel, display_label: String(s.display_label || '').trim() || (known ? known.display_label : srcLabel) });
         }
 
+        // Event columns: default = the standard webinar stages; custom funnels
+        // define their own (e.g. eboov's stages). Column name = the webhook
+        // `field` value = the events.event_type.
+        const RESERVED_COLS = new Set(['id', 'date', 'day_of_week', 'fb_spend', 'fb_link_clicks', 'purchases', 'attended', 'overrides', 'variant_splits', 'finalized_at', 'created_at', 'updated_at', 'total_purchases', 'stayeduntil', 'stayed_45', 'stayed_60', 'stayed_80', 'reg_page_visits', 'day', 'email', 'name', 'phone']);
+        const eventsIn = (Array.isArray(rawEvents) && rawEvents.length) ? rawEvents : FALLBACK_EVENTS.map(e => ({ event_type: e.column_name, display_label: e.display_label }));
+        const seenEv = new Set();
+        const events = [];
+        for (const e of eventsIn) {
+            const evName = String(e.event_type || e.column_name || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+            if (!/^[a-z][a-z0-9_]{1,28}$/.test(evName)) return res.status(400).json({ error: `Bad event name: "${e.event_type || e.column_name}" (2-29 chars, lowercase letters/digits/underscores)` });
+            if (RESERVED_COLS.has(evName) || evName.startsWith('purchases_')) return res.status(400).json({ error: `Event name "${evName}" is reserved` });
+            if (seenEv.has(evName)) continue;
+            seenEv.add(evName);
+            events.push({ column_name: evName, display_label: String(e.display_label || '').trim() || evName });
+        }
+        if (!events.length) return res.status(400).json({ error: 'Define at least one event' });
+        const milestones = rawMilestones !== undefined ? !!rawMilestones : !Array.isArray(rawEvents) || rawEvents.length === 0;
+
         let fb = null;
         if (fb_ad_account_id) {
             fb = await validateFbAccount(fb_ad_account_id);
@@ -2641,6 +2694,17 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
         console.log(`🏗️  Provisioning funnel "${key}" (${statements.length} statements) by ${req.user.email}`);
         try {
             for (const stmt of statements) await runProvisionSQL(stmt);
+            // Event columns + config per selection
+            for (let i = 0; i < events.length; i++) {
+                const e = events[i];
+                await runProvisionSQL(`ALTER TABLE ${key}.daily_metrics ADD COLUMN IF NOT EXISTS ${e.column_name} INTEGER NOT NULL DEFAULT 0`);
+                await runProvisionSQL(`INSERT INTO ${key}.event_types (column_name, display_label, sort_order) VALUES (${sqlLit(e.column_name)}, ${sqlLit(e.display_label)}, ${(i + 1) * 10}) ON CONFLICT (column_name) DO NOTHING`);
+            }
+            if (milestones) {
+                for (const c of ['stayed_45', 'stayed_60', 'stayed_80']) {
+                    await runProvisionSQL(`ALTER TABLE ${key}.daily_metrics ADD COLUMN IF NOT EXISTS ${c} INTEGER NOT NULL DEFAULT 0`);
+                }
+            }
             // Purchase columns + source config per selection
             for (let i = 0; i < sources.length; i++) {
                 const s = sources[i];
@@ -2648,10 +2712,10 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
                 await runProvisionSQL(`INSERT INTO ${key}.purchase_sources (column_name, source_label, display_label, sort_order) VALUES (${sqlLit(s.column_name)}, ${sqlLit(s.source_label)}, ${sqlLit(s.display_label)}, ${(i + 1) * 10}) ON CONFLICT (column_name) DO NOTHING`);
             }
             // Default lens with the chosen columns
-            const lensMetrics = ['fb_spend', 'fb_link_clicks', 'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', ...sources.map(s => s.column_name), 'total_purchases'];
+            const lensMetrics = ['fb_spend', 'fb_link_clicks', ...events.map(e => e.column_name), ...sources.map(s => s.column_name), 'total_purchases'];
             await runProvisionSQL(`INSERT INTO ${key}.dashboard_lenses (id, name, metrics, sort_order) VALUES ('default-all', 'All Metrics', ${sqlLit(JSON.stringify(lensMetrics))}::jsonb, 0)`);
             // Registry row + creator access/admin
-            await runProvisionSQL(`INSERT INTO public.funnels (key, schema_name, label, fb_ad_account_id, created_by) VALUES (${sqlLit(key)}, ${sqlLit(key)}, ${sqlLit(String(label).trim())}, ${fb ? sqlLit(fb.id) : 'NULL'}, ${sqlLit(req.user.id)})`);
+            await runProvisionSQL(`INSERT INTO public.funnels (key, schema_name, label, fb_ad_account_id, created_by, webinar_milestones) VALUES (${sqlLit(key)}, ${sqlLit(key)}, ${sqlLit(String(label).trim())}, ${fb ? sqlLit(fb.id) : 'NULL'}, ${sqlLit(req.user.id)}, ${milestones})`);
             await runProvisionSQL(`INSERT INTO public.user_funnel_access (user_id, funnel) VALUES (${sqlLit(req.user.id)}, ${sqlLit(key)}) ON CONFLICT DO NOTHING`);
             await runProvisionSQL(`INSERT INTO ${key}.user_roles (user_id, role) VALUES (${sqlLit(req.user.id)}, 'admin') ON CONFLICT (user_id) DO UPDATE SET role = 'admin'`);
         } catch (provisionErr) {
@@ -2685,6 +2749,8 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
             funnel: key,
             label: String(label).trim(),
             fb_ad_account: fb ? { id: fb.id, name: fb.name } : null,
+            events,
+            webinar_milestones: milestones,
             columns: sources,
             webhook_api_key: plaintextKey,
             postgrest_exposed: reachable,
@@ -2728,6 +2794,37 @@ app.post('/api/admin/purchase-sources', dashboardLimiter, requireAuth, requireAd
         return res.json({ ok: true, funnel, column_name: column, source_label: srcLabel, display_label: dispLabel, note: `Webhooks can now send source:"${srcLabel}" on purchases.` });
     } catch (err) {
         console.error('❌ POST /api/admin/purchase-sources error:', err.message);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/admin/event-types — add an EVENT column to the CURRENT funnel.
+// Body: { event_type, display_label? } — the event_type is both the webhook
+// `field` value and the daily_metrics column name.
+app.post('/api/admin/event-types', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const funnel = req.funnel;
+        const schema = funnelConfig.funnels.get(funnel)?.schema_name;
+        if (!schema) return res.status(400).json({ error: `Unknown funnel ${funnel}` });
+        const evName = String(req.body?.event_type || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+        const dispLabel = String(req.body?.display_label || '').trim() || evName;
+        if (!/^[a-z][a-z0-9_]{1,28}$/.test(evName)) return res.status(400).json({ error: 'Event name must be 2-29 chars: lowercase letters, digits, underscores' });
+        const RESERVED = new Set(['id', 'date', 'day_of_week', 'fb_spend', 'fb_link_clicks', 'purchases', 'overrides', 'variant_splits', 'finalized_at', 'created_at', 'updated_at', 'total_purchases', 'stayeduntil', 'stayed_45', 'stayed_60', 'stayed_80', 'reg_page_visits', 'day', 'email', 'name', 'phone']);
+        if (RESERVED.has(evName) || evName.startsWith('purchases_')) return res.status(400).json({ error: `Event name "${evName}" is reserved` });
+        await refreshFunnelConfig(true);
+        const existing = eventTypes(funnel);
+        if (existing.some(e => e.column_name === evName)) return res.status(400).json({ error: `Event "${evName}" already exists on this funnel` });
+        const nextSort = Math.max(0, ...existing.map(e => e.sort_order || 0)) + 10;
+        await runProvisionSQL(`ALTER TABLE ${schema}.daily_metrics ADD COLUMN IF NOT EXISTS ${evName} INTEGER NOT NULL DEFAULT 0`);
+        await runProvisionSQL(`INSERT INTO ${schema}.event_types (column_name, display_label, sort_order) VALUES (${sqlLit(evName)}, ${sqlLit(dispLabel)}, ${nextSort})`);
+        await runProvisionSQL(`UPDATE ${schema}.dashboard_lenses SET metrics = (metrics - 'total_purchases') || ${sqlLit(JSON.stringify([evName, 'total_purchases']))}::jsonb WHERE id = 'default-all' AND NOT metrics ? ${sqlLit(evName)}`);
+        await runProvisionSQL(`NOTIFY pgrst, 'reload schema'`);
+        await refreshFunnelConfig(true);
+        invalidateMetricsCache(funnel);
+        console.log(`✅ Event type "${evName}" added to ${schema} by ${req.user.email}`);
+        return res.json({ ok: true, funnel, column_name: evName, display_label: dispLabel, note: `Webhooks can now send field:"${evName}" and it counts into the ${dispLabel} column.` });
+    } catch (err) {
+        console.error('❌ POST /api/admin/event-types error:', err.message);
         return res.status(500).json({ error: err.message });
     }
 });
@@ -2834,9 +2931,9 @@ app.post('/api/admin/backfill-variant-splits', requireAuth, requireAdmin, async 
         const dedupMap = computeDedupFromEvents(events, abCutoff, aliasMap, emailPhones, purchaseSourceMap(funnel));
 
         const FIELDS = [
-            'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
+            ...eventCols(funnel),
             ...purchaseSubCols(funnel),
-            'stayed_45', 'stayed_60', 'stayed_80',
+            ...milestoneCols(funnel),
         ];
         let updated = 0;
         for (const t of targets) {
@@ -3595,7 +3692,7 @@ async function loadAllInsightsMetrics(funnel) {
     const dates = rawRows.filter(r => !r.finalized_at).map(r => String(r.date).substring(0, 10));
     const dedupMap = await getDedupCounts(funnel, dates);
 
-    const PURCHASE_SUB_COLS = new Set([...purchaseSubCols(funnel), 'stayed_45', 'stayed_60', 'stayed_80']);
+    const PURCHASE_SUB_COLS = new Set([...purchaseSubCols(funnel), ...milestoneCols(funnel)]);
     const metrics = rawRows.map(r => {
         const dateStr = String(r.date).substring(0, 10);
         const deduped = dedupMap[dateStr] || {};
@@ -3613,15 +3710,9 @@ async function loadAllInsightsMetrics(funnel) {
             day: r.day_of_week,
             fb_spend: ov.fb_spend !== undefined ? ov.fb_spend : Number(r.fb_spend),
             fb_link_clicks: ov.fb_link_clicks !== undefined ? ov.fb_link_clicks : Number(r.fb_link_clicks || 0),
-            registrations: pick('registrations'),
-            attended: pick('attended'),
-            replays: pick('replays'),
-            viewedcta: pick('viewedcta'),
-            clickedcta: pick('clickedcta'),
+            ...Object.fromEntries(eventCols(funnel).map(c => [c, pick(c)])),
             ...Object.fromEntries(purchaseSubCols(funnel).map(c => [c, pick(c) || 0])),
-            stayed_45: pick('stayed_45') || 0,
-            stayed_60: pick('stayed_60') || 0,
-            stayed_80: pick('stayed_80') || 0,
+            ...Object.fromEntries(milestoneCols(funnel).map(c => [c, pick(c) || 0])),
             total_purchases: purchaseSubCols(funnel).reduce((s, c) => s + (pick(c) || 0), 0),
         };
     });
@@ -3672,7 +3763,7 @@ async function getInsightsRollup(funnel, period, from, to) {
     };
 
     const buckets = new Map();
-    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta',...purchaseSubCols(funnel),'stayed_45','stayed_60','stayed_80','total_purchases'];
+    const ADDITIVE = ['fb_spend','fb_link_clicks',...eventCols(funnel),...purchaseSubCols(funnel),...milestoneCols(funnel),'total_purchases'];
 
     for (const r of rows) {
         const k = bucketKey(r.date);
@@ -3707,7 +3798,7 @@ async function compareInsightsPeriods(funnel, aFrom, aTo, bFrom, bTo) {
         getInsightsMetrics(funnel, bFrom, bTo),
     ]);
 
-    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta',...purchaseSubCols(funnel),'total_purchases'];
+    const ADDITIVE = ['fb_spend','fb_link_clicks',...eventCols(funnel),...purchaseSubCols(funnel),'total_purchases'];
     const sumOf = (rows) => {
         const t = { days: rows.length };
         ADDITIVE.forEach(c => t[c] = rows.reduce((s, r) => s + (Number(r[c]) || 0), 0));
@@ -5139,6 +5230,26 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
             ? '(no remembered facts yet — use the `remember` tool to save things future chats should know)'
             : memory.map(m => `- ${m.key}: ${m.value}`).join('\n');
 
+        // Funnel shape: standard webinar funnels keep the rich hand-written
+        // stage/metric text; custom-event funnels get generated equivalents,
+        // and the Shumard-specific GHL/avatar tools are withheld.
+        const standardFunnel = hasStandardEvents(funnel);
+        const stagesList = standardFunnel ? `3. Registrations — people who signed up for the webinar
+4. Attended — people who actually attended the webinar
+5. Replays — people who watched the replay
+6. Viewed CTA — people who saw the call to action
+7. Clicked CTA — people who clicked the call to action` : eventTypes(funnel).map((e, i) => `${i + 3}. ${e.display_label} (${e.column_name}) — "${e.column_name}" events sent by this funnel's webhooks`).join('\n');
+        const keyMetricsList = standardFunnel ? `- Landing Page Conversion Rate = registrations / fb_link_clicks × 100
+- Cost per Registration         = fb_spend / registrations
+- Attendance Rate               = attended / registrations × 100
+- CTA View Rate                 = viewedcta / (attended + replays) × 100
+- CTA Click Rate                = clickedcta / viewedcta × 100
+- Conversion Rate               = total_purchases / clickedcta × 100
+- Cost per Acquisition          = fb_spend / total_purchases
+- Post Webinar Rate             = purchases_postwebinar / total_purchases × 100` : `- Cost per <stage> = fb_spend / <stage count>, for any stage above
+- Stage-to-stage conversion = later stage / earlier stage × 100 (stages are listed in funnel order)
+- Cost per Acquisition = fb_spend / total_purchases`;
+
         // CRM / journey digest — compact cached rollups injected into the prompt so
         // common journey/timing questions are answered with no extra egress. Best-effort:
         // if the CRM tables aren't present in this funnel yet, the block stays empty.
@@ -5156,7 +5267,7 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
         } catch { /* digest is best-effort — never block the chat */ }
 
         // GoHighLevel opportunities (via the ghl MCP server) — only when configured.
-        const ghlBlock = !GHL_ENABLED ? '' : `
+        const ghlBlock = (!GHL_ENABLED || !standardFunnel) ? '' : `
 
 GOHIGHLEVEL CRM — OPPORTUNITIES (ghl MCP tools):
 - locationId: ${GHL_LOCATION_ID} — provide it wherever a GHL tool expects a location.
@@ -5175,26 +5286,15 @@ TODAY'S DATE: ${today} (Los Angeles timezone)
 THE FUNNEL STAGES (in order):
 1. FB Spend — daily Facebook ad budget
 2. Total Registration Page Visited (fb_link_clicks) — people who clicked the ad link to the registration page
-3. Registrations — people who signed up for the webinar
-4. Attended — people who actually attended the webinar
-5. Replays — people who watched the replay
-6. Viewed CTA — people who saw the call to action
-7. Clicked CTA — people who clicked the call to action
-8. Purchases — broken down by source:
+${stagesList}
+${eventCols(funnel).length + 3}. Purchases — broken down by source:
 ${purchaseSources(funnel).map(s => s.column_name === 'purchases_postwebinar'
         ? `   - ${s.column_name} (${s.display_label}) — Paid Ads / Sales A / Sales B purchases made 12+ hours AFTER attending a webinar (auto-detected; webhooks can also tag source:"Post Webinar" explicitly)`
         : `   - ${s.column_name} (${s.display_label}) — purchases attributed to webhook source:"${s.source_label}"`).join('\n')}
    - total_purchases — sum of all purchase sources above
 
 KEY METRICS:
-- Landing Page Conversion Rate = registrations / fb_link_clicks × 100
-- Cost per Registration         = fb_spend / registrations
-- Attendance Rate               = attended / registrations × 100
-- CTA View Rate                 = viewedcta / (attended + replays) × 100
-- CTA Click Rate                = clickedcta / viewedcta × 100
-- Conversion Rate               = total_purchases / clickedcta × 100
-- Cost per Acquisition          = fb_spend / total_purchases
-- Post Webinar Rate             = purchases_postwebinar / total_purchases × 100${journeyBlock}${ghlBlock}
+${keyMetricsList}${journeyBlock}${ghlBlock}
 
 REMEMBERED FACTS:
 ${memoryBlock}
@@ -5259,18 +5359,22 @@ ${VIZ_FORMAT_GUIDE}`;
         const SERVER_TOOLS = [
             { type: 'code_execution_20250522', name: 'code_execution' },
         ];
-        const allTools = [...INSIGHTS_TOOLS, ...SERVER_TOOLS];
+        // GHL pipelines + patient-intake avatar are Shumard-business services —
+        // withheld on custom-event funnels (a different business's data).
+        const BUSINESS_TOOLS = new Set(['get_ghl_pipeline_status', 'get_customer_avatar']);
+        const funnelTools = standardFunnel ? INSIGHTS_TOOLS : INSIGHTS_TOOLS.filter(t => !BUSINESS_TOOLS.has(t.name));
+        const allTools = [...funnelTools, ...SERVER_TOOLS];
 
         // GoHighLevel MCP — Anthropic runs the MCP client server-side. The
         // mcp_servers entry and its mcp_toolset must travel together (the API
         // rejects one without the other), so both are dropped on outOfTime.
-        const GHL_MCP_SERVERS = GHL_ENABLED ? [{
+        const GHL_MCP_SERVERS = (GHL_ENABLED && standardFunnel) ? [{
             type: 'url',
             name: 'ghl',
             url: 'https://services.leadconnectorhq.com/mcp/',
             authorization_token: GHL_MCP_TOKEN,
         }] : undefined;
-        if (GHL_ENABLED) allTools.push({ type: 'mcp_toolset', mcp_server_name: 'ghl' });
+        if (GHL_ENABLED && standardFunnel) allTools.push({ type: 'mcp_toolset', mcp_server_name: 'ghl' });
 
         const MAX_ITERS = 10;
         // Overall wall-clock budget for the whole tool loop. Kept under the nginx
@@ -5436,11 +5540,11 @@ function parseWorkerDatetime(input) {
 const laDayISO = (d) => d.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
 // The daily_metrics column an event row counts toward (null = uncounted type).
-function dailyColumnForEvent(ev, sourceMap) {
+function dailyColumnForEvent(ev, sourceMap, eventSet) {
     const t = ev.event_type;
     if (t === 'purchases') return sourceMap[ev.metadata?.source] || 'purchases_fb';
     if (t === 'stayeduntil') return STAYED_DEDUP_MAP[Number(ev.metadata?.stayeduntil)] || null;
-    if (['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta'].includes(t)) return t;
+    if (eventSet.has(t)) return t;
     return null;
 }
 
@@ -5545,11 +5649,12 @@ async function workerAddSale(funnel, input, ctx) {
     };
 }
 
-const WORKER_EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', 'stayeduntil'];
+const workerEventTypes = (funnel) => [...eventCols(funnel), ...(hasMilestones(funnel) ? ['stayeduntil'] : [])];
 
 async function workerAddEvent(funnel, input, ctx) {
     const sb = clientFor(funnel);
     const type = input.event_type;
+    const WORKER_EVENT_TYPES = workerEventTypes(funnel);
     if (!WORKER_EVENT_TYPES.includes(type)) return { error: `event_type must be one of: ${WORKER_EVENT_TYPES.join(', ')}. For purchases use add_sale.` };
     const email = String(input.email || '').toLowerCase().trim();
     if (!email || !email.includes('@')) return { error: 'A valid email is required.' };
@@ -5616,7 +5721,7 @@ async function workerDeleteEvent(funnel, input) {
     if (delErr) return { error: `Delete failed: ${delErr.message}` };
 
     const day = laDayISO(new Date(ev.event_time));
-    const tail = await workerAdjustDay(funnel, day, dailyColumnForEvent(ev, purchaseSourceMap(funnel)), -1);
+    const tail = await workerAdjustDay(funnel, day, dailyColumnForEvent(ev, purchaseSourceMap(funnel), eventColSet(funnel)), -1);
     return {
         ok: true,
         deleted: { event_id: ev.id, event_type: ev.event_type, email: ev.email, name: ev.name, event_time: ev.event_time, metadata: ev.metadata },
@@ -5652,7 +5757,7 @@ async function workerUpdateEvent(funnel, input, ctx) {
     return { ok: true, event_id: id, before: { email: ev.email, name: ev.name, phone: ev.phone }, applied: patch, ...tail };
 }
 
-const workerOverrideFields = (funnel) => ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', ...purchaseSubCols(funnel), 'stayed_45', 'stayed_60', 'stayed_80'];
+const workerOverrideFields = (funnel) => ['fb_spend', 'fb_link_clicks', ...eventCols(funnel), 'purchases', ...purchaseSubCols(funnel), ...milestoneCols(funnel)];
 
 async function workerSetOverride(funnel, input) {
     const sb = clientFor(funnel);
@@ -5776,7 +5881,7 @@ const WORKER_TOOLS = [
         input_schema: {
             type: 'object',
             properties: {
-                event_type:  { type: 'string', enum: WORKER_EVENT_TYPES },
+                event_type:  { type: 'string', description: 'One of this funnel\'s configured event types (the system prompt lists them; invalid values are rejected with the valid list).' },
                 email:       { type: 'string', description: 'Person\'s email (required)' },
                 name:        { type: 'string' },
                 phone:       { type: 'string' },

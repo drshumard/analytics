@@ -12,21 +12,16 @@
 CREATE SCHEMA IF NOT EXISTS {{schema}}
 
 -- @statement
+-- Event columns are NOT here — the provisioner ALTERs in the funnel's chosen
+-- event set (and stayed_45/60/80 when webinar milestones are enabled), then
+-- seeds {{schema}}.event_types.
 CREATE TABLE {{schema}}.daily_metrics (
     id            BIGSERIAL PRIMARY KEY,
     date          DATE NOT NULL UNIQUE,
     day_of_week   TEXT NOT NULL,
     fb_spend      NUMERIC(12,2) NOT NULL DEFAULT 0,
     fb_link_clicks INTEGER NOT NULL DEFAULT 0,
-    registrations INTEGER NOT NULL DEFAULT 0,
-    replays       INTEGER NOT NULL DEFAULT 0,
-    viewedcta     INTEGER NOT NULL DEFAULT 0,
-    clickedcta    INTEGER NOT NULL DEFAULT 0,
     purchases     INTEGER NOT NULL DEFAULT 0,
-    attended      INTEGER NOT NULL DEFAULT 0,
-    stayed_45     INTEGER NOT NULL DEFAULT 0,
-    stayed_60     INTEGER NOT NULL DEFAULT 0,
-    stayed_80     INTEGER NOT NULL DEFAULT 0,
     overrides     JSONB DEFAULT '{}',
     variant_splits JSONB,
     finalized_at  TIMESTAMPTZ,
@@ -173,6 +168,15 @@ CREATE TABLE {{schema}}.ai_memory (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (user_id, key)
+)
+
+-- @statement
+CREATE TABLE {{schema}}.event_types (
+    column_name   TEXT PRIMARY KEY CHECK (column_name ~ '^[a-z][a-z0-9_]{1,28}$'),
+    display_label TEXT NOT NULL,
+    sort_order    INTEGER NOT NULL DEFAULT 0,
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
 
 -- @statement
