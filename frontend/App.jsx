@@ -188,6 +188,25 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Worker chat failed: ${res.status}`); }
     return res.json();
   },
+  async adminValidateFbAccount(id, funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/fb-account?id=${encodeURIComponent(id)}`, { headers });
+    return res.json();
+  },
+  async adminCreateFunnel(body, funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/funnels`, { method: "POST", headers, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
+    return data;
+  },
+  async adminAddPurchaseSource(body, funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/purchase-sources`, { method: "POST", headers, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
+    return data;
+  },
   async adminResetLink(email, funnel) {
     const headers = await getAuthHeaders(funnel);
     const res = await fetch(`${API_BASE}/api/admin/reset-link`, { method: "POST", headers, body: JSON.stringify({ email }) });
@@ -877,6 +896,8 @@ export default function App() {
   const [pwSubmitting, setPwSubmitting] = useState(false);
   const [forgotOpen, setForgotOpen] = useState(false);
   const [resetLinkOpen, setResetLinkOpen] = useState(false);
+  const [newFunnelOpen, setNewFunnelOpen] = useState(false);
+  const [manageColsOpen, setManageColsOpen] = useState(false);
   const [metrics, setMetrics] = useState([]);
   const [customs, setCustoms] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -1697,6 +1718,8 @@ export default function App() {
                 <div className="navbar-popover account-popover">
                   <div className="account-popover-identity"><strong>{session?.user?.email?.split("@")[0] || "Account"}</strong><span>{session?.user?.email || ""}</span><small>{isAdmin ? "Administrator" : "Viewer"}</small></div>
                   <div className="navbar-popover-divider" />
+                  {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} /><span>New funnel</span></button>}
+                  {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} /><span>Purchase columns</span></button>}
                   {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} /><span>Password reset link</span></button>}
                   <button onClick={handleLogout}><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={15} /><span>Sign out</span></button>
                 </div>
@@ -1722,7 +1745,7 @@ export default function App() {
                   ))}
                 </nav>
                 <div className="nav-menu-footer">
-                  <div className="nav-menu-utilities"><button onClick={() => { setMobileMenuOpen(false); clearCache(); }}><I d="M3 6h18M8 6V4h8v2m-9 0l1 15h8l1-15" size={15} />Clear cache</button>{isAdmin && <button disabled={finalizing} onClick={() => { setMobileMenuOpen(false); finalizePastDays(); }}><I d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14" size={15} />{finalizing ? "Finalizing…" : "Finalize data"}</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} />Password reset link</button>}</div>
+                  <div className="nav-menu-utilities"><button onClick={() => { setMobileMenuOpen(false); clearCache(); }}><I d="M3 6h18M8 6V4h8v2m-9 0l1 15h8l1-15" size={15} />Clear cache</button>{isAdmin && <button disabled={finalizing} onClick={() => { setMobileMenuOpen(false); finalizePastDays(); }}><I d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14" size={15} />{finalizing ? "Finalizing…" : "Finalize data"}</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} />New funnel</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} />Purchase columns</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} />Password reset link</button>}</div>
                   <div className="nav-menu-account"><span className="account-avatar">{(session?.user?.email || "U").charAt(0).toUpperCase()}</span><div><strong>{session?.user?.email?.split("@")[0] || "Account"}</strong><span>{isAdmin ? "Administrator" : "Viewer"}</span></div><button onClick={handleLogout} aria-label="Sign out" title="Sign out"><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={16} /></button></div>
                 </div>
               </div>
@@ -2249,6 +2272,8 @@ export default function App() {
       </div>
 
       {resetLinkOpen && <ResetLinkModal funnel={activeFunnel} onCancel={() => setResetLinkOpen(false)} />}
+      {newFunnelOpen && <NewFunnelModal funnel={activeFunnel} onCancel={() => setNewFunnelOpen(false)} onCreated={() => { if (session?.access_token) fetchRole(session.access_token); }} />}
+      {manageColsOpen && <ManageColumnsModal funnel={activeFunnel} onCancel={() => setManageColsOpen(false)} onChanged={() => { if (session?.access_token) fetchRole(session.access_token); loadData(); }} />}
       {delConfirm && <Modal title="Delete entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
       {delCM && <Modal title="Delete custom metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
       {lensEditing && <LensEditor lens={lensEditing} onSave={saveLens} onCancel={() => setLensEditing(null)} />}
@@ -2692,6 +2717,184 @@ function ForgotPasswordModal({ initialEmail, onCancel, onSent }) {
         <div style={{ display: "flex", gap: 10 }}>
           <button type="button" style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
           <button type="submit" disabled={sending} aria-busy={sending} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{sending ? "Sending…" : "Send reset link"}</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+const inputStyle = { width: "100%", padding: "9px 12px", borderRadius: 8, border: "1px solid var(--ds-border-hover)", fontSize: 13, outline: "none", boxSizing: "border-box" };
+const fieldLabel = { display: "block", fontSize: 12, fontWeight: 600, color: "#333", marginBottom: 5 };
+
+function NewFunnelModal({ funnel, onCancel, onCreated }) {
+  useEscapeKey(onCancel);
+  const dialogRef = useDialogFocus();
+  const [label, setLabel] = useState("");
+  const [key, setKey] = useState("");
+  const [keyTouched, setKeyTouched] = useState(false);
+  const [fbId, setFbId] = useState("");
+  const [fbCheck, setFbCheck] = useState(null); // {ok, name} | {ok:false, error}
+  const [checkingFb, setCheckingFb] = useState(false);
+  const [picked, setPicked] = useState(() => new Set(FUNNEL_SOURCES.map(s => s.source_label)));
+  const [customs, setCustoms] = useState([]); // [{source_label, display_label}]
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const [copied, setCopied] = useState(false);
+
+  const slugKey = (v) => v.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^[^a-z]+/, "").replace(/_+$/g, "").slice(0, 21);
+  const setFromLabel = (v) => { setLabel(v); if (!keyTouched) setKey(slugKey(v)); };
+  const checkFb = async () => {
+    if (!fbId.trim()) { setFbCheck(null); return; }
+    setCheckingFb(true);
+    try { setFbCheck(await api.adminValidateFbAccount(fbId.trim(), funnel)); }
+    catch (e) { setFbCheck({ ok: false, error: e.message }); }
+    finally { setCheckingFb(false); }
+  };
+  const submit = async (e) => {
+    e.preventDefault();
+    setErr("");
+    const sources = [
+      ...FUNNEL_SOURCES.filter(s => picked.has(s.source_label)).map(s => ({ source_label: s.source_label, display_label: s.display_label })),
+      ...customs.filter(c => c.source_label.trim()).map(c => ({ source_label: c.source_label.trim(), display_label: (c.display_label || "").trim() || c.source_label.trim() })),
+    ];
+    if (!sources.length) { setErr("Pick or add at least one purchase source."); return; }
+    if (fbId.trim() && !fbCheck?.ok) { setErr("Validate the Facebook ad account first (or clear the field)."); return; }
+    setBusy(true);
+    try {
+      const r = await api.adminCreateFunnel({ key: key.trim(), label: label.trim(), fb_ad_account_id: fbId.trim() || undefined, sources }, funnel);
+      setResult(r);
+      onCreated?.();
+    } catch (ex) { setErr(ex.message); }
+    finally { setBusy(false); }
+  };
+  const copyKey = async () => {
+    try { await navigator.clipboard.writeText(result.webhook_api_key); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch {}
+  };
+
+  if (result) return (
+    <div className="modal-backdrop" style={S.overlay} onClick={() => {}}>
+      <div ref={dialogRef} tabIndex={-1} className="modal-inner" role="dialog" aria-modal="true" aria-label="Funnel created" style={{ ...S.modal, maxWidth: 520, textAlign: "left" }} onClick={e => e.stopPropagation()}>
+        <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Funnel "{result.label}" is live</div>
+        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>
+          Schema, tables, and dashboard are provisioned{result.fb_ad_account ? <> · Facebook spend syncs from <strong>{result.fb_ad_account.name}</strong></> : " · no Facebook account linked"}.
+          Columns: {result.columns.map(c => c.display_label).join(", ")}.
+        </div>
+        <div style={{ background: "#FFF8E6", border: "1px solid #F0D588", borderRadius: 8, padding: "10px 12px", marginBottom: 14 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#7A5B00", marginBottom: 6 }}>Webhook API key — shown only once</div>
+          <div style={{ fontSize: 12, fontFamily: "monospace", wordBreak: "break-all", userSelect: "all", marginBottom: 8 }}>{result.webhook_api_key}</div>
+          <button type="button" onClick={copyKey} style={{ ...S.btnDark, padding: "7px 14px", fontSize: 13 }}>{copied ? "Copied ✓" : "Copy key"}</button>
+        </div>
+        <div style={{ fontSize: 12, color: "var(--ds-gray-600)", marginBottom: 16 }}>Point the funnel's n8n/webhooks at /api/metrics/increment with this key in X-API-Key — events route to the new funnel automatically.</div>
+        <button type="button" style={{ ...S.btnDark, width: "100%", justifyContent: "center" }} onClick={onCancel}>Done</button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="modal-backdrop" style={S.overlay} onClick={onCancel}>
+      <form ref={dialogRef} tabIndex={-1} className="modal-inner structured-dialog" role="dialog" aria-modal="true" aria-label="New funnel" style={{ ...S.modal, maxWidth: 560, textAlign: "left", maxHeight: "88vh", overflowY: "auto" }} onClick={e => e.stopPropagation()} onSubmit={submit}>
+        <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>New funnel</div>
+        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 18, lineHeight: 1.5 }}>Provisions a full workspace — database schema, dashboard, webhook key, AI tools — in one go.</div>
+        {err && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 14, border: "1px solid #F5B7B7" }}>{err}</div>}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+          <div>
+            <label htmlFor="nf-label" style={fieldLabel}>Display name</label>
+            <input id="nf-label" data-dialog-initial-focus value={label} onChange={e => setFromLabel(e.target.value)} required placeholder="YouTube Funnel" style={inputStyle} />
+          </div>
+          <div>
+            <label htmlFor="nf-key" style={fieldLabel}>Key (schema name)</label>
+            <input id="nf-key" value={key} onChange={e => { setKeyTouched(true); setKey(slugKey(e.target.value)); }} required pattern="[a-z][a-z0-9_]{1,20}" placeholder="youtube" style={{ ...inputStyle, fontFamily: "monospace" }} />
+          </div>
+        </div>
+        <div style={{ marginBottom: 14 }}>
+          <label htmlFor="nf-fb" style={fieldLabel}>Facebook ad account (optional — pulls daily spend)</label>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input id="nf-fb" value={fbId} onChange={e => { setFbId(e.target.value); setFbCheck(null); }} placeholder="act_1234567890" style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }} />
+            <button type="button" disabled={checkingFb || !fbId.trim()} onClick={checkFb} style={{ ...S.btnLight, padding: "0 14px", fontSize: 13 }}>{checkingFb ? "Checking…" : "Validate"}</button>
+          </div>
+          {fbCheck && (fbCheck.ok
+            ? <div style={{ fontSize: 12, color: "#0A7F43", marginTop: 6 }}>✓ {fbCheck.name}</div>
+            : <div style={{ fontSize: 12, color: "#C00", marginTop: 6 }}>{fbCheck.error}</div>)}
+          <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginTop: 4 }}>The system-user token must have access to this account (same Business Manager).</div>
+        </div>
+        <div style={{ marginBottom: 6 }}>
+          <div style={fieldLabel}>Purchase columns</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px", marginBottom: 8 }}>
+            {FUNNEL_SOURCES.map(s => (
+              <label key={s.source_label} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, color: "var(--ds-gray-800)", cursor: "pointer" }}>
+                <input type="checkbox" checked={picked.has(s.source_label)} onChange={e => setPicked(p => { const n = new Set(p); e.target.checked ? n.add(s.source_label) : n.delete(s.source_label); return n; })} />
+                {s.display_label} <span style={{ color: "var(--ds-gray-500)", fontSize: 11 }}>({s.source_label})</span>
+              </label>
+            ))}
+          </div>
+          {customs.map((c, i) => (
+            <div key={i} style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+              <input value={c.source_label} onChange={e => setCustoms(cs => cs.map((x, j) => j === i ? { ...x, source_label: e.target.value } : x))} placeholder='Webhook source (e.g. "TikTok")' style={{ ...inputStyle, flex: 1 }} />
+              <input value={c.display_label} onChange={e => setCustoms(cs => cs.map((x, j) => j === i ? { ...x, display_label: e.target.value } : x))} placeholder="Column label (optional)" style={{ ...inputStyle, flex: 1 }} />
+              <button type="button" aria-label="Remove source" onClick={() => setCustoms(cs => cs.filter((_, j) => j !== i))} style={{ ...S.btnLight, padding: "0 10px" }}>✕</button>
+            </div>
+          ))}
+          <button type="button" onClick={() => setCustoms(cs => [...cs, { source_label: "", display_label: "" }])} style={{ background: "none", border: "none", padding: 0, fontSize: 13, color: "var(--ds-blue-700)", cursor: "pointer", fontWeight: 600 }}>+ Add a new source</button>
+        </div>
+        <div style={{ fontSize: 11, color: "var(--ds-gray-600)", margin: "10px 0 16px" }}>Every funnel also gets the standard stages (registrations, attended, replays, CTA, webinar milestones) — pick which purchase sources it tracks.</div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button type="button" style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
+          <button type="submit" disabled={busy} aria-busy={busy} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{busy ? "Provisioning…" : "Create funnel"}</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ManageColumnsModal({ funnel, onCancel, onChanged }) {
+  useEscapeKey(onCancel);
+  const dialogRef = useDialogFocus();
+  const [srcLabel, setSrcLabel] = useState("");
+  const [dispLabel, setDispLabel] = useState("");
+  const [err, setErr] = useState("");
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const add = async (e) => {
+    e.preventDefault();
+    setErr(""); setNotice("");
+    setBusy(true);
+    try {
+      const r = await api.adminAddPurchaseSource({ source_label: srcLabel.trim(), display_label: dispLabel.trim() || undefined }, funnel);
+      setNotice(`Added "${r.display_label}" (${r.column_name}). ${r.note}`);
+      setSrcLabel(""); setDispLabel("");
+      onChanged?.();
+    } catch (ex) { setErr(ex.message); }
+    finally { setBusy(false); }
+  };
+  return (
+    <div className="modal-backdrop" style={S.overlay} onClick={onCancel}>
+      <form ref={dialogRef} tabIndex={-1} className="modal-inner" role="dialog" aria-modal="true" aria-label="Purchase columns" style={{ ...S.modal, maxWidth: 480, textAlign: "left" }} onClick={e => e.stopPropagation()} onSubmit={add}>
+        <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Purchase columns — {FUNNEL_META[funnel]?.label || funnel}</div>
+        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>Add a purchase source: the column is created in the database and webhooks can use the source immediately. Dashboards, editors, and the AI pick it up automatically.</div>
+        {err && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 12, border: "1px solid #F5B7B7" }}>{err}</div>}
+        {notice && <div role="status" style={{ background: "#F0FDF4", color: "#166534", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 12, border: "1px solid #BBF7D0" }}>{notice}</div>}
+        <div style={{ marginBottom: 14, maxHeight: 180, overflowY: "auto", border: "1px solid var(--ds-border)", borderRadius: 8, padding: "8px 12px" }}>
+          {(FUNNEL_META[funnel]?.sources || FUNNEL_SOURCES).map(s => (
+            <div key={s.column_name} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "4px 0" }}>
+              <span>{s.display_label}</span>
+              <span style={{ color: "var(--ds-gray-500)", fontFamily: "monospace", fontSize: 11 }}>{s.source_label} → {s.column_name}</span>
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
+          <div>
+            <label htmlFor="pc-src" style={fieldLabel}>Webhook source value</label>
+            <input id="pc-src" data-dialog-initial-focus value={srcLabel} onChange={e => setSrcLabel(e.target.value)} required placeholder='e.g. "TikTok"' style={inputStyle} />
+          </div>
+          <div>
+            <label htmlFor="pc-disp" style={fieldLabel}>Column label (optional)</label>
+            <input id="pc-disp" value={dispLabel} onChange={e => setDispLabel(e.target.value)} placeholder="defaults to source" style={inputStyle} />
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button type="button" style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Close</button>
+          <button type="submit" disabled={busy || !srcLabel.trim()} aria-busy={busy} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{busy ? "Adding…" : "Add column"}</button>
         </div>
       </form>
     </div>
