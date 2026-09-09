@@ -214,6 +214,27 @@ const api = {
     if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
     return data;
   },
+  async adminFunnelUsers(funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/funnel-users`, { headers });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
+    return data;
+  },
+  async adminSetFunnelUser(body, funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/funnel-users`, { method: "POST", headers, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
+    return data;
+  },
+  async adminInviteUser(body, funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/invite-user`, { method: "POST", headers, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
+    return data;
+  },
   async adminResetLink(email, funnel) {
     const headers = await getAuthHeaders(funnel);
     const res = await fetch(`${API_BASE}/api/admin/reset-link`, { method: "POST", headers, body: JSON.stringify({ email }) });
@@ -922,6 +943,7 @@ export default function App() {
   const [resetLinkOpen, setResetLinkOpen] = useState(false);
   const [newFunnelOpen, setNewFunnelOpen] = useState(false);
   const [manageColsOpen, setManageColsOpen] = useState(false);
+  const [accessOpen, setAccessOpen] = useState(false);
   const [metrics, setMetrics] = useState([]);
   const [customs, setCustoms] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -1744,6 +1766,7 @@ export default function App() {
                   <div className="navbar-popover-divider" />
                   {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} /><span>New funnel</span></button>}
                   {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} /><span>Columns</span></button>}
+                  {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setAccessOpen(true); }}><I d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zm14 10v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" size={15} /><span>Funnel access</span></button>}
                   {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} /><span>Password reset link</span></button>}
                   <button onClick={handleLogout}><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={15} /><span>Sign out</span></button>
                 </div>
@@ -1769,7 +1792,7 @@ export default function App() {
                   ))}
                 </nav>
                 <div className="nav-menu-footer">
-                  <div className="nav-menu-utilities"><button onClick={() => { setMobileMenuOpen(false); clearCache(); }}><I d="M3 6h18M8 6V4h8v2m-9 0l1 15h8l1-15" size={15} />Clear cache</button>{isAdmin && <button disabled={finalizing} onClick={() => { setMobileMenuOpen(false); finalizePastDays(); }}><I d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14" size={15} />{finalizing ? "Finalizing…" : "Finalize data"}</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} />New funnel</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} />Columns</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} />Password reset link</button>}</div>
+                  <div className="nav-menu-utilities"><button onClick={() => { setMobileMenuOpen(false); clearCache(); }}><I d="M3 6h18M8 6V4h8v2m-9 0l1 15h8l1-15" size={15} />Clear cache</button>{isAdmin && <button disabled={finalizing} onClick={() => { setMobileMenuOpen(false); finalizePastDays(); }}><I d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14" size={15} />{finalizing ? "Finalizing…" : "Finalize data"}</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} />New funnel</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} />Columns</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setAccessOpen(true); }}><I d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zm14 10v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" size={15} />Funnel access</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} />Password reset link</button>}</div>
                   <div className="nav-menu-account"><span className="account-avatar">{(session?.user?.email || "U").charAt(0).toUpperCase()}</span><div><strong>{session?.user?.email?.split("@")[0] || "Account"}</strong><span>{isAdmin ? "Administrator" : "Viewer"}</span></div><button onClick={handleLogout} aria-label="Sign out" title="Sign out"><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={16} /></button></div>
                 </div>
               </div>
@@ -2296,6 +2319,7 @@ export default function App() {
       </div>
 
       {resetLinkOpen && <ResetLinkModal funnel={activeFunnel} onCancel={() => setResetLinkOpen(false)} />}
+      {accessOpen && <FunnelAccessModal funnel={activeFunnel} onCancel={() => setAccessOpen(false)} />}
       {newFunnelOpen && <NewFunnelModal funnel={activeFunnel} onCancel={() => setNewFunnelOpen(false)} onCreated={() => { if (session?.access_token) fetchRole(session.access_token); }} />}
       {manageColsOpen && <ManageColumnsModal funnel={activeFunnel} onCancel={() => setManageColsOpen(false)} onChanged={() => { if (session?.access_token) fetchRole(session.access_token); loadData(); }} />}
       {delConfirm && <Modal title="Delete entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
@@ -2985,6 +3009,91 @@ function ManageColumnsModal({ funnel, onCancel, onChanged }) {
           <button type="submit" disabled={busy || !srcLabel.trim()} aria-busy={busy} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{busy ? "Adding…" : "Add column"}</button>
         </div>
       </form>
+    </div>
+  );
+}
+
+function FunnelAccessModal({ funnel, onCancel }) {
+  useEscapeKey(onCancel);
+  const dialogRef = useDialogFocus();
+  const [rows, setRows] = useState(null);
+  const [err, setErr] = useState("");
+  const [busyId, setBusyId] = useState(null);
+  const [invEmail, setInvEmail] = useState("");
+  const [invRole, setInvRole] = useState("viewer");
+  const [inviting, setInviting] = useState(false);
+  const [invResult, setInvResult] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const load = async () => {
+    try { setRows((await api.adminFunnelUsers(funnel)).users); }
+    catch (e) { setErr(e.message); }
+  };
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
+  const setUser = async (u, access, role) => {
+    setErr(""); setBusyId(u.id);
+    try {
+      await api.adminSetFunnelUser({ user_id: u.id, access, role }, funnel);
+      setRows(rs => rs.map(r => r.id === u.id ? { ...r, has_access: access, role } : r));
+    } catch (e) { setErr(e.message); }
+    finally { setBusyId(null); }
+  };
+  const invite = async (e) => {
+    e.preventDefault();
+    setErr(""); setInvResult(null); setCopied(false);
+    setInviting(true);
+    try {
+      const r = await api.adminInviteUser({ email: invEmail.trim(), role: invRole }, funnel);
+      setInvResult(r);
+      setInvEmail("");
+      load();
+    } catch (ex) { setErr(ex.message); }
+    finally { setInviting(false); }
+  };
+  const copyLink = async () => {
+    try { await navigator.clipboard.writeText(invResult.link); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch {}
+  };
+  return (
+    <div className="modal-backdrop" style={S.overlay} onClick={onCancel}>
+      <div ref={dialogRef} tabIndex={-1} className="modal-inner" role="dialog" aria-modal="true" aria-label="Funnel access" style={{ ...S.modal, maxWidth: 560, textAlign: "left" }} onClick={e => e.stopPropagation()}>
+        <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Funnel access — {FUNNEL_META[funnel]?.label || funnel}</div>
+        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>Who can open this workspace, and what they can do. Viewers are read-only; admins can edit data, manage columns, and use the AI worker.</div>
+        {err && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 12, border: "1px solid #F5B7B7" }}>{err}</div>}
+        <div style={{ marginBottom: 14, maxHeight: 260, overflowY: "auto", border: "1px solid var(--ds-border)", borderRadius: 8 }}>
+          {rows === null ? (
+            <div style={{ padding: 14, fontSize: 13, color: "var(--ds-gray-600)" }}>Loading users…</div>
+          ) : rows.map(u => (
+            <div key={u.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 12px", borderBottom: "1px solid var(--ds-border)", opacity: busyId === u.id ? 0.5 : 1 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0, cursor: u.is_you ? "not-allowed" : "pointer", fontSize: 13 }}>
+                <input type="checkbox" checked={u.has_access} disabled={u.is_you || busyId === u.id} onChange={e => setUser(u, e.target.checked, u.role)} />
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.email}{u.is_you ? " (you)" : ""}</span>
+              </label>
+              <select value={u.role} disabled={!u.has_access || u.is_you || busyId === u.id} onChange={e => setUser(u, true, e.target.value)} style={{ fontSize: 12, padding: "4px 6px", borderRadius: 6, border: "1px solid var(--ds-border-hover)" }}>
+                <option value="viewer">Viewer</option>
+                <option value="admin">Admin</option>
+              </select>
+            </div>
+          ))}
+        </div>
+        <div style={fieldLabel}>Invite someone new</div>
+        {invResult && (
+          <div style={{ background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>
+            <div style={{ fontSize: 13, color: "#166534", marginBottom: 6 }}>{invResult.email} added as {invResult.role}. {invResult.note}</div>
+            {invResult.link && <>
+              <div style={{ fontSize: 11, fontFamily: "monospace", wordBreak: "break-all", userSelect: "all", marginBottom: 8 }}>{invResult.link}</div>
+              <button type="button" onClick={copyLink} style={{ ...S.btnDark, padding: "6px 12px", fontSize: 12 }}>{copied ? "Copied ✓" : "Copy set-password link"}</button>
+            </>}
+          </div>
+        )}
+        <form onSubmit={invite} style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+          <input type="email" required value={invEmail} onChange={e => setInvEmail(e.target.value)} placeholder="person@example.com" style={{ ...inputStyle, flex: 1 }} />
+          <select value={invRole} onChange={e => setInvRole(e.target.value)} style={{ fontSize: 13, padding: "0 8px", borderRadius: 8, border: "1px solid var(--ds-border-hover)" }}>
+            <option value="viewer">Viewer</option>
+            <option value="admin">Admin</option>
+          </select>
+          <button type="submit" disabled={inviting || !invEmail.trim()} style={{ ...S.btnDark, padding: "0 14px", fontSize: 13 }}>{inviting ? "Adding…" : "Add"}</button>
+        </form>
+        <button type="button" style={{ ...S.btnLight, width: "100%", justifyContent: "center" }} onClick={onCancel}>Done</button>
+      </div>
     </div>
   );
 }

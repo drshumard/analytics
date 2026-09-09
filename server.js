@@ -2550,6 +2550,141 @@ app.post('/api/admin/reset-link', dashboardLimiter, requireAuth, requireAdmin, a
     }
 });
 
+// ─── Admin: funnel access management ─────────────────────────────────────────
+// Access = row in public.user_funnel_access (shows the funnel in the user's
+// workspace switcher); role = row in <schema>.user_roles (viewer by default,
+// admin unlocks editing/worker). Invite creates the auth user, grants access,
+// and returns a set-password link to hand over (no email delivery involved).
+
+async function listAuthUsers() {
+    const users = [];
+    for (let page = 1; page <= 5; page++) {
+        const r = await fetch(`${SUPABASE_URL}/auth/v1/admin/users?page=${page}&per_page=100`, {
+            headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` },
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.msg || body.message || `auth admin HTTP ${r.status}`);
+        const batch = body.users || [];
+        users.push(...batch);
+        if (batch.length < 100) break;
+    }
+    return users;
+}
+
+// GET /api/admin/funnel-users — every dashboard user + access/role for req.funnel.
+app.get('/api/admin/funnel-users', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const funnel = req.funnel;
+        const [users, accessRows, roleRows] = await Promise.all([
+            listAuthUsers(),
+            supabasePublic.from('user_funnel_access').select('user_id').eq('funnel', funnel).then(r => r.data || []),
+            clientFor(funnel).from('user_roles').select('user_id, role').then(r => r.data || []),
+        ]);
+        const access = new Set(accessRows.map(r => r.user_id));
+        const roles = Object.fromEntries(roleRows.map(r => [r.user_id, r.role]));
+        res.json({
+            funnel,
+            users: users.filter(u => u.email).map(u => ({
+                id: u.id,
+                email: u.email,
+                has_access: access.has(u.id),
+                role: roles[u.id] || 'viewer',
+                is_you: u.id === req.user.id,
+            })).sort((a, b) => (b.has_access - a.has_access) || a.email.localeCompare(b.email)),
+        });
+    } catch (err) {
+        console.error('❌ GET /api/admin/funnel-users error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/admin/funnel-users — grant/revoke access + set role for req.funnel.
+// Body: { user_id, access: bool, role?: 'viewer'|'admin' }
+app.post('/api/admin/funnel-users', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const funnel = req.funnel;
+        const { user_id, access, role = 'viewer' } = req.body || {};
+        if (!user_id || !/^[0-9a-f-]{36}$/.test(String(user_id))) return res.status(400).json({ error: 'user_id required' });
+        if (!['viewer', 'admin'].includes(role)) return res.status(400).json({ error: 'role must be viewer or admin' });
+        if (user_id === req.user.id && access === false) {
+            return res.status(400).json({ error: "You can't remove your own access to the funnel you're managing" });
+        }
+        if (access) {
+            const { error: aErr } = await supabasePublic.from('user_funnel_access')
+                .upsert({ user_id, funnel }, { onConflict: 'user_id,funnel' });
+            if (aErr) throw aErr;
+            const { error: rErr } = await clientFor(funnel).from('user_roles')
+                .upsert({ user_id, role }, { onConflict: 'user_id' });
+            if (rErr) throw rErr;
+        } else {
+            await supabasePublic.from('user_funnel_access').delete().eq('user_id', user_id).eq('funnel', funnel);
+            await clientFor(funnel).from('user_roles').delete().eq('user_id', user_id);
+        }
+        console.log(`👥 Funnel access [${funnel}]: ${req.user.email} set user ${user_id} → access:${!!access} role:${role}`);
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('❌ POST /api/admin/funnel-users error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/admin/invite-user — create (or reuse) an auth user by email, grant
+// access to req.funnel, return a set-password link to hand to them.
+// Body: { email, role?: 'viewer'|'admin' }
+app.post('/api/admin/invite-user', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const funnel = req.funnel;
+        const email = String(req.body?.email || '').trim().toLowerCase();
+        const role = ['viewer', 'admin'].includes(req.body?.role) ? req.body.role : 'viewer';
+        if (!email || !email.includes('@')) return res.status(400).json({ error: 'A valid email is required' });
+
+        let userId = null;
+        let existed = false;
+        const cr = await fetch(`${SUPABASE_URL}/auth/v1/admin/users`, {
+            method: 'POST',
+            headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, email_confirm: true, password: crypto.randomBytes(18).toString('hex') }),
+        });
+        const cb = await cr.json().catch(() => ({}));
+        if (cr.ok && cb.id) {
+            userId = cb.id;
+        } else if (/already.*(registered|exists)/i.test(cb.msg || cb.message || '')) {
+            existed = true;
+            userId = (await listAuthUsers()).find(u => u.email?.toLowerCase() === email)?.id || null;
+        }
+        if (!userId) return res.status(502).json({ error: cb.msg || cb.message || 'Could not create the user' });
+
+        const { error: aErr } = await supabasePublic.from('user_funnel_access')
+            .upsert({ user_id: userId, funnel }, { onConflict: 'user_id,funnel' });
+        if (aErr) throw aErr;
+        const { error: rErr } = await clientFor(funnel).from('user_roles')
+            .upsert({ user_id: userId, role }, { onConflict: 'user_id' });
+        if (rErr) throw rErr;
+
+        const lr = await fetch(`${SUPABASE_URL}/auth/v1/admin/generate_link`, {
+            method: 'POST',
+            headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: 'recovery', email }),
+        });
+        const lb = await lr.json().catch(() => ({}));
+        console.log(`👥 Invite [${funnel}]: ${req.user.email} invited ${email} (${role}${existed ? ', existing user' : ''})`);
+        res.json({
+            ok: true,
+            email,
+            user_id: userId,
+            existed,
+            role,
+            link: lb.action_link || null,
+            note: existed
+                ? 'Existing dashboard user — access granted; they can sign in as usual (link below resets their password if needed).'
+                : 'Send them the link — it opens the set-a-new-password screen; single-use, ~1h expiry (generate a fresh one from “Password reset link” if it expires).',
+        });
+    } catch (err) {
+        console.error('❌ POST /api/admin/invite-user error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ─── Admin: funnel + purchase-column provisioning ────────────────────────────
 // Creates a complete funnel schema from db/funnel_template.sql (statement-per-
 // call through the ai_run_sql_write RPC), adds the chosen purchase columns,
