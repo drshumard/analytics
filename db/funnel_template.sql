@@ -291,22 +291,4 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA {{schema}} GRANT ALL ON SEQUENCES TO postgres
 ALTER DEFAULT PRIVILEGES IN SCHEMA {{schema}} GRANT ALL ON ROUTINES TO postgres, anon, authenticated, service_role
 
 -- @statement
-DO $do$
-DECLARE cur text;
-BEGIN
-    SELECT split_part(cfg, '=', 2) INTO cur
-      FROM pg_roles r, unnest(r.rolconfig) AS cfg
-     WHERE r.rolname = 'authenticator' AND cfg LIKE 'pgrst.db_schemas=%';
-    IF cur IS NULL OR cur = '' THEN
-        cur := 'public, storage, graphql_public';
-    END IF;
-    IF position('{{schema}}' IN cur) = 0 THEN
-        EXECUTE format('ALTER ROLE authenticator SET pgrst.db_schemas = %L', cur || ', {{schema}}');
-    END IF;
-END $do$
-
--- @statement
-NOTIFY pgrst, 'reload config'
-
--- @statement
 NOTIFY pgrst, 'reload schema'

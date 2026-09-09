@@ -2780,6 +2780,12 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
           Schema, tables, and dashboard are provisioned{result.fb_ad_account ? <> · Facebook spend syncs from <strong>{result.fb_ad_account.name}</strong></> : " · no Facebook account linked"}.
           Columns: {result.columns.map(c => c.display_label).join(", ")}.
         </div>
+        {result.manual_step && (
+          <div style={{ background: "#FFF4ED", border: "1px solid #F5C6A5", borderRadius: 8, padding: "10px 12px", marginBottom: 14 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#9A3E00", marginBottom: 4 }}>One manual step to activate the dashboard</div>
+            <div style={{ fontSize: 12, color: "#7C4A12", lineHeight: 1.5 }}>{result.manual_step}</div>
+          </div>
+        )}
         <div style={{ background: "#FFF8E6", border: "1px solid #F0D588", borderRadius: 8, padding: "10px 12px", marginBottom: 14 }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: "#7A5B00", marginBottom: 6 }}>Webhook API key — shown only once</div>
           <div style={{ fontSize: 12, fontFamily: "monospace", wordBreak: "break-all", userSelect: "all", marginBottom: 8 }}>{result.webhook_api_key}</div>

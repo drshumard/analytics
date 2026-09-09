@@ -2535,6 +2535,43 @@ async function runProvisionSQL(stmt) {
 const slugifyColumn = (label) => ('purchases_' + String(label).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')).slice(0, 34);
 const sqlLit = (s) => `'${String(s).replace(/'/g, "''")}'`;
 
+// PostgREST only serves schemas listed in the project's "Exposed schemas".
+// Supabase does not allow setting that via SQL (permission denied on the
+// authenticator role), so: automate through the Management API when
+// SUPABASE_ACCESS_TOKEN is configured, otherwise surface a one-step manual
+// instruction and let the probe below confirm once it's done.
+async function exposeSchemaToPostgREST(schemaName) {
+    const token = process.env.SUPABASE_ACCESS_TOKEN;
+    if (!token) return { automated: false };
+    try {
+        const ref = new URL(SUPABASE_URL).hostname.split('.')[0];
+        const get = await fetch(`https://api.supabase.com/v1/projects/${ref}/postgrest`, { headers: { Authorization: `Bearer ${token}` } });
+        const cfg = await get.json().catch(() => ({}));
+        if (!get.ok) throw new Error(cfg.message || `HTTP ${get.status}`);
+        const schemas = String(cfg.db_schema || 'public').split(',').map(s => s.trim()).filter(Boolean);
+        if (!schemas.includes(schemaName)) {
+            schemas.push(schemaName);
+            const patch = await fetch(`https://api.supabase.com/v1/projects/${ref}/postgrest`, {
+                method: 'PATCH',
+                headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ db_schema: schemas.join(', ') }),
+            });
+            if (!patch.ok) throw new Error((await patch.json().catch(() => ({}))).message || `HTTP ${patch.status}`);
+        }
+        return { automated: true };
+    } catch (e) {
+        console.warn('⚠️ PostgREST exposure via Management API failed:', e.message);
+        return { automated: false, error: e.message };
+    }
+}
+
+async function schemaReachable(schemaName) {
+    try {
+        const { error } = await clientForSchema(schemaName).from('daily_metrics').select('id').limit(1);
+        return !error;
+    } catch { return false; }
+}
+
 async function validateFbAccount(accountId) {
     if (!process.env.FB_ACCESS_TOKEN) return { ok: false, error: 'FB_ACCESS_TOKEN not configured on the server' };
     const id = String(accountId).trim();
@@ -2628,8 +2665,15 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
         const keyHash = crypto.createHash('sha256').update(plaintextKey).digest('hex');
         await supabasePublic.from('api_keys').insert({ key_hash: keyHash, label: `${key} webhooks (provisioned)`, funnel: key, is_active: true });
 
+        const exposure = await exposeSchemaToPostgREST(key);
+        let reachable = await schemaReachable(key);
+        if (exposure.automated && !reachable) {
+            await new Promise(r => setTimeout(r, 4000)); // PostgREST restart after config change
+            reachable = await schemaReachable(key);
+        }
+
         await refreshFunnelConfig(true);
-        console.log(`✅ Funnel "${key}" provisioned (${sources.length} sources${fb ? `, FB ${fb.id}` : ''})`);
+        console.log(`✅ Funnel "${key}" provisioned (${sources.length} sources${fb ? `, FB ${fb.id}` : ''}, reachable: ${reachable})`);
         return res.json({
             ok: true,
             funnel: key,
@@ -2637,6 +2681,10 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
             fb_ad_account: fb ? { id: fb.id, name: fb.name } : null,
             columns: sources,
             webhook_api_key: plaintextKey,
+            postgrest_exposed: reachable,
+            ...(reachable ? {} : {
+                manual_step: `Supabase Dashboard → Project Settings → Data API → "Exposed schemas" → add "${key}" → Save. The funnel's dashboard activates the moment it's saved (everything else is already provisioned).`,
+            }),
             note: 'Save the webhook API key now — it is shown only once. Send events with X-API-Key and this funnel is written automatically.',
         });
     } catch (err) {
