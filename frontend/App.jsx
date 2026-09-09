@@ -278,8 +278,38 @@ const getLADayShort = (d) => { try { const [m, dy, y] = d.split("/").map(Number)
 const fmtDateNice = (d) => { try { const [m, dy, y] = d.split("/").map(Number); return new Date(y, m - 1, dy).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return d; } };
 
 // ─── Formula Engine ──────────────────────────────────────────────────────────
-const MK = ["fb_spend", "fb_link_clicks", "reg_page_visits", "registrations", "replays", "viewedcta", "clickedcta", "purchases", "purchases_fb", "purchases_native", "purchases_youtube", "purchases_aibot", "purchases_aibot_b", "purchases_postwebinar", "purchases_cpa", "purchases_sales_a", "purchases_sales_b", "purchases_retargeting", "purchases_promo", "stayed_45", "stayed_60", "stayed_80", "total_purchases", "attended"];
-const COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", reg_page_visits: "Page Views", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", purchases_fb: "FB Purchases", purchases_native: "Native Ads", purchases_youtube: "Youtube/Organic", purchases_aibot: "AI Chat Bot", purchases_aibot_b: "AI Chat Bot B", purchases_postwebinar: "Post Webinar", purchases_cpa: "CPA Traffic Funnel", purchases_sales_a: "Sales A", purchases_sales_b: "Sales B", purchases_retargeting: "Retargeting", purchases_promo: "Promo", stayed_45: "45 min", stayed_60: "60 min", stayed_80: "80 min", total_purchases: "Total Purchases" };
+// Purchase-source columns are funnel-specific — the server's /api/me/funnels
+// meta carries each funnel's configured sources. MK and COL_LABELS are rebuilt
+// IN PLACE by applyFunnelColumns so every consumer (formula variables, lens
+// defaults, column pickers, editors) sees the active funnel's columns.
+const DEFAULT_SOURCES = [
+  { column_name: "purchases_fb", source_label: "Paid Ads", display_label: "FB Purchases" },
+  { column_name: "purchases_native", source_label: "Native", display_label: "Native Ads" },
+  { column_name: "purchases_youtube", source_label: "Youtube", display_label: "Youtube/Organic" },
+  { column_name: "purchases_aibot", source_label: "AI Bot", display_label: "AI Chat Bot" },
+  { column_name: "purchases_aibot_b", source_label: "AI Bot B", display_label: "AI Chat Bot B" },
+  { column_name: "purchases_postwebinar", source_label: "Post Webinar", display_label: "Post Webinar" },
+  { column_name: "purchases_cpa", source_label: "CPA Traffic", display_label: "CPA Traffic Funnel" },
+  { column_name: "purchases_sales_a", source_label: "Sales A", display_label: "Sales A" },
+  { column_name: "purchases_sales_b", source_label: "Sales B", display_label: "Sales B" },
+  { column_name: "purchases_retargeting", source_label: "Retargeting", display_label: "Retargeting" },
+  { column_name: "purchases_promo", source_label: "Promo", display_label: "Promo" },
+];
+let FUNNEL_SOURCES = DEFAULT_SOURCES;
+const FUNNEL_META = {}; // funnel key → { label, has_fb, sources } from /api/me/funnels
+const MK_PREFIX = ["fb_spend", "fb_link_clicks", "reg_page_visits", "registrations", "replays", "viewedcta", "clickedcta", "purchases"];
+const MK_SUFFIX = ["stayed_45", "stayed_60", "stayed_80", "total_purchases", "attended"];
+const STATIC_COL_LABELS = { fb_spend: "FB Spend", fb_link_clicks: "Total Reg. Page Visited", reg_page_visits: "Page Views", registrations: "Registra​tions", attended: "Attended", replays: "Replays", viewedcta: "Viewed CTA", clickedcta: "Clicked CTA", stayed_45: "45 min", stayed_60: "60 min", stayed_80: "80 min", total_purchases: "Total Purchases" };
+const MK = [];
+const COL_LABELS = {};
+function applyFunnelColumns(sources) {
+  if (Array.isArray(sources) && sources.length) FUNNEL_SOURCES = sources;
+  MK.length = 0;
+  MK.push(...MK_PREFIX, ...FUNNEL_SOURCES.map(s => s.column_name), ...MK_SUFFIX);
+  Object.keys(COL_LABELS).forEach(k => delete COL_LABELS[k]);
+  Object.assign(COL_LABELS, STATIC_COL_LABELS, Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, s.display_label])));
+}
+applyFunnelColumns(null);
 const DEFAULT_HIDDEN = [];
 
 // Summary card defaults and metric options for the configurable summary strip
@@ -290,7 +320,7 @@ const DEFAULT_SUMMARY_CARDS = [
   { label: "Purchases", key: "purchases", agg: "total", format: "number" },
   { label: "Total Replays", key: "replays", agg: "total", format: "number" },
 ];
-const SUMMARY_METRIC_OPTIONS = [
+const summaryMetricOptions = () => [
   { key: "fb_spend", label: "FB Spend", defaultFormat: "currency" },
   { key: "fb_link_clicks", label: "Reg. Page Visits", defaultFormat: "number" },
   { key: "registrations", label: "Registrations", defaultFormat: "number" },
@@ -299,17 +329,7 @@ const SUMMARY_METRIC_OPTIONS = [
   { key: "viewedcta", label: "Viewed CTA", defaultFormat: "number" },
   { key: "clickedcta", label: "Clicked CTA", defaultFormat: "number" },
   { key: "purchases", label: "Total Purchases", defaultFormat: "number" },
-  { key: "purchases_fb", label: "FB Purchases", defaultFormat: "number" },
-  { key: "purchases_native", label: "Native Ads", defaultFormat: "number" },
-  { key: "purchases_youtube", label: "Youtube/Organic", defaultFormat: "number" },
-  { key: "purchases_aibot", label: "AI Chat Bot", defaultFormat: "number" },
-  { key: "purchases_aibot_b", label: "AI Chat Bot B", defaultFormat: "number" },
-  { key: "purchases_postwebinar", label: "Post Webinar", defaultFormat: "number" },
-  { key: "purchases_cpa", label: "CPA Traffic Funnel", defaultFormat: "number" },
-  { key: "purchases_sales_a", label: "Sales A", defaultFormat: "number" },
-  { key: "purchases_sales_b", label: "Sales B", defaultFormat: "number" },
-  { key: "purchases_retargeting", label: "Retargeting", defaultFormat: "number" },
-  { key: "purchases_promo", label: "Promo", defaultFormat: "number" },
+  ...FUNNEL_SOURCES.map(s => ({ key: s.column_name, label: s.display_label, defaultFormat: "number" })),
   { key: "stayed_45", label: "45 min", defaultFormat: "number" },
   { key: "stayed_60", label: "60 min", defaultFormat: "number" },
   { key: "stayed_80", label: "80 min", defaultFormat: "number" },
@@ -1107,6 +1127,7 @@ export default function App() {
         if (fr.ok) {
           const fd = await fr.json();
           if (Array.isArray(fd.funnels) && fd.funnels.length > 0) allowed = fd.funnels;
+          if (Array.isArray(fd.meta)) for (const m of fd.meta) FUNNEL_META[m.key] = m;
         }
       } catch { /* fall back to analytics */ }
       setAllowedFunnels(allowed);
@@ -1118,6 +1139,7 @@ export default function App() {
         setActiveFunnelLS(active);
         setActiveFunnelState(active);
       }
+      applyFunnelColumns(FUNNEL_META[active]?.sources);
 
       // ── Step 2: Now safely call /api/me with a valid funnel ─────────
       const res = await fetch(`${API_BASE}/api/me`, {
@@ -1141,6 +1163,7 @@ export default function App() {
   const switchFunnel = useCallback((f) => {
     if (f === activeFunnel) return;
     if (!allowedFunnels.includes(f)) return;
+    applyFunnelColumns(FUNNEL_META[f]?.sources);
     setActiveFunnelLS(f);
     setActiveFunnelState(f);
   }, [activeFunnel, allowedFunnels]);
@@ -1632,7 +1655,7 @@ export default function App() {
                     value={activeFunnel}
                     onChange={switchFunnel}
                     ariaLabel="Active workspace"
-                    options={allowedFunnels.map(f => ({ value: f, label: f === "analytics" ? "Main funnel" : f === "native" ? "Native funnel" : f }))}
+                    options={allowedFunnels.map(f => ({ value: f, label: FUNNEL_META[f]?.label || (f === "analytics" ? "Main funnel" : f === "native" ? "Native funnel" : f) }))}
                   />
                 </div>
               )}
@@ -1691,7 +1714,7 @@ export default function App() {
               <div ref={navMenuRef} className="nav-menu-panel" role="dialog" aria-modal="true" aria-label="Navigation menu">
                 <div className="nav-menu-header"><div><strong>Navigation</strong><span>{viewTitles[view] || "Analytics"}</span></div><button className="nav-menu-close" aria-label="Close navigation" onClick={() => setMobileMenuOpen(false)}><I d="M6 18L18 6M6 6l12 12" size={18} sw={2} /></button></div>
                 {allowedFunnels.length > 1 && (
-                  <div className="menu-workspace"><span>Workspace</span><GeistSelect className="menu-workspace-geist-select" value={activeFunnel} onChange={(nextFunnel) => { setMobileMenuOpen(false); switchFunnel(nextFunnel); }} ariaLabel="Active workspace" options={allowedFunnels.map(f => ({ value: f, label: f === "analytics" ? "Main funnel" : f === "native" ? "Native funnel" : f }))} /></div>
+                  <div className="menu-workspace"><span>Workspace</span><GeistSelect className="menu-workspace-geist-select" value={activeFunnel} onChange={(nextFunnel) => { setMobileMenuOpen(false); switchFunnel(nextFunnel); }} ariaLabel="Active workspace" options={allowedFunnels.map(f => ({ value: f, label: FUNNEL_META[f]?.label || (f === "analytics" ? "Main funnel" : f === "native" ? "Native funnel" : f) }))} /></div>
                 )}
                 <nav className="nav-menu-groups" aria-label="Application navigation">
                   {navigationGroups.map(group => (
@@ -2248,7 +2271,7 @@ function SummaryEditor({ cards: initialCards, customs, onSave, onCancel }) {
 
   // Build full options list: base metrics + custom metrics
   const allOptions = [
-    ...SUMMARY_METRIC_OPTIONS,
+    ...summaryMetricOptions(),
     ...(customs || []).map(cm => ({ key: `cm:${cm.id}`, label: cm.name, defaultFormat: cm.format === "currency" ? "currency" : cm.format === "percent" ? "decimal" : "number" })),
   ];
 
@@ -3037,15 +3060,15 @@ function EmailDrillModal({ drill, loading, onClose, onOpenContact }) {
 function EntryForm({ initial, onSubmit, onCancel, isMobile }) {
   const today = getLADate();
   const defaults = initial
-    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, registrations: initial.registrations ?? 0, replays: initial.replays ?? 0, viewedcta: initial.viewedcta ?? 0, clickedcta: initial.clickedcta ?? 0, purchases_fb: initial.purchases_fb ?? 0, purchases_native: initial.purchases_native ?? 0, purchases_youtube: initial.purchases_youtube ?? 0, purchases_aibot: initial.purchases_aibot ?? 0, purchases_aibot_b: initial.purchases_aibot_b ?? 0, purchases_postwebinar: initial.purchases_postwebinar ?? 0, purchases_cpa: initial.purchases_cpa ?? 0, purchases_sales_a: initial.purchases_sales_a ?? 0, purchases_sales_b: initial.purchases_sales_b ?? 0, purchases_retargeting: initial.purchases_retargeting ?? 0, purchases_promo: initial.purchases_promo ?? 0, stayed_45: initial.stayed_45 ?? 0, stayed_60: initial.stayed_60 ?? 0, stayed_80: initial.stayed_80 ?? 0, attended: initial.attended ?? 0 }
-    : { fb_spend: "", fb_link_clicks: "", registrations: "", replays: "", viewedcta: "", clickedcta: "", purchases_fb: "", purchases_native: "", purchases_youtube: "", purchases_aibot: "", purchases_aibot_b: "", purchases_postwebinar: "", purchases_cpa: "", purchases_sales_a: "", purchases_sales_b: "", purchases_retargeting: "", purchases_promo: "", stayed_45: "", stayed_60: "", stayed_80: "", attended: "" };
+    ? { fb_spend: initial.fb_spend ?? 0, fb_link_clicks: initial.fb_link_clicks ?? 0, registrations: initial.registrations ?? 0, replays: initial.replays ?? 0, viewedcta: initial.viewedcta ?? 0, clickedcta: initial.clickedcta ?? 0, ...Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, initial[s.column_name] ?? 0])), stayed_45: initial.stayed_45 ?? 0, stayed_60: initial.stayed_60 ?? 0, stayed_80: initial.stayed_80 ?? 0, attended: initial.attended ?? 0 }
+    : { fb_spend: "", fb_link_clicks: "", registrations: "", replays: "", viewedcta: "", clickedcta: "", ...Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, ""])), stayed_45: "", stayed_60: "", stayed_80: "", attended: "" };
   const [f, setF] = useState({ date: initial?.date || today, ...defaults });
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
-  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, purchases_fb: parseInt(f.purchases_fb) || 0, purchases_native: parseInt(f.purchases_native) || 0, purchases_youtube: parseInt(f.purchases_youtube) || 0, purchases_aibot: parseInt(f.purchases_aibot) || 0, purchases_aibot_b: parseInt(f.purchases_aibot_b) || 0, purchases_postwebinar: parseInt(f.purchases_postwebinar) || 0, purchases_cpa: parseInt(f.purchases_cpa) || 0, purchases_sales_a: parseInt(f.purchases_sales_a) || 0, purchases_sales_b: parseInt(f.purchases_sales_b) || 0, purchases_retargeting: parseInt(f.purchases_retargeting) || 0, purchases_promo: parseInt(f.purchases_promo) || 0, stayed_45: parseInt(f.stayed_45) || 0, stayed_60: parseInt(f.stayed_60) || 0, stayed_80: parseInt(f.stayed_80) || 0, attended: parseInt(f.attended) || 0 });
+  const go = () => onSubmit({ date: f.date, day: getLADay(f.date), fb_spend: parseFloat(f.fb_spend) || 0, fb_link_clicks: parseInt(f.fb_link_clicks) || 0, registrations: parseInt(f.registrations) || 0, replays: parseInt(f.replays) || 0, viewedcta: parseInt(f.viewedcta) || 0, clickedcta: parseInt(f.clickedcta) || 0, ...Object.fromEntries(FUNNEL_SOURCES.map(s => [s.column_name, parseInt(f[s.column_name]) || 0])), stayed_45: parseInt(f.stayed_45) || 0, stayed_60: parseInt(f.stayed_60) || 0, stayed_80: parseInt(f.stayed_80) || 0, attended: parseInt(f.attended) || 0 });
   const fieldGroups = [
     { title: "Traffic", description: "Spend, visits, and registrations", fields: [{ k: "fb_spend", l: "Facebook spend ($)", step: "0.01", ph: "0.00" }, { k: "fb_link_clicks", l: "Registration page visits", ph: "0" }, { k: "registrations", l: "Registrations", ph: "0" }] },
     { title: "Engagement", description: "Attendance and call-to-action behavior", fields: [{ k: "attended", l: "Attended", ph: "0" }, { k: "replays", l: "Replays", ph: "0" }, { k: "viewedcta", l: "Viewed CTA", ph: "0" }, { k: "clickedcta", l: "Clicked CTA", ph: "0" }] },
-    { title: "Purchase sources", description: "Attribute purchases to their source", fields: [{ k: "purchases_fb", l: "Facebook", ph: "0" }, { k: "purchases_native", l: "Native ads", ph: "0" }, { k: "purchases_youtube", l: "YouTube / organic", ph: "0" }, { k: "purchases_aibot", l: "AI chatbot", ph: "0" }, { k: "purchases_aibot_b", l: "AI chatbot B", ph: "0" }, { k: "purchases_postwebinar", l: "Post-webinar", ph: "0" }, { k: "purchases_cpa", l: "CPA funnel", ph: "0" }, { k: "purchases_sales_a", l: "Sales A", ph: "0" }, { k: "purchases_sales_b", l: "Sales B", ph: "0" }, { k: "purchases_retargeting", l: "Retargeting", ph: "0" }, { k: "purchases_promo", l: "Promo", ph: "0" }] },
+    { title: "Purchase sources", description: "Attribute purchases to their source", fields: FUNNEL_SOURCES.map(s => ({ k: s.column_name, l: s.display_label, ph: "0" })) },
     { title: "Retention", description: "How long attendees stayed", fields: [{ k: "stayed_45", l: "Stayed 45 minutes", ph: "0" }, { k: "stayed_60", l: "Stayed 60 minutes", ph: "0" }, { k: "stayed_80", l: "Stayed 80 minutes", ph: "0" }] },
   ];
   return (
@@ -4158,7 +4181,7 @@ function InsightsChat({ flash, isMobile, activeFunnel, userId, mode = "insights"
     catch { flash("Copy failed", "err"); }
   };
 
-  const sourceLabel = activeFunnel ? activeFunnel.charAt(0).toUpperCase() + activeFunnel.slice(1) : "Select Source";
+  const sourceLabel = activeFunnel ? (FUNNEL_META[activeFunnel]?.label || activeFunnel.charAt(0).toUpperCase() + activeFunnel.slice(1)) : "Select Source";
 
   const IC = {
     outer: { display: "flex", height: compact ? "100%" : "calc(100dvh - 64px)", gap: 0, position: "relative", background: "var(--ds-background-100)", border: "none", borderRadius: 0, overflow: "hidden" },

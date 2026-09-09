@@ -41,31 +41,100 @@ if (!API_KEY) {
 //
 // supabasePublic is used for cross-funnel concerns: auth.getUser, the shared
 // api_keys table, and user_funnel_access. It always targets `public`.
-const FUNNEL_TO_SCHEMA = { analytics: 'public', native: 'native' };
-const ALLOWED_FUNNELS = Object.keys(FUNNEL_TO_SCHEMA);
-
-// Per-funnel branding used by the AI insights chat. Each entry shapes the
-// system prompt so the model knows which business/channel it's analyzing.
-const FUNNEL_BRANDS = {
-    analytics: { brand: 'Dr Shumard', context: 'a medical practice', funnelName: 'Main (FB Ads) Funnel' },
-    native:    { brand: 'Dr Shumard', context: 'a medical practice', funnelName: 'Native Ads Funnel' },
-};
+// ─── Funnel + column registry ────────────────────────────────────────────────
+// Funnels live in public.funnels; each funnel schema has a purchase_sources
+// table. Everything funnel- or column-shaped in this app derives from this
+// config (refreshed every 60s + on admin writes). Falls back to the
+// pre-registry hardcoded values if the registry is unreachable, so boot order
+// can never break the app.
+const FALLBACK_FUNNELS = [
+    { key: 'analytics', schema_name: 'public', label: 'Main (FB Ads) Funnel', brand: 'Dr Shumard', brand_context: 'a medical practice', fb_ad_account_id: process.env.FB_AD_ACCOUNT_ID || null, is_active: true },
+    { key: 'native',    schema_name: 'native', label: 'Native Ads Funnel',    brand: 'Dr Shumard', brand_context: 'a medical practice', fb_ad_account_id: null, is_active: true },
+];
+const FALLBACK_SOURCES = [
+    { column_name: 'purchases_fb',          source_label: 'Paid Ads',     display_label: 'FB Purchases',       sort_order: 10 },
+    { column_name: 'purchases_native',      source_label: 'Native',       display_label: 'Native Ads',         sort_order: 20 },
+    { column_name: 'purchases_youtube',     source_label: 'Youtube',      display_label: 'Youtube/Organic',    sort_order: 30 },
+    { column_name: 'purchases_aibot',       source_label: 'AI Bot',       display_label: 'AI Chat Bot',        sort_order: 40 },
+    { column_name: 'purchases_aibot_b',     source_label: 'AI Bot B',     display_label: 'AI Chat Bot B',      sort_order: 50 },
+    { column_name: 'purchases_postwebinar', source_label: 'Post Webinar', display_label: 'Post Webinar',       sort_order: 60 },
+    { column_name: 'purchases_cpa',         source_label: 'CPA Traffic',  display_label: 'CPA Traffic Funnel', sort_order: 70 },
+    { column_name: 'purchases_sales_a',     source_label: 'Sales A',      display_label: 'Sales A',            sort_order: 80 },
+    { column_name: 'purchases_sales_b',     source_label: 'Sales B',      display_label: 'Sales B',            sort_order: 90 },
+    { column_name: 'purchases_retargeting', source_label: 'Retargeting',  display_label: 'Retargeting',        sort_order: 100 },
+    { column_name: 'purchases_promo',       source_label: 'Promo',        display_label: 'Promo',              sort_order: 110 },
+];
 
 const supabasePublic = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
     realtime: { transport: ws },
 });
 
-const _funnelClients = new Map();
-function clientFor(funnel) {
-    const schema = FUNNEL_TO_SCHEMA[funnel];
-    if (!schema) throw new Error(`Unknown funnel: ${funnel}`);
-    if (!_funnelClients.has(funnel)) {
-        _funnelClients.set(funnel, createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+const _schemaClients = new Map();
+function clientForSchema(schema) {
+    if (!/^[a-z][a-z0-9_]{0,30}$/.test(schema)) throw new Error(`Bad schema name: ${schema}`);
+    if (!_schemaClients.has(schema)) {
+        _schemaClients.set(schema, createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
             db: { schema },
             realtime: { transport: ws },
         }));
     }
-    return _funnelClients.get(funnel);
+    return _schemaClients.get(schema);
+}
+
+const funnelConfig = {
+    funnels: new Map(FALLBACK_FUNNELS.map(f => [f.key, f])),
+    sources: new Map(FALLBACK_FUNNELS.map(f => [f.key, FALLBACK_SOURCES])),
+    sourceMaps: new Map(), // funnel → { source_label: column_name }, precomputed
+    loadedAt: 0,
+    fromRegistry: false,
+};
+function rebuildSourceMaps() {
+    funnelConfig.sourceMaps = new Map(
+        [...funnelConfig.sources.entries()].map(([k, rows]) => [k, Object.fromEntries(rows.map(s => [s.source_label, s.column_name]))])
+    );
+}
+rebuildSourceMaps();
+
+async function refreshFunnelConfig(force = false) {
+    if (!force && Date.now() - funnelConfig.loadedAt < 60_000) return;
+    funnelConfig.loadedAt = Date.now();
+    try {
+        const { data: rows, error } = await supabasePublic.from('funnels').select('*').eq('is_active', true).order('created_at');
+        if (error || !rows?.length) throw error || new Error('funnels registry empty');
+        const sources = new Map();
+        await Promise.all(rows.map(async r => {
+            const { data: srcRows } = await clientForSchema(r.schema_name)
+                .from('purchase_sources').select('*').eq('is_active', true).order('sort_order');
+            sources.set(r.key, srcRows?.length ? srcRows : FALLBACK_SOURCES);
+        }));
+        funnelConfig.funnels = new Map(rows.map(r => [r.key, r]));
+        funnelConfig.sources = sources;
+        rebuildSourceMaps();
+        funnelConfig.fromRegistry = true;
+    } catch (e) {
+        if (!funnelConfig.fromRegistry) console.warn('⚠️ Funnel registry unavailable — using fallback config:', e?.message);
+    }
+}
+refreshFunnelConfig(true).catch(() => {});
+setInterval(() => refreshFunnelConfig().catch(() => {}), 60_000);
+
+// Sync getters — the only sanctioned way to enumerate funnels/purchase columns.
+function allowedFunnels() { return [...funnelConfig.funnels.keys()]; }
+function funnelExists(f) { return funnelConfig.funnels.has(f); }
+function brandFor(funnel) {
+    const f = funnelConfig.funnels.get(funnel);
+    return f ? { brand: f.brand, context: f.brand_context || '', funnelName: f.label } : { brand: funnel, context: '', funnelName: funnel };
+}
+function fbAccountFor(funnel) { return funnelConfig.funnels.get(funnel)?.fb_ad_account_id || null; }
+function purchaseSources(funnel) { return funnelConfig.sources.get(funnel) || FALLBACK_SOURCES; }
+function purchaseSourceMap(funnel) { return funnelConfig.sourceMaps.get(funnel) || funnelConfig.sourceMaps.get('analytics') || {}; }
+function purchaseSubCols(funnel) { return purchaseSources(funnel).map(s => s.column_name); }
+function purchaseCols(funnel) { return ['purchases', ...purchaseSubCols(funnel)]; }
+
+function clientFor(funnel) {
+    const f = funnelConfig.funnels.get(funnel);
+    if (!f) throw new Error(`Unknown funnel: ${funnel}`);
+    return clientForSchema(f.schema_name);
 }
 
 // Resolve funnel for unauthenticated routes (defaults to analytics — preserves
@@ -73,7 +142,7 @@ function clientFor(funnel) {
 // validates against user_funnel_access.
 function resolveFunnel(req, fallback = 'analytics') {
     const f = req.headers['x-funnel'] || fallback;
-    return ALLOWED_FUNNELS.includes(f) ? f : fallback;
+    return funnelExists(f) ? f : fallback;
 }
 
 // ─── In-Memory Cache (reduces Supabase egress by ~98%) ───────────────────────
@@ -559,7 +628,7 @@ async function authenticateWebhook(req, res, next) {
             .select('*')
             .eq('key_hash', hash)
             .single();
-        if (dbKey && dbKey.is_active && ALLOWED_FUNNELS.includes(dbKey.funnel)) {
+        if (dbKey && dbKey.is_active && funnelExists(dbKey.funnel)) {
             await supabasePublic.from('api_keys').update({ last_used_at: new Date().toISOString() }).eq('id', dbKey.id);
             req.funnel = dbKey.funnel;
             req.apiKeyScopes = dbKey.scopes || []; // TEXT[] of allowed AI tool names; empty = none, ['*'] = all
@@ -744,7 +813,7 @@ app.post('/api/metrics', webhookLimiter, async (req, res) => {
 
         // Only include purchase source columns if explicitly provided
         // Prevents admin form edits from clobbering webhook-sourced data to 0
-        const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo'];
+        const PURCHASE_COLS = purchaseCols(req.funnel);
         for (const col of PURCHASE_COLS) {
             if (body[col] !== undefined && body[col] !== '' && body[col] !== null) {
                 row[col] = parseInt(body[col]) || 0;
@@ -807,7 +876,7 @@ app.post('/api/metrics/batch', webhookLimiter, authenticateWebhook, async (req, 
                 attended: parseInt(entry.attended) || 0,
             };
             // Only include purchase columns if explicitly provided (prevents clobbering)
-            const PURCHASE_COLS = ['purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo'];
+            const PURCHASE_COLS = purchaseCols(req.funnel);
             for (const col of PURCHASE_COLS) {
                 if (entry[col] !== undefined && entry[col] !== '' && entry[col] !== null) {
                     row[col] = parseInt(entry[col]) || 0;
@@ -846,22 +915,9 @@ app.post('/api/metrics/increment', webhookLimiter, authenticateWebhook, async (r
         // field:'purchases' with a 'source' param so source routing and Post Webinar detection run.
         const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'stayeduntil'];
 
-        // ── Purchase source mapping ──────────────────────────────────────
-        const PURCHASE_SOURCE_MAP = {
-            'Paid Ads':    'purchases_fb',
-            'Native':      'purchases_native',
-            'Youtube':     'purchases_youtube',
-            'AI Bot':      'purchases_aibot',
-            'AI Bot B':    'purchases_aibot_b',
-            'CPA Traffic': 'purchases_cpa',
-            'Sales A':     'purchases_sales_a',
-            'Sales B':     'purchases_sales_b',
-            'Retargeting': 'purchases_retargeting',
-            'Promo':       'purchases_promo',
-            // Explicit tag — trusted verbatim, skips the 12h auto-detection
-            // (which otherwise re-routes Paid Ads / Sales A / Sales B).
-            'Post Webinar': 'purchases_postwebinar',
-        };
+        // ── Purchase source mapping (registry-driven; 'Post Webinar' is an
+        // explicit tag that skips the 12h auto-detection) ─────────────────
+        const PURCHASE_SOURCE_MAP = purchaseSourceMap(req.funnel);
 
         // ── Webinar engagement milestone mapping ─────────────────────────
         // field='stayeduntil' + body.stayeduntil ∈ {45,60,80} → stayed_NN column
@@ -1107,7 +1163,7 @@ app.post('/api/metrics/set', webhookLimiter, authenticateWebhook, async (req, re
     try {
         const supabase = clientFor(req.funnel);
         const { field, value, date: dateInput } = req.body;
-        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo', 'stayed_45', 'stayed_60', 'stayed_80', 'attended'];
+        const validFields = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', ...purchaseSubCols(req.funnel), 'stayed_45', 'stayed_60', 'stayed_80', 'attended'];
 
         if (!validFields.includes(field)) {
             return res.status(400).json({ error: `Invalid field. Use: ${validFields.join(', ')}` });
@@ -1249,8 +1305,17 @@ app.get('/api/me/funnels', dashboardLimiter, async (req, res) => {
             .from('user_funnel_access')
             .select('funnel')
             .eq('user_id', user.id);
-        const funnels = (rows || []).map(r => r.funnel).filter(f => ALLOWED_FUNNELS.includes(f));
-        res.json({ funnels: funnels.length > 0 ? funnels : ['analytics'] });
+        const funnels = (rows || []).map(r => r.funnel).filter(f => funnelExists(f));
+        const list = funnels.length > 0 ? funnels : ['analytics'];
+        res.json({
+            funnels: list,
+            meta: list.map(k => ({
+                key: k,
+                label: brandFor(k).funnelName,
+                has_fb: !!fbAccountFor(k),
+                sources: purchaseSources(k).map(({ column_name, source_label, display_label }) => ({ column_name, source_label, display_label })),
+            })),
+        });
     } catch (err) {
         console.error('❌ GET /api/me/funnels error:', err.message);
         res.status(500).json({ error: 'Failed to fetch funnels' });
@@ -1473,20 +1538,7 @@ const EVENT_TYPES = ['registrations', 'attended', 'replays', 'viewedcta', 'click
 // stayeduntil events use metadata.stayeduntil (45|60|80) as the sub-key
 const STAYED_DEDUP_MAP = { 45: 'stayed_45', 60: 'stayed_60', 80: 'stayed_80' };
 
-// Map purchase event metadata.source to the dedup sub-key
-const PURCHASE_DEDUP_MAP = {
-    'Paid Ads':      'purchases_fb',
-    'Native':        'purchases_native',
-    'Youtube':       'purchases_youtube',
-    'AI Bot':        'purchases_aibot',
-    'AI Bot B':      'purchases_aibot_b',
-    'Post Webinar':  'purchases_postwebinar',
-    'CPA Traffic':   'purchases_cpa',
-    'Sales A':       'purchases_sales_a',
-    'Sales B':       'purchases_sales_b',
-    'Retargeting':   'purchases_retargeting',
-    'Promo':         'purchases_promo',
-};
+// Purchase metadata.source → column mapping now comes from purchaseSourceMap(funnel).
 
 // Allowed variant buckets. 'all' is computed as the sum of the others.
 const VARIANT_BUCKETS = ['A', 'B', 'undetected'];
@@ -1565,7 +1617,7 @@ function buildVariantResolver(events, cutoffMs = null, aliasMap = null, emailPho
 
 // Returns: { 'YYYY-MM-DD': { event_type: { all, A, B, undetected } } }.
 // 'all' = A + B + undetected (each person resolves to exactly one bucket).
-function computeDedupFromEvents(events, cutoffMs = null, aliasMap = null, emailPhones = null) {
+function computeDedupFromEvents(events, cutoffMs = null, aliasMap = null, emailPhones = null, sourceMap = purchaseSourceMap('analytics')) {
     const variantOf = buildVariantResolver(events, cutoffMs, aliasMap, emailPhones);
     // The A/B-test-start as an LA calendar date. Any event bucketed to a day BEFORE this
     // is a pre-test row and never shows a variant — even if the event itself was recorded
@@ -1591,7 +1643,7 @@ function computeDedupFromEvents(events, cutoffMs = null, aliasMap = null, emailP
         let eventKey = ev.event_type;
         if (ev.event_type === 'purchases') {
             const src = ev.metadata?.source || 'Paid Ads';
-            eventKey = PURCHASE_DEDUP_MAP[src] || 'purchases_fb';
+            eventKey = sourceMap[src] || 'purchases_fb';
         } else if (ev.event_type === 'stayeduntil') {
             const minute = Number(ev.metadata?.stayeduntil);
             eventKey = STAYED_DEDUP_MAP[minute];
@@ -1705,7 +1757,7 @@ async function computeAndCacheUncached(funnel, bucket, uncachedDates, today) {
     const computedByDate = {};
     for (const [minDate, maxDate] of ranges) {
         const events = await fetchEventsForDateRange(funnel, minDate, maxDate);
-        const computed = computeDedupFromEvents(events, abCutoff, aliasMap, emailPhones);
+        const computed = computeDedupFromEvents(events, abCutoff, aliasMap, emailPhones, purchaseSourceMap(funnel));
         const dayCounts = {};
         for (const [d, counts] of Object.entries(computed)) {
             dayCounts[d] = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(', ');
@@ -1799,7 +1851,7 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
     const toISO = toDate.toISOString().slice(0, 10);
 
     const events = await fetchEventsForDateRange(funnel, fromISO, toISO);
-    const dedupMap = computeDedupFromEvents(events);
+    const dedupMap = computeDedupFromEvents(events, null, null, null, purchaseSourceMap(funnel));
     const counts = dedupMap[isoDate] || {};
 
     // Which event_types are present in the events table for isoDate. If a
@@ -1824,19 +1876,14 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
 
     const FIELDS = [
         'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
-        'purchases_fb', 'purchases_native', 'purchases_youtube',
-        'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa',
-        'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo',
+        ...purchaseSubCols(funnel),
         'stayed_45', 'stayed_60', 'stayed_80',
     ];
 
     const FIELD_PARENT = {
         registrations: 'registrations', attended: 'attended', replays: 'replays',
         viewedcta: 'viewedcta', clickedcta: 'clickedcta',
-        purchases_fb: 'purchases', purchases_native: 'purchases',
-        purchases_youtube: 'purchases', purchases_aibot: 'purchases', purchases_aibot_b: 'purchases',
-        purchases_postwebinar: 'purchases', purchases_cpa: 'purchases',
-        purchases_sales_a: 'purchases', purchases_sales_b: 'purchases', purchases_retargeting: 'purchases', purchases_promo: 'purchases',
+        ...Object.fromEntries(purchaseSubCols(funnel).map(c => [c, 'purchases'])),
         stayed_45: 'stayeduntil', stayed_60: 'stayeduntil', stayed_80: 'stayeduntil',
     };
 
@@ -2110,12 +2157,12 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         // independent of the FB fb_link_clicks total.
         const regVisits = await getRegPageVisits(funnel, (data || []).map(r => String(r.date).substring(0, 10)));
 
+        const PURCHASE_SUB = purchaseSubCols(funnel);
         const DEDUP_COLS = new Set([
             'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
-            'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo',
+            ...PURCHASE_SUB,
             'stayed_45', 'stayed_60', 'stayed_80',
         ]);
-        const PURCHASE_SUB = ['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo'];
 
         // Convert to frontend format (MM/DD/YYYY)
         const formatted = (data || []).map(row => {
@@ -2154,17 +2201,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                     replays: pickV('replays', vnt),
                     viewedcta: pickV('viewedcta', vnt),
                     clickedcta: pickV('clickedcta', vnt),
-                    purchases_fb: pickV('purchases_fb', vnt),
-                    purchases_native: pickV('purchases_native', vnt),
-                    purchases_youtube: pickV('purchases_youtube', vnt),
-                    purchases_aibot: pickV('purchases_aibot', vnt),
-                    purchases_aibot_b: pickV('purchases_aibot_b', vnt),
-                    purchases_postwebinar: pickV('purchases_postwebinar', vnt),
-                    purchases_cpa: pickV('purchases_cpa', vnt),
-                    purchases_sales_a: pickV('purchases_sales_a', vnt),
-                    purchases_sales_b: pickV('purchases_sales_b', vnt),
-                    purchases_retargeting: pickV('purchases_retargeting', vnt),
-                    purchases_promo: pickV('purchases_promo', vnt),
+                    ...Object.fromEntries(PURCHASE_SUB.map(c => [c, pickV(c, vnt)])),
                     stayed_45: pickV('stayed_45', vnt),
                     stayed_60: pickV('stayed_60', vnt),
                     stayed_80: pickV('stayed_80', vnt),
@@ -2234,7 +2271,7 @@ app.put('/api/metrics/:date', dashboardLimiter, requireAuth, requireAdmin, async
 
         // Only write to overrides — raw columns stay as the automated data source.
         // This prevents overrides from drifting separately from raw columns (#6).
-        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo', 'stayed_45', 'stayed_60', 'stayed_80'];
+        const OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', ...purchaseSubCols(req.funnel), 'stayed_45', 'stayed_60', 'stayed_80'];
         const newOverrides = {};
         for (const f of OVERRIDE_FIELDS) {
             if (body[f] !== undefined) {
@@ -2572,12 +2609,11 @@ app.post('/api/admin/backfill-variant-splits', requireAuth, requireAdmin, async 
         const aliasMap = await getCombinedAliases(funnel);
         const emailPhones = await getTrackingPhones(funnel);
         const events = await fetchEventsForDateRange(funnel, fromISO, todayISO);
-        const dedupMap = computeDedupFromEvents(events, abCutoff, aliasMap, emailPhones);
+        const dedupMap = computeDedupFromEvents(events, abCutoff, aliasMap, emailPhones, purchaseSourceMap(funnel));
 
         const FIELDS = [
             'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta',
-            'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b',
-            'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo',
+            ...purchaseSubCols(funnel),
             'stayed_45', 'stayed_60', 'stayed_80',
         ];
         let updated = 0;
@@ -2699,7 +2735,7 @@ const _computeYesterdayLA = () => {
 // of FB config (the dedup engine doesn't depend on FB).
 cron.schedule('5 4 * * *', async () => {
     const yesterdayISO = _computeYesterdayLA();
-    for (const funnel of ALLOWED_FUNNELS) {
+    for (const funnel of allowedFunnels()) {
         try {
             console.log(`🧊 [${funnel}] Daily 4:05 AM cron: finalizing daily_metrics for ${yesterdayISO}`);
             const result = await finalizeDailyMetricsForDate(funnel, yesterdayISO);
@@ -2802,7 +2838,7 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
                 let eventKey = ev.event_type;
                 if (ev.event_type === 'purchases') {
                     const src = ev.metadata?.source || 'Paid Ads';
-                    eventKey = PURCHASE_DEDUP_MAP[src] || 'purchases_fb';
+                    eventKey = purchaseSourceMap(req.funnel)[src] || 'purchases_fb';
                 }
 
                 // Date filter: only include events attributed to the requested range
@@ -2920,7 +2956,7 @@ console.log(AVATAR_ENABLED
 // Live Facebook Ads reporting (campaign/adset/ad structure + delivery) for AI
 // Insights. Reuses the spend-sync System User token; analytics funnel only
 // (native runs Taboola).
-const FB_ADS_ENABLED = !!(process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID);
+const FB_ADS_ENABLED = !!process.env.FB_ACCESS_TOKEN;
 if (GHL_ENABLED) {
     // Prewarm the pipeline snapshots shortly after boot; thereafter the
     // stale-while-revalidate cache keeps chat tool calls near-instant.
@@ -3328,7 +3364,7 @@ async function loadAllInsightsMetrics(funnel) {
     const dates = rawRows.filter(r => !r.finalized_at).map(r => String(r.date).substring(0, 10));
     const dedupMap = await getDedupCounts(funnel, dates);
 
-    const PURCHASE_SUB_COLS = new Set(['purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo', 'stayed_45', 'stayed_60', 'stayed_80']);
+    const PURCHASE_SUB_COLS = new Set([...purchaseSubCols(funnel), 'stayed_45', 'stayed_60', 'stayed_80']);
     const metrics = rawRows.map(r => {
         const dateStr = String(r.date).substring(0, 10);
         const deduped = dedupMap[dateStr] || {};
@@ -3351,24 +3387,11 @@ async function loadAllInsightsMetrics(funnel) {
             replays: pick('replays'),
             viewedcta: pick('viewedcta'),
             clickedcta: pick('clickedcta'),
-            purchases_fb: pick('purchases_fb') || 0,
-            purchases_native: pick('purchases_native') || 0,
-            purchases_youtube: pick('purchases_youtube') || 0,
-            purchases_aibot: pick('purchases_aibot') || 0,
-            purchases_aibot_b: pick('purchases_aibot_b') || 0,
-            purchases_postwebinar: pick('purchases_postwebinar') || 0,
-            purchases_cpa: pick('purchases_cpa') || 0,
-            purchases_sales_a: pick('purchases_sales_a') || 0,
-            purchases_sales_b: pick('purchases_sales_b') || 0,
-            purchases_retargeting: pick('purchases_retargeting') || 0,
-            purchases_promo: pick('purchases_promo') || 0,
+            ...Object.fromEntries(purchaseSubCols(funnel).map(c => [c, pick(c) || 0])),
             stayed_45: pick('stayed_45') || 0,
             stayed_60: pick('stayed_60') || 0,
             stayed_80: pick('stayed_80') || 0,
-            total_purchases: (pick('purchases_fb') || 0) + (pick('purchases_native') || 0) +
-                             (pick('purchases_youtube') || 0) + (pick('purchases_aibot') || 0) + (pick('purchases_aibot_b') || 0) +
-                             (pick('purchases_postwebinar') || 0) + (pick('purchases_cpa') || 0) +
-                             (pick('purchases_sales_a') || 0) + (pick('purchases_sales_b') || 0) + (pick('purchases_retargeting') || 0) + (pick('purchases_promo') || 0),
+            total_purchases: purchaseSubCols(funnel).reduce((s, c) => s + (pick(c) || 0), 0),
         };
     });
 
@@ -3418,7 +3441,7 @@ async function getInsightsRollup(funnel, period, from, to) {
     };
 
     const buckets = new Map();
-    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta','purchases_fb','purchases_native','purchases_youtube','purchases_aibot','purchases_aibot_b','purchases_postwebinar','purchases_cpa','purchases_sales_a','purchases_sales_b','purchases_retargeting','purchases_promo','stayed_45','stayed_60','stayed_80','total_purchases'];
+    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta',...purchaseSubCols(funnel),'stayed_45','stayed_60','stayed_80','total_purchases'];
 
     for (const r of rows) {
         const k = bucketKey(r.date);
@@ -3453,7 +3476,7 @@ async function compareInsightsPeriods(funnel, aFrom, aTo, bFrom, bTo) {
         getInsightsMetrics(funnel, bFrom, bTo),
     ]);
 
-    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta','purchases_fb','purchases_native','purchases_youtube','purchases_aibot','purchases_aibot_b','purchases_postwebinar','purchases_cpa','purchases_sales_a','purchases_sales_b','purchases_retargeting','purchases_promo','total_purchases'];
+    const ADDITIVE = ['fb_spend','fb_link_clicks','registrations','attended','replays','viewedcta','clickedcta',...purchaseSubCols(funnel),'total_purchases'];
     const sumOf = (rows) => {
         const t = { days: rows.length };
         ADDITIVE.forEach(c => t[c] = rows.reduce((s, r) => s + (Number(r[c]) || 0), 0));
@@ -4340,8 +4363,9 @@ function fbCreative(c) {
 }
 
 async function getFbAds(funnel, input) {
-    if (!FB_ADS_ENABLED) return { error: 'Facebook Ads not configured (FB_ACCESS_TOKEN / FB_AD_ACCOUNT_ID)' };
-    if (funnel !== 'analytics') return { error: 'Facebook Ads is connected to the Main (analytics) funnel only — the native funnel runs Taboola, not Facebook.' };
+    if (!FB_ADS_ENABLED) return { error: 'Facebook Ads not configured (FB_ACCESS_TOKEN)' };
+    const adAccount = fbAccountFor(funnel);
+    if (!adAccount) return { error: `The ${funnel} funnel has no Facebook ad account linked — an admin can set one on the funnel (New Funnel / funnel settings).` };
 
     const level = String(input.level || 'campaign');
     const EDGES = { campaign: 'campaigns', adset: 'adsets', ad: 'ads' };
@@ -4374,7 +4398,7 @@ async function getFbAds(funnel, input) {
     const fields = `${FIELDS[level]},insights.time_range({"since":"${since}","until":"${until}"})${breakdown ? `.breakdowns(${breakdown}).limit(50)` : ''}{${INSIGHT_FIELDS}}`;
 
     // parent_id scopes children: a campaign id for adsets/ads, or an adset id for ads.
-    const edgeBase = input.parent_id ? `${String(input.parent_id).replace(/[^\d_]/g, '')}/${EDGES[level]}` : `${process.env.FB_AD_ACCOUNT_ID}/${EDGES[level]}`;
+    const edgeBase = input.parent_id ? `${String(input.parent_id).replace(/[^\d_]/g, '')}/${EDGES[level]}` : `${adAccount}/${EDGES[level]}`;
 
     const signature = `${edgeBase}|${status}|${since}|${until}|${input.include_creative ? 'c' : ''}|${breakdown || ''}`;
     const hit = _fbAdsCache.get(signature);
@@ -4739,7 +4763,7 @@ if (AVATAR_ENABLED) INSIGHTS_TOOLS.push({
 // Facebook Ads tool — registered only when the ads token is configured.
 if (FB_ADS_ENABLED) INSIGHTS_TOOLS.push({
     name: 'get_fb_ads',
-    description: 'LIVE Facebook Ads from the Meta Marketing API at EVERY level of the hierarchy: campaigns → ad sets → individual ads and their creatives. Per entity over any date range: impressions, reach, frequency, clicks, link clicks, CTR, CPC, CPM, spend, PLUS Meta-pixel conversions (purchases, leads, registrations, landing-page views, checkouts started, video thruplays) with cost-per-purchase/lead/registration. Level "adset" includes the audience targeting (age, gender, geo, platforms, custom/lookalike audiences). Level "ad" + include_creative returns the full creative: headline, body text, CTA, destination URL, media type, and dynamic-creative variants. Optional breakdown splits every entity by age, gender, publisher_platform, platform_position, device_platform, country, or region — with account-wide totals_by_segment. DRILL DOWN rather than stopping at campaigns: answer "which audience/ad/creative works" by calling level:"adset" or level:"ad" (parent_id scopes to one campaign or ad set), and demographic/placement questions with breakdown. Defaults: active entities, last 7 days, sorted by spend. NOTE: conversions here are Meta-attributed; get_metrics (fb_spend, registrations, purchases) stays canonical for historical funnel numbers. Main funnel only (native runs Taboola). Results cached ~5 min.',
+    description: 'LIVE Facebook Ads from the Meta Marketing API at EVERY level of the hierarchy: campaigns → ad sets → individual ads and their creatives. Per entity over any date range: impressions, reach, frequency, clicks, link clicks, CTR, CPC, CPM, spend, PLUS Meta-pixel conversions (purchases, leads, registrations, landing-page views, checkouts started, video thruplays) with cost-per-purchase/lead/registration. Level "adset" includes the audience targeting (age, gender, geo, platforms, custom/lookalike audiences). Level "ad" + include_creative returns the full creative: headline, body text, CTA, destination URL, media type, and dynamic-creative variants. Optional breakdown splits every entity by age, gender, publisher_platform, platform_position, device_platform, country, or region — with account-wide totals_by_segment. DRILL DOWN rather than stopping at campaigns: answer "which audience/ad/creative works" by calling level:"adset" or level:"ad" (parent_id scopes to one campaign or ad set), and demographic/placement questions with breakdown. Defaults: active entities, last 7 days, sorted by spend. NOTE: conversions here are Meta-attributed; get_metrics (fb_spend, registrations, purchases) stays canonical for historical funnel numbers. Available for funnels with a linked FB ad account. Results cached ~5 min.',
     input_schema: {
         type: 'object',
         properties: {
@@ -4877,7 +4901,7 @@ app.post('/api/insights/chat', dashboardLimiter, requireAuth, async (req, res) =
         }
 
         const funnel = req.funnel;
-        const brand = FUNNEL_BRANDS[funnel] || { brand: funnel, context: '', funnelName: funnel };
+        const brand = brandFor(funnel);
         const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
         const memory = await loadMemory(funnel, req.user.id);
         const memoryBlock = memory.length === 0
@@ -4926,17 +4950,9 @@ THE FUNNEL STAGES (in order):
 6. Viewed CTA — people who saw the call to action
 7. Clicked CTA — people who clicked the call to action
 8. Purchases — broken down by source:
-   - purchases_fb (FB Purchases) — from Facebook Paid Ads
-   - purchases_native (Native Ads) — from native ad placements
-   - purchases_youtube (Youtube) — from Youtube campaigns
-   - purchases_aibot (AI Chat Bot) — from AI chatbot interactions
-   - purchases_aibot_b (AI Chat Bot B) — second AI chatbot source (webhook source:"AI Bot B")
-   - purchases_postwebinar (Post Webinar) — Paid Ads / Sales A / Sales B purchases made 12+ hours AFTER attending a webinar (auto-detected; webhooks can also tag source:"Post Webinar" explicitly)
-   - purchases_cpa (CPA Traffic Funnel) — purchases attributed to the CPA Traffic source
-   - purchases_sales_a (Sales A) — purchases attributed to the Sales A source
-   - purchases_sales_b (Sales B) — purchases attributed to the Sales B source
-   - purchases_retargeting (Retargeting) — purchases attributed to the Retargeting source (webhook source:"Retargeting")
-   - purchases_promo (Promo) — purchases attributed to the Promo source (webhook source:"Promo")
+${purchaseSources(funnel).map(s => s.column_name === 'purchases_postwebinar'
+        ? `   - ${s.column_name} (${s.display_label}) — Paid Ads / Sales A / Sales B purchases made 12+ hours AFTER attending a webinar (auto-detected; webhooks can also tag source:"Post Webinar" explicitly)`
+        : `   - ${s.column_name} (${s.display_label}) — purchases attributed to webhook source:"${s.source_label}"`).join('\n')}
    - total_purchases — sum of all purchase sources above
 
 KEY METRICS:
@@ -4986,7 +5002,7 @@ INSTRUCTIONS:
   • \`describe_journey_data\` — live schema + every \`events.metadata\` key (with samples) + enum values. Call it FIRST when unsure what's queryable, so you never guess a column or metadata key.${AVATAR_ENABLED ? `
   • \`get_customer_avatar\` — the demographic CUSTOMER AVATAR (gender split, age stats + buckets, top cities/states) for any segment: event_type + dates, purchase_source, journey-stage criteria (reached_stages/not_reached_stages — e.g. attended but never bought), or an email list from any other tool. Add group_by_stage:true to ALSO see where the same people sit in the funnel (furthest stage, with a mini-avatar per stage) — one call answers "who are they AND how far did they get". Use for "who is my typical buyer", "average age of purchasers", "avatar of no-shows", source comparisons (one call per source). ALWAYS quote profiles_found vs segment_size — people without an intake profile are absent from the splits, so never project the percentages onto them. The per-email data is joinable in run_sql via the contact_demographics table.` : ''}
   • \`run_sql\` against \`crm_people\` / \`events.metadata\` for anything else (webinar-slot popularity, attribution, cohorts). The journey snapshot above already answers the most common ones — cite it directly when it suffices.
-${FB_ADS_ENABLED ? `- LIVE FACEBOOK ADS: \`get_fb_ads\` sees the WHOLE ads hierarchy, not just campaigns — ad sets (with their audience targeting: age/gender/geo/platforms/custom + lookalike audiences), individual ads, and full creatives (headline, body copy, CTA, destination URL) — each with delivery metrics AND Meta-pixel conversions (purchases/leads/registrations + cost-per). DIG DOWN by default: for any "what's working / what's not / why" question go past campaign level — call level:"adset" to compare audiences, level:"ad" with include_creative:true to compare the actual ads and quote their copy, parent_id to zoom into one campaign's children, and breakdown:"age"/"gender"/"publisher_platform"/"platform_position"/etc. for demographic and placement splits. A strong ads answer usually takes 2-3 calls at different levels (e.g. campaigns → the leader's ad sets → its best ads' creatives). Meta's conversion counts are Meta-attributed — for canonical spend/registrations/purchases keep using get_metrics; small gaps between the two are normal. Main funnel only.` : ''}
+${FB_ADS_ENABLED && fbAccountFor(funnel) ? `- LIVE FACEBOOK ADS: \`get_fb_ads\` sees the WHOLE ads hierarchy, not just campaigns — ad sets (with their audience targeting: age/gender/geo/platforms/custom + lookalike audiences), individual ads, and full creatives (headline, body copy, CTA, destination URL) — each with delivery metrics AND Meta-pixel conversions (purchases/leads/registrations + cost-per). DIG DOWN by default: for any "what's working / what's not / why" question go past campaign level — call level:"adset" to compare audiences, level:"ad" with include_creative:true to compare the actual ads and quote their copy, parent_id to zoom into one campaign's children, and breakdown:"age"/"gender"/"publisher_platform"/"platform_position"/etc. for demographic and placement splits. A strong ads answer usually takes 2-3 calls at different levels (e.g. campaigns → the leader's ad sets → its best ads' creatives). Meta's conversion counts are Meta-attributed — for canonical spend/registrations/purchases keep using get_metrics; small gaps between the two are normal.` : ''}
 - For statistical work (forecasts, regressions, anomaly detection, t-tests), use the code execution tool. The data you've fetched is available as variables.
 - Give specific, data-backed insights. Reference actual numbers and dates.
 - When the user shares context worth remembering across chats (promos, definitions, business changes), use the \`remember\` tool silently.
@@ -5189,9 +5205,9 @@ function parseWorkerDatetime(input) {
 const laDayISO = (d) => d.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
 // The daily_metrics column an event row counts toward (null = uncounted type).
-function dailyColumnForEvent(ev) {
+function dailyColumnForEvent(ev, sourceMap) {
     const t = ev.event_type;
-    if (t === 'purchases') return PURCHASE_DEDUP_MAP[ev.metadata?.source] || 'purchases_fb';
+    if (t === 'purchases') return sourceMap[ev.metadata?.source] || 'purchases_fb';
     if (t === 'stayeduntil') return STAYED_DEDUP_MAP[Number(ev.metadata?.stayeduntil)] || null;
     if (['registrations', 'attended', 'replays', 'viewedcta', 'clickedcta'].includes(t)) return t;
     return null;
@@ -5236,7 +5252,7 @@ async function workerAddSale(funnel, input, ctx) {
     const email = String(input.email || '').toLowerCase().trim();
     if (!email || !email.includes('@')) return { error: 'A valid buyer email is required.' };
     const source = input.source || 'Paid Ads';
-    if (!PURCHASE_DEDUP_MAP[source]) return { error: `Unknown source "${source}". Valid: ${Object.keys(PURCHASE_DEDUP_MAP).join(', ')}` };
+    if (!purchaseSourceMap(funnel)[source]) return { error: `Unknown source "${source}". Valid: ${Object.keys(purchaseSourceMap(funnel)).join(', ')}` };
     const when = parseWorkerDatetime(input.datetime);
     if (!when) return { error: `Could not parse datetime "${input.datetime}". Use "YYYY-MM-DD HH:mm" (Pacific) or an ISO string.` };
     if (when.getTime() > Date.now() + 5 * 60 * 1000) return { error: `That datetime is in the future (${when.toISOString()}).` };
@@ -5263,7 +5279,7 @@ async function workerAddSale(funnel, input, ctx) {
     // Post-webinar detection, same rule as the webhook: Paid Ads / Sales A/B
     // purchase 12h+ after the buyer's most recent webinar engagement.
     let resolvedSource = source;
-    let column = PURCHASE_DEDUP_MAP[source];
+    let column = purchaseSourceMap(funnel)[source];
     if (['Paid Ads', 'Sales A', 'Sales B'].includes(source)) {
         const { data: engaged } = await sb.from('events')
             .select('event_time, event_type')
@@ -5369,7 +5385,7 @@ async function workerDeleteEvent(funnel, input) {
     if (delErr) return { error: `Delete failed: ${delErr.message}` };
 
     const day = laDayISO(new Date(ev.event_time));
-    const tail = await workerAdjustDay(funnel, day, dailyColumnForEvent(ev), -1);
+    const tail = await workerAdjustDay(funnel, day, dailyColumnForEvent(ev, purchaseSourceMap(funnel)), -1);
     return {
         ok: true,
         deleted: { event_id: ev.id, event_type: ev.event_type, email: ev.email, name: ev.name, event_time: ev.event_time, metadata: ev.metadata },
@@ -5405,7 +5421,7 @@ async function workerUpdateEvent(funnel, input, ctx) {
     return { ok: true, event_id: id, before: { email: ev.email, name: ev.name, phone: ev.phone }, applied: patch, ...tail };
 }
 
-const WORKER_OVERRIDE_FIELDS = ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', 'purchases_fb', 'purchases_native', 'purchases_youtube', 'purchases_aibot', 'purchases_aibot_b', 'purchases_postwebinar', 'purchases_cpa', 'purchases_sales_a', 'purchases_sales_b', 'purchases_retargeting', 'purchases_promo', 'stayed_45', 'stayed_60', 'stayed_80'];
+const workerOverrideFields = (funnel) => ['fb_spend', 'fb_link_clicks', 'registrations', 'replays', 'viewedcta', 'clickedcta', 'purchases', 'attended', ...purchaseSubCols(funnel), 'stayed_45', 'stayed_60', 'stayed_80'];
 
 async function workerSetOverride(funnel, input) {
     const sb = clientFor(funnel);
@@ -5415,6 +5431,7 @@ async function workerSetOverride(funnel, input) {
     if (!input.values || typeof input.values !== 'object' || Array.isArray(input.values)) {
         return { error: 'Pass values: { field: number | null, ... }. null clears that field\'s override.' };
     }
+    const WORKER_OVERRIDE_FIELDS = workerOverrideFields(funnel);
     const bad = Object.keys(input.values).filter(f => !WORKER_OVERRIDE_FIELDS.includes(f));
     if (bad.length) return { error: `Not overridable: ${bad.join(', ')}. Valid: ${WORKER_OVERRIDE_FIELDS.join(', ')}` };
 
@@ -5515,7 +5532,7 @@ const WORKER_TOOLS = [
                 email:      { type: 'string', description: 'Buyer email (required)' },
                 name:       { type: 'string', description: 'Buyer name' },
                 phone:      { type: 'string', description: 'Buyer phone' },
-                source:     { type: 'string', enum: Object.keys(PURCHASE_DEDUP_MAP), description: 'Purchase source. GHL "AI CHAT BOT" pipeline = "AI Bot". Default: Paid Ads.' },
+                source:     { type: 'string', description: 'Purchase source label exactly as configured for this funnel (the system prompt lists them). GHL "AI CHAT BOT" pipeline = "AI Bot". Default: Paid Ads. Invalid values are rejected with the valid list.' },
                 datetime:   { type: 'string', description: 'When the sale happened. "YYYY-MM-DD HH:mm" is read as PACIFIC time; ISO with zone is trusted; omit for now.' },
                 skip_dedup: { type: 'boolean', description: 'Set true ONLY after the user confirms a genuine second same-day sale for this email.' },
             },
@@ -5571,7 +5588,7 @@ const WORKER_TOOLS = [
             type: 'object',
             properties: {
                 date:   { type: 'string', description: 'YYYY-MM-DD' },
-                values: { type: 'object', description: `{ field: number } to set, { field: null } to clear. Fields: ${WORKER_OVERRIDE_FIELDS.join(', ')}` },
+                values: { type: 'object', description: '{ field: number } to set, { field: null } to clear. Valid fields: the daily_metrics counter columns (the system prompt lists purchase sources); invalid fields are rejected with the valid list.' },
             },
             required: ['date', 'values'],
         },
@@ -5696,7 +5713,7 @@ app.post('/api/worker/chat', dashboardLimiter, requireAuth, requireAdmin, async 
         }
 
         const funnel = req.funnel;
-        const brand = FUNNEL_BRANDS[funnel] || { brand: funnel, context: '', funnelName: funnel };
+        const brand = brandFor(funnel);
         const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
         const memory = await loadMemory(funnel, req.user.id);
         const memoryBlock = memory.length === 0
@@ -5717,7 +5734,7 @@ TODAY'S DATE: ${today} (Los Angeles timezone)
 HOW THE DATA WORKS (respect this model or numbers WILL drift):
 - \`events\` is the source of truth — one row per funnel action (event_type, email, event_time in UTC, metadata jsonb). \`daily_metrics\` holds denormalized per-day counters, one column per stage / purchase source. The dashboard prefers DEDUPLICATED event counts for recent days; past days are frozen ("finalized") into canonical columns.
 - Therefore a day's numbers = its events. add_sale / add_event / delete_event handle the FULL flow for you: event row + the right daily column for the sale's LA calendar day + re-finalize if the day was frozen + cache invalidation. NEVER manipulate events via run_sql_write when a dedicated tool fits.
-- Purchase sources → columns: Paid Ads→purchases_fb, Native→purchases_native, Youtube→purchases_youtube, AI Bot→purchases_aibot, AI Bot B→purchases_aibot_b, CPA Traffic→purchases_cpa, Sales A→purchases_sales_a, Sales B→purchases_sales_b, Retargeting→purchases_retargeting, Promo→purchases_promo, Post Webinar→purchases_postwebinar. The GHL "AI CHAT BOT" pipeline corresponds to source "AI Bot". add_sale auto-detects Post Webinar (Paid Ads / Sales A / Sales B sale 12h+ after the buyer's last webinar engagement).
+- Purchase sources → columns: ${purchaseSources(funnel).map(s => `${s.source_label}→${s.column_name}`).join(', ')}. The GHL "AI CHAT BOT" pipeline corresponds to source "AI Bot". add_sale auto-detects Post Webinar (Paid Ads / Sales A / Sales B sale 12h+ after the buyer's last webinar engagement).
 - One purchase per email per LA day is the dedup rule. add_sale reports duplicates instead of double-recording; use skip_dedup only after the user confirms a genuine second sale.
 - Cosmetic corrections to a day's DISPLAYED numbers ("show 5 registrations for Jul 3") go through set_metric_override — overrides sit on top and never touch raw data. A MISSED real sale/event goes through add_sale/add_event so the person actually exists in the data.
 
@@ -7122,7 +7139,7 @@ const server = app.listen(PORT, () => {
 
 async function warmCaches() {
     const base = `http://127.0.0.1:${PORT}`;
-    for (const funnel of ALLOWED_FUNNELS) {
+    for (const funnel of allowedFunnels()) {
         for (const qs of ['limit=90&offset=0', 'limit=90&offset=0&expand=variants']) {
             try {
                 const r = await fetch(`${base}/api/metrics?${qs}`, { headers: { 'x-funnel': funnel } });
@@ -7130,7 +7147,7 @@ async function warmCaches() {
             } catch (e) { /* best-effort: a failed warm just means the first user request pays the cost */ }
         }
     }
-    console.log('🔥 Cache warm complete (metrics primed for', ALLOWED_FUNNELS.join(', '), ')');
+    console.log('🔥 Cache warm complete (metrics primed for', allowedFunnels().join(', '), ')');
 }
 
 // ─── Graceful Shutdown ───────────────────────────────────────────────────────
