@@ -15,12 +15,20 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const FB_API_VERSION = process.env.FB_API_VERSION || 'v23.0';
 
-// Pinned to the analytics funnel (schema 'public'). The native funnel uses
-// Taboola, not Facebook, so this sync is intentionally analytics-only.
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-    db: { schema: 'public' },
-    realtime: { transport: ws },
-});
+// Multi-funnel: each funnel can carry its own FB ad account (public.funnels
+// registry); writes go to that funnel's schema. Default remains analytics/public.
+const _clients = new Map();
+function clientForSchema(schema = 'public') {
+    if (!/^[a-z][a-z0-9_]{0,30}$/.test(schema)) throw new Error(`Bad schema: ${schema}`);
+    if (!_clients.has(schema)) {
+        _clients.set(schema, createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+            db: { schema },
+            realtime: { transport: ws },
+        }));
+    }
+    return _clients.get(schema);
+}
+const supabase = clientForSchema('public');
 
 // ─── Get today's date in LA timezone ─────────────────────────────────────────
 function getTodayLA() {
@@ -42,8 +50,8 @@ function getDayOfWeek(isoDate) {
 }
 
 // ─── Fetch insights from Facebook Graph API ─────────────────────────────────
-async function fetchFacebookInsights(dateISO) {
-    const url = new URL(`https://graph.facebook.com/${FB_API_VERSION}/${FB_AD_ACCOUNT_ID}/insights`);
+async function fetchFacebookInsights(dateISO, adAccountId = FB_AD_ACCOUNT_ID) {
+    const url = new URL(`https://graph.facebook.com/${FB_API_VERSION}/${adAccountId}/insights`);
     url.searchParams.set('access_token', FB_ACCESS_TOKEN);
     url.searchParams.set('fields', 'spend,inline_link_clicks');
     url.searchParams.set('time_range', JSON.stringify({
@@ -80,11 +88,12 @@ async function fetchFacebookSpend(dateISO) {
 }
 
 // ─── Write insights to Supabase ──────────────────────────────────────────────
-async function writeInsightsToSupabase(isoDate, { spend, linkClicks }) {
+async function writeInsightsToSupabase(isoDate, { spend, linkClicks }, schema = 'public') {
     const dayOfWeek = getDayOfWeek(isoDate);
 
+    const sb = clientForSchema(schema);
     // Ensure row exists for today
-    await supabase
+    await sb
         .from('daily_metrics')
         .upsert({ date: isoDate, day_of_week: dayOfWeek }, { onConflict: 'date' });
 
@@ -92,7 +101,7 @@ async function writeInsightsToSupabase(isoDate, { spend, linkClicks }) {
     const updateFields = { fb_spend: spend };
     if (linkClicks !== undefined) updateFields.fb_link_clicks = linkClicks;
 
-    const { data, error } = await supabase
+    const { data, error } = await sb
         .from('daily_metrics')
         .update(updateFields)
         .eq('date', isoDate)
@@ -110,19 +119,19 @@ async function writeSpendToSupabase(isoDate, spend) {
 
 // ─── Main sync function ──────────────────────────────────────────────────────
 export { fetchFacebookSpend, fetchFacebookInsights, writeSpendToSupabase, writeInsightsToSupabase };
-export async function syncFacebookSpend() {
-    if (!FB_ACCESS_TOKEN || !FB_AD_ACCOUNT_ID) {
-        console.warn('⚠️  FB sync skipped — FB_ACCESS_TOKEN or FB_AD_ACCOUNT_ID not set');
+export async function syncFacebookSpend(adAccountId = FB_AD_ACCOUNT_ID, schema = 'public', label = 'analytics') {
+    if (!FB_ACCESS_TOKEN || !adAccountId) {
+        console.warn('⚠️  FB sync skipped — FB_ACCESS_TOKEN or ad account not set');
         return null;
     }
 
     const { iso, display } = getTodayLA();
 
     try {
-        const insights = await fetchFacebookInsights(iso);
-        const result = await writeInsightsToSupabase(iso, insights);
+        const insights = await fetchFacebookInsights(iso, adAccountId);
+        const result = await writeInsightsToSupabase(iso, insights, schema);
 
-        console.log(`✅ FB sync: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks for ${display} (${getDayOfWeek(iso)})`);
+        console.log(`✅ FB sync [${label}]: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks for ${display} (${getDayOfWeek(iso)})`);
         return { date: display, spend: insights.spend, linkClicks: insights.linkClicks, result };
 
     } catch (err) {
@@ -130,7 +139,7 @@ export async function syncFacebookSpend() {
 
         // Log the failure to webhook_log for visibility in the dashboard
         try {
-            await supabase.from('webhook_log').insert({
+            await clientForSchema(schema).from('webhook_log').insert({
                 source: 'fb-sync',
                 payload: { date: iso, error: err.message },
                 status: 'error',

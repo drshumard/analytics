@@ -1245,11 +1245,13 @@ app.post('/api/refresh', dashboardLimiter, async (req, res) => {
     }
 
     try {
-        // FB sync writes to the analytics schema only (Taboola for native is future work)
-        const result = await syncFacebookSpend();
+        const funnel = resolveFunnel(req);
+        const acct = fbAccountFor(funnel);
+        if (!acct) return res.status(400).json({ error: `The ${funnel} funnel has no Facebook ad account linked` });
+        const result = await syncFacebookSpend(acct, funnelConfig.funnels.get(funnel).schema_name, funnel);
         refreshTimestamps.push(now);
-        invalidateMetricsCache('analytics');
-        invalidateInsightsCache('analytics');
+        invalidateMetricsCache(funnel);
+        invalidateInsightsCache(funnel);
 
         const remaining = 3 - refreshTimestamps.length;
         return res.json({
@@ -1273,11 +1275,14 @@ app.post('/api/refresh-date', dashboardLimiter, async (req, res) => {
     }
 
     try {
+        const funnel = resolveFunnel(req);
+        const acct = fbAccountFor(funnel);
+        if (!acct) return res.status(400).json({ error: `The ${funnel} funnel has no Facebook ad account linked` });
         const { fetchFacebookInsights, writeInsightsToSupabase } = await import('./fb-sync.js');
-        const insights = await fetchFacebookInsights(date);
-        await writeInsightsToSupabase(date, insights);
-        invalidateMetricsCache('analytics');
-        invalidateInsightsCache('analytics');
+        const insights = await fetchFacebookInsights(date, acct);
+        await writeInsightsToSupabase(date, insights, funnelConfig.funnels.get(funnel).schema_name);
+        invalidateMetricsCache(funnel);
+        invalidateInsightsCache(funnel);
 
         console.log(`✅ Recalc for ${date}: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks`);
         return res.json({ message: `Insights for ${date} updated — $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks`, spend: insights.spend, linkClicks: insights.linkClicks });
@@ -2510,6 +2515,169 @@ app.post('/api/admin/reset-link', dashboardLimiter, requireAuth, requireAdmin, a
     }
 });
 
+// ─── Admin: funnel + purchase-column provisioning ────────────────────────────
+// Creates a complete funnel schema from db/funnel_template.sql (statement-per-
+// call through the ai_run_sql_write RPC), adds the chosen purchase columns,
+// registers the funnel, exposes the schema to PostgREST, grants the creator
+// admin, and mints a webhook API key. Column additions to existing funnels
+// reuse the same machinery.
+
+const SCHEMA_NAME_RE = /^[a-z][a-z0-9_]{1,20}$/;
+const RESERVED_SCHEMAS = new Set(['public', 'native', 'auth', 'storage', 'extensions', 'graphql', 'graphql_public', 'realtime', 'vault', 'pgbouncer', 'supabase_functions', 'net', 'pgsodium', 'pg_catalog', 'information_schema']);
+
+async function runProvisionSQL(stmt) {
+    const { data, error } = await supabasePublic.rpc('ai_run_sql_write', { query: stmt });
+    if (error) throw new Error(error.message);
+    if (data && data.error) throw new Error(`${data.error} — in: ${stmt.replace(/\s+/g, ' ').slice(0, 90)}…`);
+    return data;
+}
+
+const slugifyColumn = (label) => ('purchases_' + String(label).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')).slice(0, 34);
+const sqlLit = (s) => `'${String(s).replace(/'/g, "''")}'`;
+
+async function validateFbAccount(accountId) {
+    if (!process.env.FB_ACCESS_TOKEN) return { ok: false, error: 'FB_ACCESS_TOKEN not configured on the server' };
+    const id = String(accountId).trim();
+    if (!/^act_\d{5,20}$/.test(id)) return { ok: false, error: 'Ad account id must look like act_1234567890' };
+    try {
+        const r = await fetch(`https://graph.facebook.com/${process.env.FB_API_VERSION || 'v23.0'}/${id}?fields=name,account_status&access_token=${process.env.FB_ACCESS_TOKEN}`);
+        const j = await r.json().catch(() => ({}));
+        if (j.error) return { ok: false, error: `Meta: ${j.error.message}` };
+        return { ok: true, id, name: j.name, status: j.account_status };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+}
+
+// GET /api/admin/fb-account?id=act_X — validate an ad account against the
+// system-user token and return its name (used live in the New Funnel modal).
+app.get('/api/admin/fb-account', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    res.json(await validateFbAccount(req.query.id || ''));
+});
+
+// POST /api/admin/funnels — provision a complete new funnel.
+// Body: { key, label, fb_ad_account_id?, sources: [{ source_label, display_label? }] }
+app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    const { key: rawKey, label, fb_ad_account_id, sources: rawSources } = req.body || {};
+    const key = String(rawKey || '').trim().toLowerCase();
+    try {
+        await refreshFunnelConfig(true);
+        if (!SCHEMA_NAME_RE.test(key)) return res.status(400).json({ error: 'Funnel key must be 2-21 chars: lowercase letters, digits, underscores, starting with a letter' });
+        if (RESERVED_SCHEMAS.has(key) || funnelExists(key)) return res.status(400).json({ error: `Funnel key "${key}" is taken or reserved` });
+        if (!label || !String(label).trim()) return res.status(400).json({ error: 'A display label is required' });
+        const sourcesIn = Array.isArray(rawSources) ? rawSources : [];
+        if (sourcesIn.length === 0) return res.status(400).json({ error: 'Pick at least one purchase source' });
+        const seen = new Set();
+        const sources = [];
+        for (const s of sourcesIn) {
+            const srcLabel = String(s.source_label || '').trim();
+            if (!srcLabel || srcLabel.length > 40) return res.status(400).json({ error: `Bad source label: "${srcLabel}"` });
+            const known = purchaseSources('analytics').find(m => m.source_label === srcLabel);
+            const column = known ? known.column_name : slugifyColumn(srcLabel);
+            if (!/^purchases_[a-z0-9_]{1,24}$/.test(column)) return res.status(400).json({ error: `Cannot derive a column name from "${srcLabel}"` });
+            if (seen.has(column)) continue;
+            seen.add(column);
+            sources.push({ column_name: column, source_label: srcLabel, display_label: String(s.display_label || '').trim() || (known ? known.display_label : srcLabel) });
+        }
+
+        let fb = null;
+        if (fb_ad_account_id) {
+            fb = await validateFbAccount(fb_ad_account_id);
+            if (!fb.ok) return res.status(400).json({ error: `Facebook ad account rejected: ${fb.error}` });
+        }
+
+        // Schema must not pre-exist (a half-provisioned schema from a failed run
+        // is cleaned up below, so a retry starts fresh).
+        const { data: existing } = await supabasePublic.rpc('ai_run_sql', { query: `SELECT 1 AS x FROM information_schema.schemata WHERE schema_name = ${sqlLit(key)}` });
+        if (Array.isArray(existing) && existing.length) return res.status(400).json({ error: `Schema "${key}" already exists in the database` });
+
+        const template = readFileSync(path.join(__dirname, 'db', 'funnel_template.sql'), 'utf8');
+        const statements = template.split(/^-- @statement$/m).map(s => s.replace(/^--.*$/gm, '').trim()).filter(Boolean)
+            .map(s => s.replaceAll('{{schema}}', key));
+
+        console.log(`🏗️  Provisioning funnel "${key}" (${statements.length} statements) by ${req.user.email}`);
+        try {
+            for (const stmt of statements) await runProvisionSQL(stmt);
+            // Purchase columns + source config per selection
+            for (let i = 0; i < sources.length; i++) {
+                const s = sources[i];
+                await runProvisionSQL(`ALTER TABLE ${key}.daily_metrics ADD COLUMN IF NOT EXISTS ${s.column_name} INTEGER NOT NULL DEFAULT 0`);
+                await runProvisionSQL(`INSERT INTO ${key}.purchase_sources (column_name, source_label, display_label, sort_order) VALUES (${sqlLit(s.column_name)}, ${sqlLit(s.source_label)}, ${sqlLit(s.display_label)}, ${(i + 1) * 10}) ON CONFLICT (column_name) DO NOTHING`);
+            }
+            // Default lens with the chosen columns
+            const lensMetrics = ['fb_spend', 'fb_link_clicks', 'registrations', 'attended', 'replays', 'viewedcta', 'clickedcta', ...sources.map(s => s.column_name), 'total_purchases'];
+            await runProvisionSQL(`INSERT INTO ${key}.dashboard_lenses (id, name, metrics, sort_order) VALUES ('default-all', 'All Metrics', ${sqlLit(JSON.stringify(lensMetrics))}::jsonb, 0)`);
+            // Registry row + creator access/admin
+            await runProvisionSQL(`INSERT INTO public.funnels (key, schema_name, label, fb_ad_account_id, created_by) VALUES (${sqlLit(key)}, ${sqlLit(key)}, ${sqlLit(String(label).trim())}, ${fb ? sqlLit(fb.id) : 'NULL'}, ${sqlLit(req.user.id)})`);
+            await runProvisionSQL(`INSERT INTO public.user_funnel_access (user_id, funnel) VALUES (${sqlLit(req.user.id)}, ${sqlLit(key)}) ON CONFLICT DO NOTHING`);
+            await runProvisionSQL(`INSERT INTO ${key}.user_roles (user_id, role) VALUES (${sqlLit(req.user.id)}, 'admin') ON CONFLICT (user_id) DO UPDATE SET role = 'admin'`);
+        } catch (provisionErr) {
+            console.error(`❌ Provisioning "${key}" failed, cleaning up:`, provisionErr.message);
+            try {
+                await runProvisionSQL(`DROP SCHEMA IF EXISTS ${key} CASCADE`);
+                await runProvisionSQL(`DELETE FROM public.user_funnel_access WHERE funnel = ${sqlLit(key)}`);
+                await runProvisionSQL(`DELETE FROM public.funnels WHERE key = ${sqlLit(key)}`);
+            } catch (cleanupErr) {
+                console.error('⚠️ Cleanup after failed provisioning also failed:', cleanupErr.message);
+            }
+            throw provisionErr;
+        }
+
+        // Webhook API key (shown once)
+        const plaintextKey = `wh_${key}_${crypto.randomBytes(24).toString('hex')}`;
+        const keyHash = crypto.createHash('sha256').update(plaintextKey).digest('hex');
+        await supabasePublic.from('api_keys').insert({ key_hash: keyHash, label: `${key} webhooks (provisioned)`, funnel: key, is_active: true });
+
+        await refreshFunnelConfig(true);
+        console.log(`✅ Funnel "${key}" provisioned (${sources.length} sources${fb ? `, FB ${fb.id}` : ''})`);
+        return res.json({
+            ok: true,
+            funnel: key,
+            label: String(label).trim(),
+            fb_ad_account: fb ? { id: fb.id, name: fb.name } : null,
+            columns: sources,
+            webhook_api_key: plaintextKey,
+            note: 'Save the webhook API key now — it is shown only once. Send events with X-API-Key and this funnel is written automatically.',
+        });
+    } catch (err) {
+        console.error('❌ POST /api/admin/funnels error:', err.message);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/admin/purchase-sources — add a purchase column to the CURRENT funnel.
+// Body: { source_label, display_label? }
+app.post('/api/admin/purchase-sources', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const funnel = req.funnel;
+        const schema = funnelConfig.funnels.get(funnel)?.schema_name;
+        if (!schema) return res.status(400).json({ error: `Unknown funnel ${funnel}` });
+        const srcLabel = String(req.body?.source_label || '').trim();
+        const dispLabel = String(req.body?.display_label || '').trim() || srcLabel;
+        if (!srcLabel || srcLabel.length > 40) return res.status(400).json({ error: 'source_label is required (max 40 chars)' });
+        const column = slugifyColumn(srcLabel);
+        if (!/^purchases_[a-z0-9_]{1,24}$/.test(column)) return res.status(400).json({ error: `Cannot derive a column name from "${srcLabel}"` });
+        await refreshFunnelConfig(true);
+        const existing = purchaseSources(funnel);
+        if (existing.some(s => s.column_name === column || s.source_label === srcLabel)) {
+            return res.status(400).json({ error: `Source "${srcLabel}" (${column}) already exists on this funnel` });
+        }
+        const nextSort = Math.max(0, ...existing.map(s => s.sort_order || 0)) + 10;
+        await runProvisionSQL(`ALTER TABLE ${schema}.daily_metrics ADD COLUMN IF NOT EXISTS ${column} INTEGER NOT NULL DEFAULT 0`);
+        await runProvisionSQL(`INSERT INTO ${schema}.purchase_sources (column_name, source_label, display_label, sort_order) VALUES (${sqlLit(column)}, ${sqlLit(srcLabel)}, ${sqlLit(dispLabel)}, ${nextSort})`);
+        // Surface it on the default lens, keeping total_purchases last
+        await runProvisionSQL(`UPDATE ${schema}.dashboard_lenses SET metrics = (metrics - 'total_purchases') || ${sqlLit(JSON.stringify([column, 'total_purchases']))}::jsonb WHERE id = 'default-all' AND NOT metrics ? ${sqlLit(column)}`);
+        await runProvisionSQL(`NOTIFY pgrst, 'reload schema'`);
+        await refreshFunnelConfig(true);
+        invalidateMetricsCache(funnel);
+        console.log(`✅ Purchase source "${srcLabel}" → ${schema}.${column} added by ${req.user.email}`);
+        return res.json({ ok: true, funnel, column_name: column, source_label: srcLabel, display_label: dispLabel, note: `Webhooks can now send source:"${srcLabel}" on purchases.` });
+    } catch (err) {
+        console.error('❌ POST /api/admin/purchase-sources error:', err.message);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
 // POST /api/admin/finalize-past-days — One-shot backfill.
 // Walks every daily_metrics row with date < today and finalized_at IS NULL,
 // runs finalizeDailyMetricsForDate on each, and reports the result. Safe to
@@ -2680,15 +2848,18 @@ app.get('/api/health', async (req, res) => {
 
 // Cron: at minute 0 and 30 of every hour, in LA timezone
 // This pulls today's cumulative spend from Facebook and writes it to Supabase
-if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
+if (process.env.FB_ACCESS_TOKEN) {
     cron.schedule('0,30 * * * *', async () => {
-        console.log('🔄 FB sync cron triggered (analytics funnel only)');
-        try {
-            await syncFacebookSpend();
-            invalidateMetricsCache('analytics');
-            invalidateInsightsCache('analytics');
-        } catch (err) {
-            console.error('❌ FB sync cron failed:', err.message);
+        const targets = allowedFunnels().filter(f => fbAccountFor(f));
+        console.log(`🔄 FB sync cron triggered (${targets.join(', ') || 'no funnels with FB accounts'})`);
+        for (const funnel of targets) {
+            try {
+                await syncFacebookSpend(fbAccountFor(funnel), funnelConfig.funnels.get(funnel).schema_name, funnel);
+                invalidateMetricsCache(funnel);
+                invalidateInsightsCache(funnel);
+            } catch (err) {
+                console.error(`❌ FB sync cron failed [${funnel}]:`, err.message);
+            }
         }
     }, { timezone: 'America/Los_Angeles' });
 
@@ -2703,22 +2874,26 @@ if (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) {
     // Cron: daily at 4:00 AM PST — fetch *yesterday's* final ad spend
     // By 4 AM the previous day's data is fully settled in Facebook's reporting
     cron.schedule('0 4 * * *', async () => {
-        try {
-            const yesterdayISO = computeYesterdayLA();
-            console.log(`🌙 Daily 4 AM cron: fetching final ad insights for ${yesterdayISO} (analytics)`);
-            const insights = await fetchFacebookInsights(yesterdayISO);
-            await writeInsightsToSupabase(yesterdayISO, insights);
-            invalidateMetricsCache('analytics');
-            invalidateInsightsCache('analytics');
-            console.log(`✅ Daily 4 AM cron: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks written for ${yesterdayISO}`);
-        } catch (err) {
-            console.error('❌ Daily 4 AM ad-spend cron failed:', err.message);
+        const yesterdayISO = computeYesterdayLA();
+        for (const funnel of allowedFunnels()) {
+            const acct = fbAccountFor(funnel);
+            if (!acct) continue;
+            try {
+                console.log(`🌙 Daily 4 AM cron: fetching final ad insights for ${yesterdayISO} (${funnel})`);
+                const insights = await fetchFacebookInsights(yesterdayISO, acct);
+                await writeInsightsToSupabase(yesterdayISO, insights, funnelConfig.funnels.get(funnel).schema_name);
+                invalidateMetricsCache(funnel);
+                invalidateInsightsCache(funnel);
+                console.log(`✅ Daily 4 AM cron [${funnel}]: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks written for ${yesterdayISO}`);
+            } catch (err) {
+                console.error(`❌ Daily 4 AM ad-spend cron failed [${funnel}]:`, err.message);
+            }
         }
     }, { timezone: 'America/Los_Angeles' });
 
-    console.log('📡 Facebook ad spend sync enabled (every 30 min + daily 4 AM previous-day)');
+    console.log('📡 Facebook ad spend sync enabled (every 30 min + daily 4 AM previous-day, per funnel with a linked FB account)');
 } else {
-    console.log('⚠️  Facebook sync disabled — set FB_ACCESS_TOKEN and FB_AD_ACCOUNT_ID to enable');
+    console.log('⚠️  Facebook sync disabled — set FB_ACCESS_TOKEN to enable');
 }
 
 // Helper: yesterday in LA as YYYY-MM-DD (used by finalize cron below; also
@@ -2750,12 +2925,13 @@ cron.schedule('5 4 * * *', async () => {
 // not used by the native funnel; Taboola integration is future work)
 app.post('/api/fb-sync', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
-        const result = await syncFacebookSpend();
+        const acct = fbAccountFor(req.funnel);
+        const result = acct ? await syncFacebookSpend(acct, funnelConfig.funnels.get(req.funnel).schema_name, req.funnel) : null;
         if (!result) {
-            return res.status(400).json({ error: 'FB sync not configured — check FB_ACCESS_TOKEN and FB_AD_ACCOUNT_ID' });
+            return res.status(400).json({ error: `FB sync not available — check FB_ACCESS_TOKEN and the ${req.funnel} funnel's linked ad account` });
         }
-        invalidateMetricsCache('analytics');
-        invalidateInsightsCache('analytics');
+        invalidateMetricsCache(req.funnel);
+        invalidateInsightsCache(req.funnel);
         res.json({ success: true, ...result });
     } catch (err) {
         res.status(500).json({ error: 'FB sync failed', detail: err.message });
@@ -2765,7 +2941,8 @@ app.post('/api/fb-sync', webhookLimiter, authenticateWebhook, async (req, res) =
 // GET /api/fb-sync/status — check if sync is configured and last run.
 // FB sync is analytics-only so we read from the analytics webhook_log.
 app.get('/api/fb-sync/status', dashboardLimiter, async (req, res) => {
-    const configured = !!(process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID);
+    const funnel = resolveFunnel(req);
+    const configured = !!(process.env.FB_ACCESS_TOKEN && fbAccountFor(funnel));
 
     let lastSync = null;
     if (configured) {
@@ -2780,7 +2957,7 @@ app.get('/api/fb-sync/status', dashboardLimiter, async (req, res) => {
 
     res.json({
         configured,
-        account_id: configured ? process.env.FB_AD_ACCOUNT_ID : null,
+        account_id: configured ? fbAccountFor(funnel) : null,
         schedule: 'Every 30 minutes',
         timezone: 'America/Los_Angeles',
         last_sync: lastSync,
@@ -7112,7 +7289,7 @@ app.use((err, req, res, next) => {
 // =============================================================================
 
 const server = app.listen(PORT, () => {
-    const fbStatus = (process.env.FB_ACCESS_TOKEN && process.env.FB_AD_ACCOUNT_ID) ? '✅ Active (every 30 min)' : '⚠️  Not configured';
+    const fbStatus = process.env.FB_ACCESS_TOKEN ? '✅ Active (every 30 min, per-funnel accounts)' : '⚠️  Not configured';
     console.log(`
 ╔══════════════════════════════════════════════════╗
 ║   Dr Shumard Analytics — Production Server       ║
