@@ -1,5 +1,9 @@
 # Dr Shumard Analytics
 
+> **Canonical documentation lives in [`PRODUCT.md`](PRODUCT.md)** — full architecture,
+> data model, features, admin tools, and operational rules (kept current).
+> This README is a short intro and predates the registry-driven multi-funnel era.
+
 Production analytics **and CRM** for a Facebook‑ads webinar funnel. It combines:
 
 - a **daily metrics dashboard** (FB spend + funnel counts, custom metrics, split‑test variants),
