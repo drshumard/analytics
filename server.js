@@ -2554,8 +2554,7 @@ app.post('/api/admin/reset-link', dashboardLimiter, requireAuth, requireAdmin, a
 // Access = row in public.user_funnel_access (shows the funnel in the user's
 // workspace switcher); role = row in <schema>.user_roles (viewer by default,
 // admin unlocks editing/worker). Invite creates the auth user, emails them a
-// set-password link (Supabase invite / recovery email), grants access, and also
-// returns the link as a fallback to hand over if the email doesn't arrive.
+// Supabase invite link (create-password screen), and grants access.
 
 async function listAuthUsers() {
     const users = [];
@@ -2630,10 +2629,12 @@ app.post('/api/admin/funnel-users', dashboardLimiter, requireAuth, requireAdmin,
 });
 
 // POST /api/admin/invite-user — invite by email. New address: Supabase creates
-// the auth user and emails them an invite link (opens the in-app set-password
-// screen). Existing address: emails a password-reset link instead (same screen).
-// Either way access to req.funnel is granted, and a fallback set-password link is
-// returned for the admin to hand over if the email doesn't arrive.
+// the auth user and emails them an invite link (opens the in-app create-password
+// screen). Pending invitee (never accepted): the invite email is re-sent. Existing
+// confirmed account: access is granted, no email (they sign in as usual). Access to
+// req.funnel is granted in every case. A fallback set-password link is returned
+// ONLY if the invite email could not be sent — minting one otherwise would
+// invalidate the token in the email.
 // Body: { email, role?: 'viewer'|'admin' }
 app.post('/api/admin/invite-user', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
     try {
@@ -2652,15 +2653,13 @@ app.post('/api/admin/invite-user', dashboardLimiter, requireAuth, requireAdmin, 
         if (!invErr && inv?.user?.id) {
             userId = inv.user.id;
             emailSent = true;
-        } else if (/already.*(registered|exists|invited)/i.test(invErr?.message || '')) {
+        } else if (/already.*(registered|exists)/i.test(invErr?.message || '')) {
             existed = true;
             userId = (await listAuthUsers()).find(u => u.email?.toLowerCase() === email)?.id || null;
-            if (userId) {
-                const { error: rcErr } = await supabasePublic.auth.resetPasswordForEmail(email, { redirectTo });
-                if (rcErr) emailError = rcErr.message; else emailSent = true;
-            }
         } else {
-            emailError = invErr?.message || 'Could not create the user';
+            emailError = invErr?.message || 'Could not send the invite';
+            // GoTrue may have created the user before the send failed — find them so access is still granted.
+            userId = (await listAuthUsers()).find(u => u.email?.toLowerCase() === email)?.id || null;
         }
         if (!userId) return res.status(502).json({ error: emailError || 'Could not create the user' });
 
@@ -2671,13 +2670,17 @@ app.post('/api/admin/invite-user', dashboardLimiter, requireAuth, requireAdmin, 
             .upsert({ user_id: userId, role }, { onConflict: 'user_id' });
         if (rErr) throw rErr;
 
-        const lr = await fetch(`${SUPABASE_URL}/auth/v1/admin/generate_link`, {
-            method: 'POST',
-            headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type: 'recovery', email }),
-        });
-        const lb = await lr.json().catch(() => ({}));
-        console.log(`👥 Invite [${funnel}]: ${req.user.email} invited ${email} (${role}${existed ? ', existing user' : ''}, email ${emailSent ? 'sent' : 'NOT sent: ' + emailError})`);
+        let link = null;
+        if (!existed && !emailSent) {
+            const lr = await fetch(`${SUPABASE_URL}/auth/v1/admin/generate_link`, {
+                method: 'POST',
+                headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type: 'recovery', email }),
+            });
+            const lb = await lr.json().catch(() => ({}));
+            link = lb.action_link || null;
+        }
+        console.log(`👥 Invite [${funnel}]: ${req.user.email} invited ${email} (${role}${existed ? ', existing account' : emailSent ? ', invite email sent' : ', email NOT sent: ' + emailError})`);
         res.json({
             ok: true,
             email,
@@ -2686,12 +2689,12 @@ app.post('/api/admin/invite-user', dashboardLimiter, requireAuth, requireAdmin, 
             role,
             email_sent: emailSent,
             email_error: emailError,
-            link: lb.action_link || null,
-            note: emailSent
-                ? (existed
-                    ? 'Already had a dashboard account — access granted and a password-reset email sent. If it doesn\'t arrive, hand them the link below.'
-                    : 'Invite email sent — it opens the create-your-password screen. If it doesn\'t arrive (some mail filters junk it), hand them the link below.')
-                : `Access granted but the email could not be sent (${emailError || 'unknown error'}). Hand them the link below instead.`,
+            link,
+            note: existed
+                ? 'Already has a dashboard account — access granted, no email sent. They sign in with their usual password (or “Forgot password?” on the login page).'
+                : emailSent
+                    ? 'Invite email sent — it opens the create-your-password screen. Didn’t arrive? Click “Send invite” again to re-send it.'
+                    : `Access granted but the invite email could not be sent (${emailError || 'unknown error'}). Hand them the link below instead.`,
         });
     } catch (err) {
         console.error('❌ POST /api/admin/invite-user error:', err.message);

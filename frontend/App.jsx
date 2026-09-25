@@ -3079,7 +3079,7 @@ function FunnelAccessModal({ funnel, onCancel }) {
         <div style={{ fontSize: 12, color: "var(--ds-gray-600)", marginBottom: 8 }}>They get an email with a link to create their password and sign in.</div>
         {invResult && (
           <div style={{ background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>
-            <div style={{ fontSize: 13, color: "#166534", marginBottom: 6 }}>{invResult.email} added as {invResult.role}. {invResult.note}</div>
+            <div style={{ fontSize: 13, color: "#166534", marginBottom: invResult.link ? 6 : 0 }}>{invResult.email} added as {invResult.role}. {invResult.note}</div>
             {invResult.link && <>
               <div style={{ fontSize: 11, fontFamily: "monospace", wordBreak: "break-all", userSelect: "all", marginBottom: 8 }}>{invResult.link}</div>
               <button type="button" onClick={copyLink} style={{ ...S.btnDark, padding: "6px 12px", fontSize: 12 }}>{copied ? "Copied ✓" : "Copy set-password link"}</button>
