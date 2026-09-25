@@ -189,7 +189,10 @@ UTC** — shift accordingly).
     hand over directly — no email needed.
 - **Funnel access UI** (account menu → *Funnel access*, admin): per-funnel user
   list with access checkbox + viewer/admin role; **invite by email** creates the
-  auth user, grants access, returns a set-password link. Self-lockout guarded.
+  auth user and sends Supabase's invite email (existing users get a password-reset
+  email instead); the link opens the in-app create-password screen
+  (`#type=invite`, same screen as recovery). A fallback set-password link is
+  also returned for hand-over if the email doesn't arrive. Self-lockout guarded.
 - **Webhook auth:** `X-API-Key` → env keys (`API_KEY`=analytics,
   `NATIVE_API_KEY`) or `public.api_keys` (sha256 hash, per-funnel, minted at
   provisioning / by hand).

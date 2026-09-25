@@ -16,7 +16,8 @@ import { ThinkingOrb } from "thinking-orbs";
 // when the one-time link was already consumed, e.g. by an email security
 // scanner). Read the hash BEFORE createClient: detectSessionInUrl strips it.
 const AUTH_HASH = new URLSearchParams(window.location.hash.replace(/^#/, ""));
-const LANDED_FROM_RECOVERY = AUTH_HASH.get("type") === "recovery";
+const LANDED_FROM_INVITE = AUTH_HASH.get("type") === "invite"; // admin invite email → create a password
+const LANDED_FROM_RECOVERY = AUTH_HASH.get("type") === "recovery" || LANDED_FROM_INVITE;
 const AUTH_LINK_ERROR_MSG = (() => {
   if (!AUTH_HASH.get("error") && !AUTH_HASH.get("error_code")) return "";
   const code = AUTH_HASH.get("error_code") || "";
@@ -1313,7 +1314,7 @@ export default function App() {
       else {
         setRecoveryMode(false);
         setNewPass(""); setNewPass2("");
-        flash("Password updated — you're signed in");
+        flash(LANDED_FROM_INVITE ? "Welcome — you're signed in" : "Password updated — you're signed in");
       }
     } finally {
       setPwSubmitting(false);
@@ -1591,8 +1592,8 @@ export default function App() {
         <form onSubmit={handleSetPassword} className="login-form" style={{ width: "100%", maxWidth: 380, background: "#fff", borderRadius: 16, padding: "48px 36px", boxShadow: "0 8px 32px rgba(0,0,0,0.08)", border: "1px solid var(--ds-border)" }}>
           <div style={{ textAlign: "center", marginBottom: 32 }}>
             <img src="https://portal-drshumard.b-cdn.net/trans_sized.png" alt="Logo" style={{ height: 36, objectFit: "contain", marginBottom: 16 }} />
-            <h1 style={{ fontSize: 24, fontWeight: 600, color: "#171717", margin: 0, letterSpacing: "-0.03em" }}>Set a new password</h1>
-            <p style={{ fontSize: 14, color: "#666", marginTop: 8 }}>for {session.user?.email}</p>
+            <h1 style={{ fontSize: 24, fontWeight: 600, color: "#171717", margin: 0, letterSpacing: "-0.03em" }}>{LANDED_FROM_INVITE ? "Create your password" : "Set a new password"}</h1>
+            <p style={{ fontSize: 14, color: "#666", marginTop: 8 }}>{LANDED_FROM_INVITE ? "You've been invited to the dashboard — choose a password for " : "for "}{session.user?.email}</p>
           </div>
           {pwError && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16, border: "1px solid #F5B7B7" }}>{pwError}</div>}
           <div style={{ marginBottom: 16 }}>
@@ -3075,6 +3076,7 @@ function FunnelAccessModal({ funnel, onCancel }) {
           ))}
         </div>
         <div style={fieldLabel}>Invite someone new</div>
+        <div style={{ fontSize: 12, color: "var(--ds-gray-600)", marginBottom: 8 }}>They get an email with a link to create their password and sign in.</div>
         {invResult && (
           <div style={{ background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>
             <div style={{ fontSize: 13, color: "#166534", marginBottom: 6 }}>{invResult.email} added as {invResult.role}. {invResult.note}</div>
@@ -3090,7 +3092,7 @@ function FunnelAccessModal({ funnel, onCancel }) {
             <option value="viewer">Viewer</option>
             <option value="admin">Admin</option>
           </select>
-          <button type="submit" disabled={inviting || !invEmail.trim()} style={{ ...S.btnDark, padding: "0 14px", fontSize: 13 }}>{inviting ? "Adding…" : "Add"}</button>
+          <button type="submit" disabled={inviting || !invEmail.trim()} style={{ ...S.btnDark, padding: "0 14px", fontSize: 13 }}>{inviting ? "Sending…" : "Send invite"}</button>
         </form>
         <button type="button" style={{ ...S.btnLight, width: "100%", justifyContent: "center" }} onClick={onCancel}>Done</button>
       </div>
