@@ -509,6 +509,12 @@ async function getRegPageVisits(funnel, dates) {
     const esc = (s) => String(s).replace(/'/g, "''");
     const urlList = urls.map(u => `'${esc(u)}'`).join(',');
     const dateList = uniq.map(d => `'${esc(d)}'`).join(',');
+    // Sargable bounds (LA midnight of the first day → LA midnight after the last) so the
+    // scan uses idx_tracking_visits_ts instead of reading the whole table; the IN list
+    // below still does the exact per-day match.
+    const sorted = [...uniq].sort();
+    const tsFrom = `('${esc(sorted[0])}'::date)::timestamp AT TIME ZONE 'America/Los_Angeles'`;
+    const tsTo = `('${esc(sorted[sorted.length - 1])}'::date + 1)::timestamp AT TIME ZONE 'America/Los_Angeles'`;
     // Per-visit variant: pre-cutoff → NULL (undetected); A/B pages → their variant; any
     // other counted page (e.g. /register='undetected') → NULL. NULL = counts in 'all',
     // bucketed undetected.
@@ -521,6 +527,7 @@ async function getRegPageVisits(funnel, dates) {
                CASE ${cutoffGate}${variantCase} ELSE NULL END AS variant
         FROM tracking_page_visits
         WHERE contact_id IS NOT NULL
+          AND timestamp >= ${tsFrom} AND timestamp < ${tsTo}
           AND split_part(current_url,'?',1) IN (${urlList})
           AND (timestamp AT TIME ZONE 'America/Los_Angeles')::date IN (${dateList})
     ), picked AS (
