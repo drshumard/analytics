@@ -271,6 +271,11 @@ counters + refinalize + cache), `set_metric_override`, `link_identity`,
 4. **Timezones:** LA everywhere for bucketing; manual imports must convert
    (eboov CRM = UTC).
 5. `ai_run_sql` caps at 500 rows / 5 s; `ai_run_sql_write` 10 s, one statement.
+   `ai_run_sql` (public + eboov) runs with `TimeZone=America/Los_Angeles`, so
+   inside AI `run_sql` queries `event_time::date`, `current_date` and plain
+   date literals are already Pacific (server-side SQL still uses explicit
+   offsets / `AT TIME ZONE`). Set via `db/migration_ai_run_sql_timezone.sql`
+   after the AI mis-bucketed "yesterday's sales" by hand-shifting UTC (2026-09-28).
 6. Registration webhooks may carry `webinar_datetime_utc` (quirky text format,
    UTC) — events bucket to the *webinar's* LA day, not arrival day.
 7. Purchase dedup blocks a genuine second same-day purchase by the same email —
