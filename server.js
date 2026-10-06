@@ -2209,9 +2209,10 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             .filter(r => !r.finalized_at || (forceAllDedup && !hasStoredSplits(r)))
             .map(r => String(r.date).substring(0, 10));
         const dedupMap = await getDedupCounts(funnel, dates);
-        // Reg-page unique visitors per variant (shumard pageviews) — for ALL row dates,
-        // independent of the FB fb_link_clicks total.
-        const regVisits = await getRegPageVisits(funnel, (data || []).map(r => String(r.date).substring(0, 10)));
+        // Reg-page unique visitors per variant (shumard pageviews), independent of the FB
+        // fb_link_clicks total. Only the newest 90 rows: the tracking scan hits ai_run_sql's
+        // 5 s timeout over the full history, which zeroes the column for every day.
+        const regVisits = await getRegPageVisits(funnel, (data || []).slice(0, 90).map(r => String(r.date).substring(0, 10)));
 
         const PURCHASE_SUB = purchaseSubCols(funnel);
         const DEDUP_COLS = new Set([
