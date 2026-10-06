@@ -297,6 +297,10 @@ counters + refinalize + cache), `set_metric_override`, `link_identity`,
 - **Historic import** (CSV/CRM dump) → insert `events` rows (mind timezone),
   set `daily_metrics` counters to distinct counts, clear cache. See
   session pattern: metadata `{"imported": "<label>"}` for traceability.
+  Done once for Jan 1 – Mar 27 2026 from the "Webinar Mastersheet - 2026" sheet:
+  day totals live in `overrides` (tagged `imported: sheet-2026`); 694 buyer
+  `purchases` events carry `metadata.imported = 'sheet-2026'`. Jan 1 – Feb 13
+  spend includes a second ad account, so Meta re-pulls would understate it.
 - **Backfill FB spend for a date** → `POST /api/refresh-date` with `X-Funnel`.
 - **Wire n8n for a funnel** → HTTP Request node → POST
   `https://analytics.drshumard.com/api/metrics/increment`, headers

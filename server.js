@@ -2149,13 +2149,16 @@ app.put('/api/sales-pages', dashboardLimiter, requireAuth, async (req, res) => {
     }
 });
 
+// Days the dashboard loads in one page (covers all history back to the 2026 backfill).
+const DASHBOARD_DAYS = 400;
+
 // GET /api/metrics — Fetch all daily metrics (with caching)
 app.get('/api/metrics', dashboardLimiter, async (req, res) => {
     try {
         const funnel = resolveFunnel(req, 'analytics');
         const supabase = clientFor(funnel);
         const bucket = getCacheBucket(funnel);
-        const { limit = 90, offset = 0, variant: variantRaw = 'all', expand } = req.query;
+        const { limit = DASHBOARD_DAYS, offset = 0, variant: variantRaw = 'all', expand } = req.query;
         const ALLOWED_VARIANTS = ['all', 'A', 'B', 'undetected'];
         const variant = ALLOWED_VARIANTS.includes(String(variantRaw)) ? String(variantRaw) : 'all';
         // expand=variants embeds per-variant (A/B/undetected) breakdowns on every
@@ -2165,7 +2168,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         // back finalized days) and a `variants` object carries each bucket from live
         // dedup. For NON-finalized days all === A+B+undetected by construction.
         const expandVariants = String(expand) === 'variants';
-        const isDefaultPage = Number(limit) === 90 && Number(offset) === 0;
+        const isDefaultPage = Number(limit) === DASHBOARD_DAYS && Number(offset) === 0;
 
         // ── Response cache (default pagination only) — the plain 'all' view and
         //    the expanded payload each get their own cache slot ──
@@ -7631,7 +7634,7 @@ const server = app.listen(PORT, () => {
 async function warmCaches() {
     const base = `http://127.0.0.1:${PORT}`;
     for (const funnel of allowedFunnels()) {
-        for (const qs of ['limit=90&offset=0', 'limit=90&offset=0&expand=variants']) {
+        for (const qs of [`limit=${DASHBOARD_DAYS}&offset=0`, `limit=${DASHBOARD_DAYS}&offset=0&expand=variants`]) {
             try {
                 const r = await fetch(`${base}/api/metrics?${qs}`, { headers: { 'x-funnel': funnel } });
                 await r.text();

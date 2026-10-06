@@ -1153,7 +1153,7 @@ export default function App() {
 
   const loadData = useCallback(async () => {
     try {
-      const [mRes, cRes] = await Promise.all([api.getMetrics(90, 0), api.getCustomMetrics()]);
+      const [mRes, cRes] = await Promise.all([api.getMetrics(400, 0), api.getCustomMetrics()]);
       setMetrics(mRes.data || []);
       setCustoms(cRes.data || []);
     } catch (e) {
