@@ -5358,6 +5358,9 @@ input:focus,select:focus,textarea:focus{border-color:var(--ds-border-hover)!impo
 @media (min-width:769px) and (max-width:1024px){
   .overview-table-wrap{width:calc(100% + 40px)!important;margin-inline:-20px}
 }
+/* Excel-style: the table scrolls inside a viewport-high box, so the sticky header row
+   and Day/Date columns stay pinned (a page-level scroll would carry the header away). */
+.overview-table-wrap{max-height:calc(100dvh - 140px);overflow:auto!important}
 table{font-variant-numeric:tabular-nums}
 thead th{position:sticky;top:0;z-index:1}
 tbody tr{transition:background-color 120ms ease}
