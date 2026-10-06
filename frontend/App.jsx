@@ -6,7 +6,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import DatePicker from "react-datepicker";
 import "react-datepicker/dist/react-datepicker.css";
-import { parse, startOfDay, endOfDay, subDays } from "date-fns";
+import { parse, startOfDay, endOfDay, subDays, startOfMonth, endOfMonth } from "date-fns";
 import { createClient } from "@supabase/supabase-js";
 import { ThinkingOrb } from "thinking-orbs";
 
@@ -467,6 +467,9 @@ const DATE_FILTER_OPTIONS = [
   { value: "7", label: "Last 7 days" },
   { value: "30", label: "Last 30 days" },
   { value: "mtd", label: "This Month" },
+  { value: "qtd", label: "Quarter to date" },
+  { value: "ytd", label: "Year to date" },
+  { value: "months", label: "Months" },
   { value: "custom", label: "Custom range" },
 ];
 
@@ -704,8 +707,8 @@ function GeistDateRangePicker({ filter, onFilterChange, range, onRangeChange }) 
   };
 
   const selectPreset = (option) => {
-    if (option.value === "custom") {
-      setDraftFilter("custom");
+    if (option.value === "custom" || option.value === "months") {
+      setDraftFilter(option.value);
       return;
     }
     onFilterChange(option.value);
@@ -716,6 +719,16 @@ function GeistDateRangePicker({ filter, onFilterChange, range, onRangeChange }) 
   const applyCustomRange = () => {
     if (!draftRange[0] || !draftRange[1]) return;
     onRangeChange(draftRange);
+    onFilterChange("custom");
+    setOpen(false);
+    requestAnimationFrame(() => triggerRef.current?.focus());
+  };
+
+  // Month range → 1st of the first month through the last day of the last month.
+  // A single clicked month (no end yet) means just that month.
+  const applyMonthRange = () => {
+    if (!draftRange[0]) return;
+    onRangeChange([startOfMonth(draftRange[0]), endOfMonth(draftRange[1] || draftRange[0])]);
     onFilterChange("custom");
     setOpen(false);
     requestAnimationFrame(() => triggerRef.current?.focus());
@@ -734,7 +747,7 @@ function GeistDateRangePicker({ filter, onFilterChange, range, onRangeChange }) 
   })();
 
   return (
-    <div ref={rootRef} className={`geist-date-picker${open ? " is-open" : ""}${draftFilter === "custom" ? " shows-calendar" : ""}`} onBlur={e => { if (e.relatedTarget && !rootRef.current?.contains(e.relatedTarget)) setOpen(false); }}>
+    <div ref={rootRef} className={`geist-date-picker${open ? " is-open" : ""}${draftFilter === "custom" || draftFilter === "months" ? " shows-calendar" : ""}`} onBlur={e => { if (e.relatedTarget && !rootRef.current?.contains(e.relatedTarget)) setOpen(false); }}>
       <button
         ref={triggerRef}
         type="button"
@@ -770,6 +783,15 @@ function GeistDateRangePicker({ filter, onFilterChange, range, onRangeChange }) 
               <div className="geist-date-actions">
                 <button type="button" className="geist-date-cancel" onClick={cancelPicker}>Cancel</button>
                 <button type="button" className="geist-date-apply" disabled={!draftRange[0] || !draftRange[1]} onClick={applyCustomRange}>Apply range</button>
+              </div>
+            </div>
+          )}
+          {draftFilter === "months" && (
+            <div className="geist-date-calendar">
+              <DatePicker inline selectsRange showMonthYearPicker startDate={draftRange[0]} endDate={draftRange[1]} onChange={(update) => setDraftRange(update)} />
+              <div className="geist-date-actions">
+                <button type="button" className="geist-date-cancel" onClick={cancelPicker}>Cancel</button>
+                <button type="button" className="geist-date-apply" disabled={!draftRange[0]} onClick={applyMonthRange}>Apply months</button>
               </div>
             </div>
           )}
@@ -1491,6 +1513,8 @@ export default function App() {
     if (dateFilter === "7" && d < subDays(today, 7)) return false;
     if (dateFilter === "30" && d < subDays(today, 30)) return false;
     if (dateFilter === "mtd" && d < new Date(today.getFullYear(), today.getMonth(), 1)) return false;
+    if (dateFilter === "qtd" && d < new Date(today.getFullYear(), Math.floor(today.getMonth() / 3) * 3, 1)) return false;
+    if (dateFilter === "ytd" && d < new Date(today.getFullYear(), 0, 1)) return false;
     if (dateFilter === "custom") {
       const [start, end] = dateRange;
       if (start && d < startOfDay(start)) return false;
