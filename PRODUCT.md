@@ -20,6 +20,9 @@ Per funnel it provides:
 - **Daily metrics dashboard** — ad spend + funnel event counts per day, custom
   metrics (formula columns), saved column sets ("lenses"), summary cards with
   sparklines, A/B split-test view, board/list views, manual day editor (admin).
+  Loads the newest 400 days; table scrolls in its own box with a sticky header +
+  Day/Date columns. Date picker (scopes the cards only): today, yesterday, 7/30
+  days, month/quarter/year to date, month ranges, custom range.
 - **AI Insights chat** — a Claude-powered analyst with ~15 tools over the funnel's
   data (metrics, rollups, journeys, segments, live Facebook Ads API, GHL pipelines
   for the main funnel), with per-user durable memory.
