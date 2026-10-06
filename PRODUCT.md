@@ -101,7 +101,7 @@ dedup semantics. Custom funnels get generated prompt text and generic tools only
 
 | Table | Role |
 |---|---|
-| `daily_metrics` | one row per LA calendar day; denormalized counters per column; `overrides` jsonb (admin display overrides, sit ON TOP of automated data); `variant_splits` jsonb (persisted A/B splits at finalize); `finalized_at` |
+| `daily_metrics` | one row per LA calendar day; denormalized counters per column; `reg_page_visits` (tracked reg-page visitors, stored at finalize — NULL = unknown/pre-tracking, shown "—"; tracking began 2026-05-30; refill gaps via `POST /api/admin/backfill-reg-page-visits`, one day per query); `overrides` jsonb (admin display overrides, sit ON TOP of automated data); `variant_splits` jsonb (persisted A/B splits at finalize); `finalized_at` |
 | `events` | source of truth. One row per funnel action: `event_type`, `name/email/phone`, `metadata` jsonb, `event_time` (UTC), `execution_id` (n8n) |
 | `event_types`, `purchase_sources` | column config (§2.1) |
 | `custom_metrics` | formula columns (`clickedcta / viewedcta * 100` style; variables = any MK column or other custom metric) |

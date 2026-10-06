@@ -2038,7 +2038,7 @@ export default function App() {
                             }
                             if (c.key === "total_purchases") return <td key={c.key} style={S.tdNum}><span style={S.purchBadge}>{(Number(row.total_purchases) || 0).toLocaleString()}</span></td>;
                             if (c.key === "fb_spend") return <td key={c.key} style={S.tdMoney}>{"$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>;
-                            return <td key={c.key} style={S.tdNum}>{(Number(row[c.key]) || 0).toLocaleString()}</td>;
+                            return <td key={c.key} style={S.tdNum}>{c.key === "reg_page_visits" && row[c.key] == null ? "\u2014" : (Number(row[c.key]) || 0).toLocaleString()}</td>;
                           })}
                           <td style={S.td} onClick={(e) => e.stopPropagation()}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
@@ -2090,7 +2090,7 @@ export default function App() {
                           }
                           if (c.key === "fb_spend") return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{"$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</span></div>;
                           if (c.key === "total_purchases") return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.purchBadge}>{(Number(row.total_purchases) || 0).toLocaleString()}</span></div>;
-                          return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{(Number(row[c.key]) || 0).toLocaleString()}</span></div>;
+                          return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{c.key === "reg_page_visits" && row[c.key] == null ? "\u2014" : (Number(row[c.key]) || 0).toLocaleString()}</span></div>;
                         })}
                       </div>
                       <div style={S.boardCardActions} onClick={(e) => e.stopPropagation()}>

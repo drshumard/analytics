@@ -21,6 +21,7 @@ CREATE TABLE {{schema}}.daily_metrics (
     day_of_week   TEXT NOT NULL,
     fb_spend      NUMERIC(12,2) NOT NULL DEFAULT 0,
     fb_link_clicks INTEGER NOT NULL DEFAULT 0,
+    reg_page_visits INTEGER,
     purchases     INTEGER NOT NULL DEFAULT 0,
     overrides     JSONB DEFAULT '{}',
     variant_splits JSONB,

@@ -496,7 +496,8 @@ async function getSalesPageMap(funnel) {
 // that day; if they only hit a non-variant reg page (e.g. /register) or only visited
 // before the A/B-test-start cutoff, they're 'undetected' but still counted in 'all'. So
 // all = A + B + undetected (every reg-page visitor). Returns { 'YYYY-MM-DD': {all,A,B,undetected} }.
-// Independent of the FB-sourced fb_link_clicks.
+// Independent of the FB-sourced fb_link_clicks. Returns null when the query fails, so
+// callers can show "unknown" instead of a fake 0.
 async function getRegPageVisits(funnel, dates) {
     const out = {};
     const uniq = [...new Set((dates || []).filter(Boolean))];
@@ -539,7 +540,7 @@ async function getRegPageVisits(funnel, dates) {
     FROM picked GROUP BY day, variant`;
     try {
         const { data, error } = await clientFor(funnel).rpc('ai_run_sql', { query: sql });
-        if (error) { console.warn(`⚠️  reg_page_visits query failed [${funnel}]:`, error.message); return out; }
+        if (error) { console.warn(`⚠️  reg_page_visits query failed [${funnel}]:`, error.message); return null; }
         for (const r of (data || [])) {
             const d = String(r.day).slice(0, 10);
             if (!out[d]) out[d] = { all: 0, A: 0, B: 0, undetected: 0 };
@@ -547,7 +548,7 @@ async function getRegPageVisits(funnel, dates) {
             out[d][v] += Number(r.visitors) || 0;
             out[d].all += Number(r.visitors) || 0;
         }
-    } catch (e) { console.warn(`⚠️  reg_page_visits error [${funnel}]:`, e.message); }
+    } catch (e) { console.warn(`⚠️  reg_page_visits error [${funnel}]:`, e.message); return null; }
     return out;
 }
 
@@ -1955,6 +1956,16 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
         }
     }
 
+    // Reg-page visitors are stored at finalize so past days never re-run the slow tracking
+    // scan. A failed lookup (null) leaves any previously stored count untouched.
+    const rv = await getRegPageVisits(funnel, [isoDate]);
+    if (rv) {
+        const c = rv[isoDate] || { all: 0, A: 0, B: 0, undetected: 0 };
+        updates.reg_page_visits = c.all;
+        written.reg_page_visits = c.all;
+        splits.reg_page_visits = { A: c.A, B: c.B, undetected: c.undetected };
+    }
+
     // Ensure the row exists. Create with day_of_week if not.
     const { data: existing } = await supabase
         .from('daily_metrics').select('date').eq('date', isoDate).maybeSingle();
@@ -2210,9 +2221,9 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             .map(r => String(r.date).substring(0, 10));
         const dedupMap = await getDedupCounts(funnel, dates);
         // Reg-page unique visitors per variant (shumard pageviews), independent of the FB
-        // fb_link_clicks total. Only the newest 90 rows: the tracking scan hits ai_run_sql's
-        // 5 s timeout over the full history, which zeroes the column for every day.
-        const regVisits = await getRegPageVisits(funnel, (data || []).slice(0, 90).map(r => String(r.date).substring(0, 10)));
+        // fb_link_clicks total. Finalized days read the count stored at finalize; only
+        // unfinalized days (today) are counted live. null = unknown (lookup failed / no data).
+        const regVisits = await getRegPageVisits(funnel, (data || []).filter(r => !r.finalized_at).map(r => String(r.date).substring(0, 10)));
 
         const PURCHASE_SUB = purchaseSubCols(funnel);
         const DEDUP_COLS = new Set([
@@ -2227,7 +2238,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             const mmddyyyy = dateStr.replace(/(\d{4})-(\d{2})-(\d{2})/, '$2/$3/$1');
             const deduped = dedupMap[dateStr] || {};
             const hasDedup = Object.keys(deduped).length > 0;
-            const rv = regVisits[dateStr] || {}; // reg-page visitors per variant for this day
+            const rv = regVisits ? (regVisits[dateStr] || {}) : null; // live reg-page visitors (unfinalized days)
             const ov = row.overrides || {};
             const isFinalized = !!row.finalized_at;
             const splits = (row.variant_splits && typeof row.variant_splits === 'object') ? row.variant_splits : null;
@@ -2261,7 +2272,13 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 const tp = PURCHASE_SUB.reduce((s, k) => s + (o[k] || 0), 0);
                 o.total_purchases = tp;
                 o.purchases = tp; // alias for backward-compat custom formulas
-                o.reg_page_visits = rv[vnt] || 0; // unique tracked reg-page visitors
+                // unique tracked reg-page visitors; null = unknown, shown as "—"
+                if (isFinalized) {
+                    const st = row.reg_page_visits;
+                    o.reg_page_visits = st == null ? null : vnt === 'all' ? Number(st) : (splits?.reg_page_visits?.[vnt] ?? null);
+                } else {
+                    o.reg_page_visits = rv ? (rv[vnt] || 0) : null;
+                }
                 return o;
             };
             // Non-expanded: top level reflects the requested `variant` (default 'all').
@@ -3110,6 +3127,44 @@ app.post('/api/admin/backfill-variant-splits', requireAuth, requireAdmin, async 
         res.json({ ok: true, finalized_days: (rows || []).length, backfilled: updated, of: targets.length });
     } catch (err) {
         console.error('❌ POST /api/admin/backfill-variant-splits error:', err.message);
+        res.status(500).json({ error: 'Backfill failed', detail: err.message });
+    }
+});
+
+// POST /api/admin/backfill-reg-page-visits — store reg-page visitor counts on finalized
+// days that lack them (finalize stores them going forward). One day per query: a single
+// day runs in ~1 s, but multi-day spans switch plans and blow ai_run_sql's 5 s timeout. Days before the first tracked visit stay NULL (shown as
+// "—": no tracking existed). Idempotent; a failed week is reported and can be re-run.
+app.post('/api/admin/backfill-reg-page-visits', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const funnel = req.funnel;
+        const sb = clientFor(funnel);
+        const { data: rows, error } = await sb.from('daily_metrics')
+            .select('date, variant_splits')
+            .not('finalized_at', 'is', null)
+            .is('reg_page_visits', null)
+            .lt('date', dateToISO(getLADate()))
+            .order('date', { ascending: true });
+        if (error) throw error;
+        let started = false, stored = 0;
+        const failed = [];
+        for (const r of rows) {
+            const d = String(r.date).substring(0, 10);
+            const rv = await getRegPageVisits(funnel, [d]);
+            if (!rv) { failed.push(d); continue; }
+            if (!started && !rv[d]) continue; // before tracking began
+            started = true;
+            const c = rv[d] || { all: 0, A: 0, B: 0, undetected: 0 };
+            const vs = { ...(r.variant_splits || {}), reg_page_visits: { A: c.A, B: c.B, undetected: c.undetected } };
+            const { error: uErr } = await sb.from('daily_metrics').update({ reg_page_visits: c.all, variant_splits: vs }).eq('date', d);
+            if (uErr) { failed.push(d); continue; }
+            stored++;
+        }
+        invalidateMetricsCache(funnel);
+        console.log(`👣 Backfill reg_page_visits[${funnel}]: ${stored} day(s), ${failed.length} failed, by ${req.user.email}`);
+        res.json({ ok: true, candidates: rows.length, stored, failed });
+    } catch (err) {
+        console.error('❌ POST /api/admin/backfill-reg-page-visits error:', err.message);
         res.status(500).json({ error: 'Backfill failed', detail: err.message });
     }
 });
