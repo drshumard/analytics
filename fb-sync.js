@@ -50,7 +50,9 @@ function getDayOfWeek(isoDate) {
 }
 
 // ─── Fetch insights from Facebook Graph API ─────────────────────────────────
-async function fetchFacebookInsights(dateISO, adAccountId = FB_AD_ACCOUNT_ID) {
+// `campaigns` optionally narrows the account total: { include: [ids] } counts
+// only those campaigns, { exclude: [ids] } counts everything except them.
+async function fetchFacebookInsights(dateISO, adAccountId = FB_AD_ACCOUNT_ID, campaigns = null) {
     const url = new URL(`https://graph.facebook.com/${FB_API_VERSION}/${adAccountId}/insights`);
     url.searchParams.set('access_token', FB_ACCESS_TOKEN);
     url.searchParams.set('fields', 'spend,inline_link_clicks');
@@ -59,6 +61,13 @@ async function fetchFacebookInsights(dateISO, adAccountId = FB_AD_ACCOUNT_ID) {
         until: dateISO,
     }));
     url.searchParams.set('level', 'account');
+    const include = campaigns?.include?.length ? campaigns.include : null;
+    const exclude = campaigns?.exclude?.length ? campaigns.exclude : null;
+    if (include || exclude) {
+        url.searchParams.set('filtering', JSON.stringify([
+            { field: 'campaign.id', operator: include ? 'IN' : 'NOT_IN', value: include || exclude },
+        ]));
+    }
 
     const res = await fetch(url.toString());
 
@@ -119,7 +128,7 @@ async function writeSpendToSupabase(isoDate, spend) {
 
 // ─── Main sync function ──────────────────────────────────────────────────────
 export { fetchFacebookSpend, fetchFacebookInsights, writeSpendToSupabase, writeInsightsToSupabase };
-export async function syncFacebookSpend(adAccountId = FB_AD_ACCOUNT_ID, schema = 'public', label = 'analytics') {
+export async function syncFacebookSpend(adAccountId = FB_AD_ACCOUNT_ID, schema = 'public', label = 'analytics', campaigns = null) {
     if (!FB_ACCESS_TOKEN || !adAccountId) {
         console.warn('⚠️  FB sync skipped — FB_ACCESS_TOKEN or ad account not set');
         return null;
@@ -128,7 +137,7 @@ export async function syncFacebookSpend(adAccountId = FB_AD_ACCOUNT_ID, schema =
     const { iso, display } = getTodayLA();
 
     try {
-        const insights = await fetchFacebookInsights(iso, adAccountId);
+        const insights = await fetchFacebookInsights(iso, adAccountId, campaigns);
         const result = await writeInsightsToSupabase(iso, insights, schema);
 
         console.log(`✅ FB sync [${label}]: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks for ${display} (${getDayOfWeek(iso)})`);

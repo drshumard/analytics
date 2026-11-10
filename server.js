@@ -159,6 +159,19 @@ function brandFor(funnel) {
     return f ? { brand: f.brand, context: f.brand_context || '', funnelName: f.label } : { brand: funnel, context: '', funnelName: funnel };
 }
 function fbAccountFor(funnel) { return funnelConfig.funnels.get(funnel)?.fb_ad_account_id || null; }
+// Campaign scope for a funnel's FB spend. A funnel with fb_campaign_ids counts
+// only those campaigns; a funnel without counts its whole ad account MINUS any
+// campaigns other funnels on the same account have claimed (no double counting).
+function fbCampaignsFor(funnel) {
+    const own = funnelConfig.funnels.get(funnel)?.fb_campaign_ids;
+    if (own?.length) return { include: own };
+    const acct = fbAccountFor(funnel);
+    const exclude = [];
+    for (const [key, f] of funnelConfig.funnels) {
+        if (key !== funnel && f.fb_ad_account_id === acct && f.fb_campaign_ids?.length) exclude.push(...f.fb_campaign_ids);
+    }
+    return exclude.length ? { exclude } : null;
+}
 function purchaseSources(funnel) { return funnelConfig.sources.get(funnel) || FALLBACK_SOURCES; }
 function purchaseSourceMap(funnel) { return funnelConfig.sourceMaps.get(funnel) || funnelConfig.sourceMaps.get('analytics') || {}; }
 function purchaseSubCols(funnel) { return purchaseSources(funnel).map(s => s.column_name); }
@@ -1295,7 +1308,7 @@ app.post('/api/refresh', dashboardLimiter, async (req, res) => {
         const funnel = resolveFunnel(req);
         const acct = fbAccountFor(funnel);
         if (!acct) return res.status(400).json({ error: `The ${funnel} funnel has no Facebook ad account linked` });
-        const result = await syncFacebookSpend(acct, funnelConfig.funnels.get(funnel).schema_name, funnel);
+        const result = await syncFacebookSpend(acct, funnelConfig.funnels.get(funnel).schema_name, funnel, fbCampaignsFor(funnel));
         refreshTimestamps.push(now);
         invalidateMetricsCache(funnel);
         invalidateInsightsCache(funnel);
@@ -1326,7 +1339,7 @@ app.post('/api/refresh-date', dashboardLimiter, async (req, res) => {
         const acct = fbAccountFor(funnel);
         if (!acct) return res.status(400).json({ error: `The ${funnel} funnel has no Facebook ad account linked` });
         const { fetchFacebookInsights, writeInsightsToSupabase } = await import('./fb-sync.js');
-        const insights = await fetchFacebookInsights(date, acct);
+        const insights = await fetchFacebookInsights(date, acct, fbCampaignsFor(funnel));
         await writeInsightsToSupabase(date, insights, funnelConfig.funnels.get(funnel).schema_name);
         invalidateMetricsCache(funnel);
         invalidateInsightsCache(funnel);
@@ -3217,7 +3230,7 @@ if (process.env.FB_ACCESS_TOKEN) {
         console.log(`🔄 FB sync cron triggered (${targets.join(', ') || 'no funnels with FB accounts'})`);
         for (const funnel of targets) {
             try {
-                await syncFacebookSpend(fbAccountFor(funnel), funnelConfig.funnels.get(funnel).schema_name, funnel);
+                await syncFacebookSpend(fbAccountFor(funnel), funnelConfig.funnels.get(funnel).schema_name, funnel, fbCampaignsFor(funnel));
                 invalidateMetricsCache(funnel);
                 invalidateInsightsCache(funnel);
             } catch (err) {
@@ -3243,7 +3256,7 @@ if (process.env.FB_ACCESS_TOKEN) {
             if (!acct) continue;
             try {
                 console.log(`🌙 Daily 4 AM cron: fetching final ad insights for ${yesterdayISO} (${funnel})`);
-                const insights = await fetchFacebookInsights(yesterdayISO, acct);
+                const insights = await fetchFacebookInsights(yesterdayISO, acct, fbCampaignsFor(funnel));
                 await writeInsightsToSupabase(yesterdayISO, insights, funnelConfig.funnels.get(funnel).schema_name);
                 invalidateMetricsCache(funnel);
                 invalidateInsightsCache(funnel);
@@ -3289,7 +3302,7 @@ cron.schedule('5 4 * * *', async () => {
 app.post('/api/fb-sync', webhookLimiter, authenticateWebhook, async (req, res) => {
     try {
         const acct = fbAccountFor(req.funnel);
-        const result = acct ? await syncFacebookSpend(acct, funnelConfig.funnels.get(req.funnel).schema_name, req.funnel) : null;
+        const result = acct ? await syncFacebookSpend(acct, funnelConfig.funnels.get(req.funnel).schema_name, req.funnel, fbCampaignsFor(req.funnel)) : null;
         if (!result) {
             return res.status(400).json({ error: `FB sync not available — check FB_ACCESS_TOKEN and the ${req.funnel} funnel's linked ad account` });
         }

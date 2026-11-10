@@ -172,8 +172,12 @@ UTC** — shift accordingly).
 - `POST /api/refresh-date {date}` re-pulls any single date (funnel via
   `X-Funnel`) — the backfill tool.
 - One system-user token (`FB_ACCESS_TOKEN` env) must have access to every linked
-  ad account (same Business Manager). Account-level = *everything in that ad
-  account counts*; keep one ad account per funnel.
+  ad account (same Business Manager).
+- **Campaign scope** (`funnels.fb_campaign_ids text[]`, set via SQL): a funnel
+  with ids counts only those campaigns; a funnel without counts its whole ad
+  account *minus* campaigns claimed by other funnels on the same account
+  (`fbCampaignsFor` in `server.js`). So funnels may share one ad account.
+  `get_fb_ads` is not campaign-scoped — it still shows the whole account.
 - `get_fb_ads` AI tool: live campaign/adset/ad + creatives + Meta-pixel
   conversions + breakdowns, per the funnel's linked account.
 
