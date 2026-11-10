@@ -4947,14 +4947,21 @@ async function getFbAds(funnel, input) {
     // parent_id scopes children: a campaign id for adsets/ads, or an adset id for ads.
     const edgeBase = input.parent_id ? `${String(input.parent_id).replace(/[^\d_]/g, '')}/${EDGES[level]}` : `${adAccount}/${EDGES[level]}`;
 
-    const signature = `${edgeBase}|${status}|${since}|${until}|${input.include_creative ? 'c' : ''}|${breakdown || ''}`;
+    // Funnels sharing an ad account only see their own campaigns (see fbCampaignsFor).
+    const scope = fbCampaignsFor(funnel);
+    const scopeFilter = scope ? { field: 'campaign.id', operator: scope.include ? 'IN' : 'NOT_IN', value: scope.include || scope.exclude } : null;
+
+    const signature = `${edgeBase}|${status}|${since}|${until}|${input.include_creative ? 'c' : ''}|${breakdown || ''}|${scopeFilter ? JSON.stringify(scopeFilter) : ''}`;
     const hit = _fbAdsCache.get(signature);
     let raw;
     if (hit && Date.now() - hit.at < FB_ADS_CACHE_TTL_MS) {
         raw = hit.json;
     } else {
         const params = { fields, limit: '100' };
-        if (STATUS_SETS[status]) params.filtering = JSON.stringify([{ field: 'effective_status', operator: 'IN', value: STATUS_SETS[status] }]);
+        const filtering = [];
+        if (STATUS_SETS[status]) filtering.push({ field: 'effective_status', operator: 'IN', value: STATUS_SETS[status] });
+        if (scopeFilter) filtering.push(scopeFilter);
+        if (filtering.length) params.filtering = JSON.stringify(filtering);
         raw = [];
         let page = await fbGraphGet(edgeBase, params);
         for (let i = 0; i < 3; i++) {

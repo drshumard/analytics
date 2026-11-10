@@ -177,7 +177,7 @@ UTC** — shift accordingly).
   with ids counts only those campaigns; a funnel without counts its whole ad
   account *minus* campaigns claimed by other funnels on the same account
   (`fbCampaignsFor` in `server.js`). So funnels may share one ad account.
-  `get_fb_ads` is not campaign-scoped — it still shows the whole account.
+  `get_fb_ads` applies the same scope at every level.
 - `get_fb_ads` AI tool: live campaign/adset/ad + creatives + Meta-pixel
   conversions + breakdowns, per the funnel's linked account.
 
