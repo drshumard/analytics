@@ -173,11 +173,18 @@ UTC** — shift accordingly).
   `X-Funnel`) — the backfill tool.
 - One system-user token (`FB_ACCESS_TOKEN` env) must have access to every linked
   ad account (same Business Manager).
-- **Campaign scope** (`funnels.fb_campaign_ids text[]`, set via SQL): a funnel
+- **Campaign scope** (`funnels.fb_campaign_ids text[]`): a funnel
   with ids counts only those campaigns; a funnel without counts its whole ad
   account *minus* campaigns claimed by other funnels on the same account
   (`fbCampaignsFor` in `server.js`). So funnels may share one ad account.
   `get_fb_ads` applies the same scope at every level.
+- **Funnel settings** (account menu, admin): edit the current funnel's label,
+  ad account and campaign ids (`GET`/`PATCH /api/admin/funnel`). Campaign ids
+  are checked against Meta (must belong to the account) and can't be claimed
+  by two funnels. The New Funnel form also takes campaign ids. The FB cron only
+  writes *today*, so after a scope change use **Re-pull spend**
+  (`POST /api/admin/funnel/resync {since}`, ≤120 days) — it re-pulls every
+  funnel sharing the ad account.
 - `get_fb_ads` AI tool: live campaign/adset/ad + creatives + Meta-pixel
   conversions + breakdowns, per the funnel's linked account.
 

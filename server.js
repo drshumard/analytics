@@ -2814,6 +2814,38 @@ async function validateFbAccount(accountId) {
     }
 }
 
+const sqlTextArray = (arr) => arr?.length ? `ARRAY[${arr.map(sqlLit).join(', ')}]::text[]` : 'NULL';
+
+// Campaign scope input → validated ids. Accepts an array or a comma/space/
+// newline-separated string. Each id must be a campaign in `acct` (checked
+// against Meta) and not already claimed by another funnel (double counting).
+// Returns { ids, campaigns: [{id, name, status}] } or { error }.
+async function checkFunnelCampaigns(funnelKey, acct, raw) {
+    const list = Array.isArray(raw) ? raw : String(raw ?? '').split(/[\s,]+/);
+    const ids = [...new Set(list.map(x => String(x).trim()).filter(Boolean))];
+    if (!ids.length) return { ids: [], campaigns: [] };
+    if (!acct) return { error: 'Link a Facebook ad account before scoping to campaigns' };
+    const bad = ids.find(id => !/^\d{6,25}$/.test(id));
+    if (bad) return { error: `"${bad}" is not a campaign id (digits only, e.g. 120254030010970725)` };
+    for (const [k, f] of funnelConfig.funnels) {
+        const clash = k !== funnelKey && (f.fb_campaign_ids || []).find(id => ids.includes(id));
+        if (clash) return { error: `Campaign ${clash} is already assigned to "${f.label || k}" — a campaign can only count toward one funnel` };
+    }
+    const campaigns = [];
+    for (const id of ids) {
+        try {
+            const r = await fetch(`https://graph.facebook.com/${process.env.FB_API_VERSION || 'v23.0'}/${id}?fields=name,account_id,effective_status&access_token=${process.env.FB_ACCESS_TOKEN}`);
+            const j = await r.json().catch(() => ({}));
+            if (j.error) return { error: `Campaign ${id}: ${j.error.message}` };
+            if (`act_${j.account_id}` !== acct) return { error: `Campaign ${id} ("${j.name}") belongs to act_${j.account_id}, not ${acct}` };
+            campaigns.push({ id, name: j.name, status: j.effective_status });
+        } catch (e) {
+            return { error: `Campaign ${id}: ${e.message}` };
+        }
+    }
+    return { ids, campaigns };
+}
+
 // GET /api/admin/fb-account?id=act_X — validate an ad account against the
 // system-user token and return its name (used live in the New Funnel modal).
 app.get('/api/admin/fb-account', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
@@ -2823,7 +2855,7 @@ app.get('/api/admin/fb-account', dashboardLimiter, requireAuth, requireAdmin, as
 // POST /api/admin/funnels — provision a complete new funnel.
 // Body: { key, label, fb_ad_account_id?, sources: [{ source_label, display_label? }] }
 app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
-    const { key: rawKey, label, fb_ad_account_id, sources: rawSources, events: rawEvents, webinar_milestones: rawMilestones } = req.body || {};
+    const { key: rawKey, label, fb_ad_account_id, fb_campaign_ids: rawCampaigns, sources: rawSources, events: rawEvents, webinar_milestones: rawMilestones } = req.body || {};
     const key = String(rawKey || '').trim().toLowerCase();
     try {
         await refreshFunnelConfig(true);
@@ -2868,6 +2900,8 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
             fb = await validateFbAccount(fb_ad_account_id);
             if (!fb.ok) return res.status(400).json({ error: `Facebook ad account rejected: ${fb.error}` });
         }
+        const camp = await checkFunnelCampaigns(key, fb?.id || null, rawCampaigns);
+        if (camp.error) return res.status(400).json({ error: camp.error });
 
         // Schema must not pre-exist (a half-provisioned schema from a failed run
         // is cleaned up below, so a retry starts fresh).
@@ -2902,7 +2936,7 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
             const lensMetrics = ['fb_spend', 'fb_link_clicks', ...events.map(e => e.column_name), ...sources.map(s => s.column_name), 'total_purchases'];
             await runProvisionSQL(`INSERT INTO ${key}.dashboard_lenses (id, name, metrics, sort_order) VALUES ('default-all', 'All Metrics', ${sqlLit(JSON.stringify(lensMetrics))}::jsonb, 0)`);
             // Registry row + creator access/admin
-            await runProvisionSQL(`INSERT INTO public.funnels (key, schema_name, label, fb_ad_account_id, created_by, webinar_milestones) VALUES (${sqlLit(key)}, ${sqlLit(key)}, ${sqlLit(String(label).trim())}, ${fb ? sqlLit(fb.id) : 'NULL'}, ${sqlLit(req.user.id)}, ${milestones})`);
+            await runProvisionSQL(`INSERT INTO public.funnels (key, schema_name, label, fb_ad_account_id, fb_campaign_ids, created_by, webinar_milestones) VALUES (${sqlLit(key)}, ${sqlLit(key)}, ${sqlLit(String(label).trim())}, ${fb ? sqlLit(fb.id) : 'NULL'}, ${sqlTextArray(camp.ids)}, ${sqlLit(req.user.id)}, ${milestones})`);
             await runProvisionSQL(`INSERT INTO public.user_funnel_access (user_id, funnel) VALUES (${sqlLit(req.user.id)}, ${sqlLit(key)}) ON CONFLICT DO NOTHING`);
             await runProvisionSQL(`INSERT INTO ${key}.user_roles (user_id, role) VALUES (${sqlLit(req.user.id)}, 'admin') ON CONFLICT (user_id) DO UPDATE SET role = 'admin'`);
         } catch (provisionErr) {
@@ -2936,6 +2970,7 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
             funnel: key,
             label: String(label).trim(),
             fb_ad_account: fb ? { id: fb.id, name: fb.name } : null,
+            fb_campaigns: camp.campaigns,
             events,
             webinar_milestones: milestones,
             columns: sources,
@@ -2949,6 +2984,96 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
     } catch (err) {
         console.error('❌ POST /api/admin/funnels error:', err.message);
         return res.status(500).json({ error: err.message });
+    }
+});
+
+// Funnels whose FB numbers depend on `acct` (they share it, so one funnel's
+// campaign scope changes what the others count).
+const funnelsOnAccount = (acct) => acct ? [...funnelConfig.funnels.values()].filter(f => f.fb_ad_account_id === acct).map(f => f.key) : [];
+
+// GET /api/admin/funnel — the CURRENT funnel's editable settings, plus the
+// campaigns other funnels on the same ad account have claimed.
+app.get('/api/admin/funnel', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    await refreshFunnelConfig(true);
+    const f = funnelConfig.funnels.get(req.funnel);
+    if (!f) return res.status(404).json({ error: 'Funnel not found' });
+    const shared = funnelsOnAccount(f.fb_ad_account_id).filter(k => k !== f.key).map(k => {
+        const o = funnelConfig.funnels.get(k);
+        return { key: k, label: o.label, fb_campaign_ids: o.fb_campaign_ids || [] };
+    });
+    res.json({ key: f.key, label: f.label, fb_ad_account_id: f.fb_ad_account_id || null, fb_campaign_ids: f.fb_campaign_ids || [], shared_with: shared });
+});
+
+// PATCH /api/admin/funnel — edit the CURRENT funnel's label, ad account and
+// campaign scope. Body: { label?, fb_ad_account_id?: string|null, fb_campaign_ids?: [ids]|string }
+// Changes apply to syncs from now on; use /api/admin/funnel/resync for past days.
+app.patch('/api/admin/funnel', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    try {
+        await refreshFunnelConfig(true);
+        const f = funnelConfig.funnels.get(req.funnel);
+        if (!f) return res.status(404).json({ error: 'Funnel not found' });
+        const body = req.body || {};
+        const label = body.label !== undefined ? String(body.label).trim() : f.label;
+        if (!label) return res.status(400).json({ error: 'A display label is required' });
+        let acct = f.fb_ad_account_id || null;
+        let fbName = null;
+        if (body.fb_ad_account_id !== undefined) {
+            acct = String(body.fb_ad_account_id || '').trim() || null;
+            if (acct) {
+                const fb = await validateFbAccount(acct);
+                if (!fb.ok) return res.status(400).json({ error: `Facebook ad account rejected: ${fb.error}` });
+                acct = fb.id; fbName = fb.name;
+            }
+        }
+        const camp = await checkFunnelCampaigns(f.key, acct, body.fb_campaign_ids !== undefined ? body.fb_campaign_ids : (acct === f.fb_ad_account_id ? f.fb_campaign_ids : []));
+        if (camp.error) return res.status(400).json({ error: camp.error });
+
+        await runProvisionSQL(`UPDATE public.funnels SET label = ${sqlLit(label)}, fb_ad_account_id = ${acct ? sqlLit(acct) : 'NULL'}, fb_campaign_ids = ${sqlTextArray(camp.ids)} WHERE key = ${sqlLit(f.key)}`);
+        const affected = new Set([f.key, ...funnelsOnAccount(f.fb_ad_account_id), ...funnelsOnAccount(acct)]);
+        await refreshFunnelConfig(true);
+        for (const k of affected) { invalidateMetricsCache(k); invalidateInsightsCache(k); }
+        console.log(`✏️  Funnel "${f.key}" settings updated by ${req.user.email}: ${acct || 'no FB'}${camp.ids.length ? ` [${camp.ids.join(',')}]` : ''}`);
+        res.json({ ok: true, key: f.key, label, fb_ad_account_id: acct, fb_account_name: fbName, fb_campaigns: camp.campaigns, affected_funnels: [...affected] });
+    } catch (err) {
+        console.error('❌ PATCH /api/admin/funnel error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/admin/funnel/resync { since: 'YYYY-MM-DD' } — re-pull FB spend and
+// clicks from `since` through today for the CURRENT funnel and every funnel
+// sharing its ad account (their campaign split changes together). Max 120 days.
+app.post('/api/admin/funnel/resync', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const acct = fbAccountFor(req.funnel);
+        if (!acct) return res.status(400).json({ error: 'This funnel has no Facebook ad account linked' });
+        const since = String(req.body?.since || '');
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) return res.status(400).json({ error: 'Send { since: "YYYY-MM-DD" }' });
+        const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+        const dates = [];
+        for (let d = new Date(`${since}T12:00:00Z`); d.toISOString().slice(0, 10) <= today; d.setUTCDate(d.getUTCDate() + 1)) dates.push(d.toISOString().slice(0, 10));
+        if (!dates.length) return res.status(400).json({ error: 'Start date is in the future' });
+        if (dates.length > 120) return res.status(400).json({ error: 'At most 120 days per re-pull — pick a later start date' });
+        const { fetchFacebookInsights, writeInsightsToSupabase } = await import('./fb-sync.js');
+        const funnels = funnelsOnAccount(acct);
+        const totals = {};
+        for (const k of funnels) {
+            const schema = funnelConfig.funnels.get(k).schema_name;
+            const scope = fbCampaignsFor(k);
+            let spend = 0;
+            for (const date of dates) {
+                const ins = await fetchFacebookInsights(date, acct, scope);
+                await writeInsightsToSupabase(date, ins, schema);
+                spend += ins.spend;
+            }
+            totals[k] = { label: funnelConfig.funnels.get(k).label, spend: Math.round(spend * 100) / 100 };
+            invalidateMetricsCache(k); invalidateInsightsCache(k);
+        }
+        console.log(`🔁 FB re-pull ${since}→${today} for ${funnels.join(', ')} by ${req.user.email}`);
+        res.json({ ok: true, since, through: today, days: dates.length, funnels: totals });
+    } catch (err) {
+        console.error('❌ POST /api/admin/funnel/resync error:', err.message);
+        res.status(502).json({ error: `Facebook API error: ${err.message}` });
     }
 });
 

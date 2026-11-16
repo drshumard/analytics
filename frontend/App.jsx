@@ -201,6 +201,27 @@ const api = {
     if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
     return data;
   },
+  async adminGetFunnel(funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/funnel`, { headers });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
+    return data;
+  },
+  async adminUpdateFunnel(body, funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/funnel`, { method: "PATCH", headers, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
+    return data;
+  },
+  async adminResyncFunnel(since, funnel) {
+    const headers = await getAuthHeaders(funnel);
+    const res = await fetch(`${API_BASE}/api/admin/funnel/resync`, { method: "POST", headers, body: JSON.stringify({ since }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Failed: ${res.status}`);
+    return data;
+  },
   async adminAddEventType(body, funnel) {
     const headers = await getAuthHeaders(funnel);
     const res = await fetch(`${API_BASE}/api/admin/event-types`, { method: "POST", headers, body: JSON.stringify(body) });
@@ -966,6 +987,7 @@ export default function App() {
   const [resetLinkOpen, setResetLinkOpen] = useState(false);
   const [newFunnelOpen, setNewFunnelOpen] = useState(false);
   const [manageColsOpen, setManageColsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [accessOpen, setAccessOpen] = useState(false);
   const [metrics, setMetrics] = useState([]);
   const [customs, setCustoms] = useState([]);
@@ -1790,6 +1812,7 @@ export default function App() {
                   <div className="account-popover-identity"><strong>{session?.user?.email?.split("@")[0] || "Account"}</strong><span>{session?.user?.email || ""}</span><small>{isAdmin ? "Administrator" : "Viewer"}</small></div>
                   <div className="navbar-popover-divider" />
                   {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} /><span>New funnel</span></button>}
+                  {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setSettingsOpen(true); }}><I d="M12 15a3 3 0 100-6 3 3 0 000 6zM19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.65 1.65 0 004.6 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.6a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" size={15} /><span>Funnel settings</span></button>}
                   {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} /><span>Columns</span></button>}
                   {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setAccessOpen(true); }}><I d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zm14 10v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" size={15} /><span>Funnel access</span></button>}
                   {isAdmin && <button onClick={e => { e.currentTarget.closest("details")?.removeAttribute("open"); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} /><span>Password reset link</span></button>}
@@ -1817,7 +1840,7 @@ export default function App() {
                   ))}
                 </nav>
                 <div className="nav-menu-footer">
-                  <div className="nav-menu-utilities"><button onClick={() => { setMobileMenuOpen(false); clearCache(); }}><I d="M3 6h18M8 6V4h8v2m-9 0l1 15h8l1-15" size={15} />Clear cache</button>{isAdmin && <button disabled={finalizing} onClick={() => { setMobileMenuOpen(false); finalizePastDays(); }}><I d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14" size={15} />{finalizing ? "Finalizing…" : "Finalize data"}</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} />New funnel</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} />Columns</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setAccessOpen(true); }}><I d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zm14 10v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" size={15} />Funnel access</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} />Password reset link</button>}</div>
+                  <div className="nav-menu-utilities"><button onClick={() => { setMobileMenuOpen(false); clearCache(); }}><I d="M3 6h18M8 6V4h8v2m-9 0l1 15h8l1-15" size={15} />Clear cache</button>{isAdmin && <button disabled={finalizing} onClick={() => { setMobileMenuOpen(false); finalizePastDays(); }}><I d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14" size={15} />{finalizing ? "Finalizing…" : "Finalize data"}</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setNewFunnelOpen(true); }}><I d="M12 5v14M5 12h14" size={15} />New funnel</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setSettingsOpen(true); }}><I d="M12 15a3 3 0 100-6 3 3 0 000 6z" size={15} />Funnel settings</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setManageColsOpen(true); }}><I d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h4m6-18h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M9 3v18m6-18v18" size={15} />Columns</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setAccessOpen(true); }}><I d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zm14 10v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" size={15} />Funnel access</button>}{isAdmin && <button onClick={() => { setMobileMenuOpen(false); setResetLinkOpen(true); }}><I d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.74 5.74L9 19H7v2H3v-4l7.26-7.26A6 6 0 0121 9z" size={15} />Password reset link</button>}</div>
                   <div className="nav-menu-account"><span className="account-avatar">{(session?.user?.email || "U").charAt(0).toUpperCase()}</span><div><strong>{session?.user?.email?.split("@")[0] || "Account"}</strong><span>{isAdmin ? "Administrator" : "Viewer"}</span></div><button onClick={handleLogout} aria-label="Sign out" title="Sign out"><I d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" size={16} /></button></div>
                 </div>
               </div>
@@ -2346,6 +2369,7 @@ export default function App() {
       {resetLinkOpen && <ResetLinkModal funnel={activeFunnel} onCancel={() => setResetLinkOpen(false)} />}
       {accessOpen && <FunnelAccessModal funnel={activeFunnel} onCancel={() => setAccessOpen(false)} />}
       {newFunnelOpen && <NewFunnelModal funnel={activeFunnel} onCancel={() => setNewFunnelOpen(false)} onCreated={() => { if (session?.access_token) fetchRole(session.access_token); }} />}
+      {settingsOpen && <FunnelSettingsModal funnel={activeFunnel} onCancel={() => setSettingsOpen(false)} onChanged={() => { if (session?.access_token) fetchRole(session.access_token); loadData(); }} />}
       {manageColsOpen && <ManageColumnsModal funnel={activeFunnel} onCancel={() => setManageColsOpen(false)} onChanged={() => { if (session?.access_token) fetchRole(session.access_token); loadData(); }} />}
       {delConfirm && <Modal title="Delete entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
       {delCM && <Modal title="Delete custom metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
@@ -2808,6 +2832,7 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
   const [fbId, setFbId] = useState("");
   const [fbCheck, setFbCheck] = useState(null); // {ok, name} | {ok:false, error}
   const [checkingFb, setCheckingFb] = useState(false);
+  const [campaignIds, setCampaignIds] = useState("");
   const [useStandardEvents, setUseStandardEvents] = useState(true);
   const [customEvents, setCustomEvents] = useState([{ event_type: "", display_label: "" }]);
   const [picked, setPicked] = useState(() => new Set(FUNNEL_SOURCES.map(s => s.source_label)));
@@ -2841,7 +2866,7 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
     if (fbId.trim() && !fbCheck?.ok) { setErr("Validate the Facebook ad account first (or clear the field)."); return; }
     setBusy(true);
     try {
-      const r = await api.adminCreateFunnel({ key: key.trim(), label: label.trim(), fb_ad_account_id: fbId.trim() || undefined, sources, events, webinar_milestones: useStandardEvents }, funnel);
+      const r = await api.adminCreateFunnel({ key: key.trim(), label: label.trim(), fb_ad_account_id: fbId.trim() || undefined, fb_campaign_ids: fbId.trim() ? campaignIds : undefined, sources, events, webinar_milestones: useStandardEvents }, funnel);
       setResult(r);
       onCreated?.();
     } catch (ex) { setErr(ex.message); }
@@ -2856,7 +2881,7 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
       <div ref={dialogRef} tabIndex={-1} className="modal-inner" role="dialog" aria-modal="true" aria-label="Funnel created" style={{ ...S.modal, maxWidth: 520, textAlign: "left" }} onClick={e => e.stopPropagation()}>
         <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Funnel "{result.label}" is live</div>
         <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>
-          Schema, tables, and dashboard are provisioned{result.fb_ad_account ? <> · Facebook spend syncs from <strong>{result.fb_ad_account.name}</strong></> : " · no Facebook account linked"}.
+          Schema, tables, and dashboard are provisioned{result.fb_ad_account ? <> · Facebook spend syncs from <strong>{result.fb_ad_account.name}</strong>{result.fb_campaigns?.length ? <> (campaigns: {result.fb_campaigns.map(c => c.name).join(", ")})</> : ""}</> : " · no Facebook account linked"}.
           Events: {(result.events || []).map(e => e.display_label).join(", ")} · Purchase columns: {result.columns.map(c => c.display_label).join(", ")}.
         </div>
         {result.manual_step && (
@@ -2902,6 +2927,13 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
             ? <div style={{ fontSize: 12, color: "#0A7F43", marginTop: 6 }}>✓ {fbCheck.name}</div>
             : <div style={{ fontSize: 12, color: "#C00", marginTop: 6 }}>{fbCheck.error}</div>)}
           <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginTop: 4 }}>The system-user token must have access to this account (same Business Manager).</div>
+          {fbId.trim() && (
+            <div style={{ marginTop: 10 }}>
+              <label htmlFor="nf-camps" style={fieldLabel}>Campaign IDs (optional)</label>
+              <input id="nf-camps" value={campaignIds} onChange={e => setCampaignIds(e.target.value)} placeholder="120254030010970725, …" style={{ ...inputStyle, fontFamily: "monospace" }} />
+              <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginTop: 4 }}>Only these campaigns count toward this funnel. Leave blank to count the whole account (minus campaigns other funnels claim) — if the account is shared and the campaign doesn't exist yet, leave the ad account blank too and add both later in Funnel settings.</div>
+            </div>
+          )}
         </div>
         <div style={{ marginBottom: 14 }}>
           <div style={fieldLabel}>Funnel events</div>
@@ -2947,6 +2979,88 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
           <button type="button" style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Cancel</button>
           <button type="submit" disabled={busy} aria-busy={busy} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{busy ? "Provisioning…" : "Create funnel"}</button>
         </div>
+      </form>
+    </div>
+  );
+}
+
+function FunnelSettingsModal({ funnel, onCancel, onChanged }) {
+  useEscapeKey(onCancel);
+  const dialogRef = useDialogFocus();
+  const [loaded, setLoaded] = useState(null); // settings as stored
+  const [label, setLabel] = useState("");
+  const [fbId, setFbId] = useState("");
+  const [campaignIds, setCampaignIds] = useState("");
+  const [since, setSince] = useState("");
+  const [err, setErr] = useState("");
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = (d) => { setLoaded(d); setLabel(d.label || ""); setFbId(d.fb_ad_account_id || ""); setCampaignIds((d.fb_campaign_ids || []).join(", ")); };
+  useEffect(() => { api.adminGetFunnel(funnel).then(load).catch(ex => setErr(ex.message)); }, [funnel]);
+
+  const save = async (e) => {
+    e.preventDefault();
+    setErr(""); setNotice(""); setBusy(true);
+    try {
+      const r = await api.adminUpdateFunnel({ label: label.trim(), fb_ad_account_id: fbId.trim() || null, fb_campaign_ids: fbId.trim() ? campaignIds : [] }, funnel);
+      setNotice(`Saved.${r.fb_ad_account_id ? ` Spend syncs from ${r.fb_account_name || r.fb_ad_account_id}${r.fb_campaigns.length ? ` — campaigns: ${r.fb_campaigns.map(c => `${c.name} (${c.status})`).join(", ")}` : " — whole account"}.` : " No Facebook account linked."} Past days keep their old spend until you re-pull below.`);
+      load(await api.adminGetFunnel(funnel));
+      onChanged?.();
+    } catch (ex) { setErr(ex.message); }
+    finally { setBusy(false); }
+  };
+  const resync = async () => {
+    setErr(""); setNotice(""); setBusy(true);
+    try {
+      const r = await api.adminResyncFunnel(since, funnel);
+      setNotice(`Re-pulled ${r.days} day${r.days === 1 ? "" : "s"} (${r.since} → ${r.through}): ${Object.values(r.funnels).map(f => `${f.label} $${f.spend.toLocaleString()}`).join(" · ")}.`);
+      onChanged?.();
+    } catch (ex) { setErr(ex.message); }
+    finally { setBusy(false); }
+  };
+  const dirty = loaded && (label.trim() !== (loaded.label || "") || fbId.trim() !== (loaded.fb_ad_account_id || "") || campaignIds.split(/[\s,]+/).filter(Boolean).join(",") !== (loaded.fb_campaign_ids || []).join(","));
+
+  return (
+    <div className="modal-backdrop" style={S.overlay} onClick={onCancel}>
+      <form ref={dialogRef} tabIndex={-1} className="modal-inner" role="dialog" aria-modal="true" aria-label="Funnel settings" style={{ ...S.modal, maxWidth: 520, textAlign: "left", maxHeight: "88vh", overflowY: "auto" }} onClick={e => e.stopPropagation()} onSubmit={save}>
+        <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Funnel settings — {loaded?.label || FUNNEL_META[funnel]?.label || funnel}</div>
+        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>Name and Facebook spend source for this funnel. Key: <code>{funnel}</code></div>
+        {err && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 12, border: "1px solid #F5B7B7" }}>{err}</div>}
+        {notice && <div role="status" style={{ background: "#F0FDF4", color: "#166534", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 12, border: "1px solid #BBF7D0" }}>{notice}</div>}
+        {!loaded ? <div style={{ fontSize: 13, color: "var(--ds-gray-600)", marginBottom: 14 }}>{err ? "" : "Loading…"}</div> : <>
+          <div style={{ marginBottom: 14 }}>
+            <label htmlFor="fs-label" style={fieldLabel}>Display name</label>
+            <input id="fs-label" data-dialog-initial-focus value={label} onChange={e => setLabel(e.target.value)} required style={inputStyle} />
+          </div>
+          <div style={{ marginBottom: 14 }}>
+            <label htmlFor="fs-fb" style={fieldLabel}>Facebook ad account</label>
+            <input id="fs-fb" value={fbId} onChange={e => setFbId(e.target.value)} placeholder="act_1234567890 (blank = no Facebook spend)" style={{ ...inputStyle, fontFamily: "monospace" }} />
+          </div>
+          <div style={{ marginBottom: 6 }}>
+            <label htmlFor="fs-camps" style={fieldLabel}>Campaign IDs</label>
+            <input id="fs-camps" value={campaignIds} disabled={!fbId.trim()} onChange={e => setCampaignIds(e.target.value)} placeholder={fbId.trim() ? "blank = whole account" : "link an ad account first"} style={{ ...inputStyle, fontFamily: "monospace" }} />
+            <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginTop: 4 }}>Comma-separated. Only these campaigns count toward this funnel; blank counts the whole account minus campaigns other funnels claim. Each id is checked against Meta on save.</div>
+          </div>
+          {loaded.shared_with?.length > 0 && (
+            <div style={{ fontSize: 12, color: "var(--ds-gray-700)", background: "var(--ds-gray-100)", borderRadius: 8, padding: "8px 12px", margin: "10px 0 0" }}>
+              Shares {loaded.fb_ad_account_id} with: {loaded.shared_with.map(o => `${o.label} (${o.fb_campaign_ids.length ? `campaigns ${o.fb_campaign_ids.join(", ")}` : "everything else"})`).join(" · ")}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 10, margin: "16px 0" }}>
+            <button type="button" style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Close</button>
+            <button type="submit" disabled={busy || !dirty} aria-busy={busy} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{busy ? "Saving…" : "Save"}</button>
+          </div>
+          {loaded.fb_ad_account_id && (
+            <div style={{ borderTop: "1px solid var(--ds-border)", paddingTop: 14 }}>
+              <div style={fieldLabel}>Re-pull Facebook spend for past days</div>
+              <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginBottom: 8 }}>The daily sync only updates today. After changing the account or campaigns, re-pull from the date the change should apply — this also refreshes every funnel sharing the ad account. Up to 120 days.</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input type="date" aria-label="Re-pull from" value={since} max={new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" })} onChange={e => setSince(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
+                <button type="button" disabled={busy || !since || dirty} onClick={resync} title={dirty ? "Save changes first" : ""} style={{ ...S.btnLight, padding: "0 14px", fontSize: 13 }}>{busy ? "Working…" : "Re-pull spend"}</button>
+              </div>
+            </div>
+          )}
+        </>}
       </form>
     </div>
   );
