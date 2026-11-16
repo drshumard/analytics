@@ -48,8 +48,8 @@ if (!API_KEY) {
 // pre-registry hardcoded values if the registry is unreachable, so boot order
 // can never break the app.
 const FALLBACK_FUNNELS = [
-    { key: 'analytics', schema_name: 'public', label: 'Main (FB Ads) Funnel', brand: 'Dr Shumard', brand_context: 'a medical practice', fb_ad_account_id: process.env.FB_AD_ACCOUNT_ID || null, is_active: true },
-    { key: 'native',    schema_name: 'native', label: 'Native Ads Funnel',    brand: 'Dr Shumard', brand_context: 'a medical practice', fb_ad_account_id: null, is_active: true },
+    { key: 'analytics', schema_name: 'public', label: 'Main (FB Ads) Funnel', brand: 'Dr Shumard', brand_context: 'a medical practice', fb_ad_account_id: process.env.FB_AD_ACCOUNT_ID || null, split_test: true, is_active: true },
+    { key: 'native',    schema_name: 'native', label: 'Native Ads Funnel',    brand: 'Dr Shumard', brand_context: 'a medical practice', fb_ad_account_id: null, split_test: true, is_active: true },
 ];
 const FALLBACK_SOURCES = [
     { column_name: 'purchases_fb',          source_label: 'Paid Ads',     display_label: 'FB Purchases',       sort_order: 10 },
@@ -148,8 +148,15 @@ async function refreshFunnelConfig(force = false) {
         if (!funnelConfig.fromRegistry) console.warn('⚠️ Funnel registry unavailable — using fallback config:', e?.message);
     }
 }
-refreshFunnelConfig(true).catch(() => {});
+const funnelConfigReady = refreshFunnelConfig(true).catch(() => {});
 setInterval(() => refreshFunnelConfig().catch(() => {}), 60_000);
+// An X-Funnel the registry doesn't know yet: wait for the startup load, then (at
+// most every 5 s) reload once in case the funnel was just created elsewhere.
+async function ensureFunnelKnown(f) {
+    if (!f || funnelExists(f)) return;
+    await funnelConfigReady;
+    if (!funnelExists(f) && Date.now() - funnelConfig.loadedAt > 5000) await refreshFunnelConfig(true).catch(() => {});
+}
 
 // Sync getters — the only sanctioned way to enumerate funnels/purchase columns.
 function allowedFunnels() { return [...funnelConfig.funnels.keys()]; }
@@ -468,10 +475,13 @@ const REG_PAGE_VARIANT_MAP_DEFAULT = {
     // in 'undetected' (they didn't see a variant). Value 'undetected' = count-but-no-variant.
     'https://drshumardworkshop.com/register': 'undetected',
 };
+// The built-in list is the main funnel's pages; every other funnel starts empty
+// (Page Views shows "—" until its own pages are added in Funnel settings).
+const regPageDefault = (funnel) => funnel === 'analytics' ? { ...REG_PAGE_VARIANT_MAP_DEFAULT } : {};
 async function getRegPageVariantMap(funnel) {
     const b = getCacheBucket(funnel);
     if (b.regPageMap !== undefined) return b.regPageMap;
-    let map = { ...REG_PAGE_VARIANT_MAP_DEFAULT };
+    let map = regPageDefault(funnel);
     try {
         const { data } = await clientFor(funnel).from('app_settings').select('value').eq('key', 'reg_page_variants').maybeSingle();
         if (data && data.value && typeof data.value === 'object' && Object.keys(data.value).length) map = data.value;
@@ -515,9 +525,17 @@ async function getRegPageVisits(funnel, dates) {
     const out = {};
     const uniq = [...new Set((dates || []).filter(Boolean))];
     if (!uniq.length) return out;
+    // One query per day: multi-day spans switch plans and blow ai_run_sql's 5 s
+    // timeout (e.g. a funnel with old unfinalized days). Per-day results merge; a
+    // day whose lookup fails is simply absent (shown "—").
+    if (uniq.length > 1) {
+        const parts = await Promise.all(uniq.map(d => getRegPageVisits(funnel, [d])));
+        if (parts.every(p => p === null)) return null;
+        return Object.assign(out, ...parts.filter(Boolean));
+    }
     const map = await getRegPageVariantMap(funnel);
     const urls = Object.keys(map);
-    if (!urls.length) return out;
+    if (!urls.length) return null; // no counted pages configured → unknown ("—")
     const cutoff = await getAbTestStart(funnel);
     const cutoffIso = cutoff ? new Date(cutoff).toISOString() : null;
     const esc = (s) => String(s).replace(/'/g, "''");
@@ -538,8 +556,8 @@ async function getRegPageVisits(funnel, dates) {
     const sql = `WITH v0 AS (
         SELECT (timestamp AT TIME ZONE 'America/Los_Angeles')::date AS day,
                contact_id, timestamp AS ts_utc,
-               CASE ${cutoffGate}${variantCase} ELSE NULL END AS variant
-        FROM tracking_page_visits
+               ${(cutoffGate || variantCase) ? `CASE ${cutoffGate}${variantCase} ELSE NULL END` : 'NULL::text'} AS variant
+        FROM public.tracking_page_visits
         WHERE contact_id IS NOT NULL
           AND timestamp >= ${tsFrom} AND timestamp < ${tsTo}
           AND split_part(current_url,'?',1) IN (${urlList})
@@ -552,8 +570,11 @@ async function getRegPageVisits(funnel, dates) {
     SELECT day::text AS day, coalesce(variant,'undetected') AS variant, count(*)::int AS visitors
     FROM picked GROUP BY day, variant`;
     try {
-        const { data, error } = await clientFor(funnel).rpc('ai_run_sql', { query: sql });
-        if (error) { console.warn(`⚠️  reg_page_visits query failed [${funnel}]:`, error.message); return null; }
+        // Tracking is one shared table in public (all sites); run via the public RPC so
+        // funnels in their own schema can read it too.
+        const { data, error } = await supabasePublic.rpc('ai_run_sql', { query: sql });
+        if (error || !Array.isArray(data)) { console.warn(`⚠️  reg_page_visits query failed [${funnel}]:`, error?.message || data?.error); return null; }
+        for (const d of uniq) out[d] = { all: 0, A: 0, B: 0, undetected: 0 }; // counted, even if zero
         for (const r of (data || [])) {
             const d = String(r.day).slice(0, 10);
             if (!out[d]) out[d] = { all: 0, A: 0, B: 0, undetected: 0 };
@@ -624,6 +645,14 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
+// Right after a restart the funnel registry may not be loaded yet; an X-Funnel
+// it doesn't know would otherwise resolve to analytics (wrong funnel's data).
+// Load it first so every route's resolveFunnel/requireAuth sees the real list.
+app.use('/api', async (req, res, next) => {
+    await ensureFunnelKnown(req.headers['x-funnel']);
+    next();
+});
+
 // ─── Rate Limiting ───────────────────────────────────────────────────────────
 const webhookLimiter = rateLimit({
     windowMs: 1 * 60 * 1000, // 1 minute
@@ -688,6 +717,7 @@ async function authenticateWebhook(req, res, next) {
             .select('*')
             .eq('key_hash', hash)
             .single();
+        if (dbKey) await ensureFunnelKnown(dbKey.funnel); // registry may still be loading after a restart
         if (dbKey && dbKey.is_active && funnelExists(dbKey.funnel)) {
             await supabasePublic.from('api_keys').update({ last_used_at: new Date().toISOString() }).eq('id', dbKey.id);
             req.funnel = dbKey.funnel;
@@ -713,6 +743,11 @@ async function requireAuth(req, res, next) {
     }
     req.user = user;
 
+    // A funnel the registry hasn't loaded yet (e.g. right after a restart) must
+    // not silently resolve to analytics — that would read/write the wrong funnel.
+    const hdr = req.headers['x-funnel'];
+    await ensureFunnelKnown(hdr);
+    if (hdr && !funnelExists(hdr)) return res.status(400).json({ error: `Unknown funnel '${hdr}'` });
     const requested = resolveFunnel(req, 'analytics');
     // Check access in user_funnel_access. If the table is empty or has no row
     // for this user, fall back to analytics-only (preserves single-funnel
@@ -1382,6 +1417,7 @@ app.get('/api/me/funnels', dashboardLimiter, async (req, res) => {
                 events: eventTypes(k).map(({ column_name, display_label }) => ({ column_name, display_label })),
                 webinar_milestones: hasMilestones(k),
                 standard_events: hasStandardEvents(k),
+                split_test: !!funnelConfig.funnels.get(k)?.split_test,
             })),
         });
     } catch (err) {
@@ -2068,8 +2104,9 @@ app.get('/api/reg-page-variants', dashboardLimiter, requireAuth, async (req, res
     try {
         const funnel = req.funnel;
         const map = await getRegPageVariantMap(funnel);
-        const isDefault = JSON.stringify(map) === JSON.stringify(REG_PAGE_VARIANT_MAP_DEFAULT);
-        res.json({ map, isDefault, default: REG_PAGE_VARIANT_MAP_DEFAULT });
+        const def = regPageDefault(funnel);
+        const isDefault = Object.keys(def).length > 0 && JSON.stringify(map) === JSON.stringify(def);
+        res.json({ map, isDefault, default: def, split_test: !!funnelConfig.funnels.get(funnel)?.split_test });
     } catch (err) {
         console.error('❌ GET /api/reg-page-variants error:', err.message);
         res.status(500).json({ error: 'Internal server error' });
@@ -2109,9 +2146,9 @@ app.put('/api/reg-page-variants', dashboardLimiter, requireAuth, async (req, res
         const b = getCacheBucket(req.funnel);
         b.regPageMap = undefined;
         invalidateMetricsCache(req.funnel);
-        const effective = Object.keys(clean).length ? clean : { ...REG_PAGE_VARIANT_MAP_DEFAULT };
+        const effective = Object.keys(clean).length ? clean : regPageDefault(req.funnel);
         console.log(`🅰️🅱️  [${req.funnel}] reg-page-variant map set:`, JSON.stringify(effective));
-        res.json({ map: effective, isDefault: Object.keys(clean).length === 0 });
+        res.json({ map: effective, isDefault: Object.keys(clean).length === 0 && Object.keys(effective).length > 0 });
     } catch (err) {
         console.error('❌ PUT /api/reg-page-variants error:', err.message);
         res.status(500).json({ error: err.message || 'Internal server error' });
@@ -2251,7 +2288,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
             const mmddyyyy = dateStr.replace(/(\d{4})-(\d{2})-(\d{2})/, '$2/$3/$1');
             const deduped = dedupMap[dateStr] || {};
             const hasDedup = Object.keys(deduped).length > 0;
-            const rv = regVisits ? (regVisits[dateStr] || {}) : null; // live reg-page visitors (unfinalized days)
+            const rv = regVisits?.[dateStr] || null; // live reg-page visitors (unfinalized days); missing = lookup failed → "—"
             const ov = row.overrides || {};
             const isFinalized = !!row.finalized_at;
             const splits = (row.variant_splits && typeof row.variant_splits === 'object') ? row.variant_splits : null;
@@ -2855,7 +2892,7 @@ app.get('/api/admin/fb-account', dashboardLimiter, requireAuth, requireAdmin, as
 // POST /api/admin/funnels — provision a complete new funnel.
 // Body: { key, label, fb_ad_account_id?, sources: [{ source_label, display_label? }] }
 app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
-    const { key: rawKey, label, fb_ad_account_id, fb_campaign_ids: rawCampaigns, sources: rawSources, events: rawEvents, webinar_milestones: rawMilestones } = req.body || {};
+    const { key: rawKey, label, fb_ad_account_id, fb_campaign_ids: rawCampaigns, split_test: rawSplit, sources: rawSources, events: rawEvents, webinar_milestones: rawMilestones } = req.body || {};
     const key = String(rawKey || '').trim().toLowerCase();
     try {
         await refreshFunnelConfig(true);
@@ -2936,7 +2973,7 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
             const lensMetrics = ['fb_spend', 'fb_link_clicks', ...events.map(e => e.column_name), ...sources.map(s => s.column_name), 'total_purchases'];
             await runProvisionSQL(`INSERT INTO ${key}.dashboard_lenses (id, name, metrics, sort_order) VALUES ('default-all', 'All Metrics', ${sqlLit(JSON.stringify(lensMetrics))}::jsonb, 0)`);
             // Registry row + creator access/admin
-            await runProvisionSQL(`INSERT INTO public.funnels (key, schema_name, label, fb_ad_account_id, fb_campaign_ids, created_by, webinar_milestones) VALUES (${sqlLit(key)}, ${sqlLit(key)}, ${sqlLit(String(label).trim())}, ${fb ? sqlLit(fb.id) : 'NULL'}, ${sqlTextArray(camp.ids)}, ${sqlLit(req.user.id)}, ${milestones})`);
+            await runProvisionSQL(`INSERT INTO public.funnels (key, schema_name, label, fb_ad_account_id, fb_campaign_ids, split_test, created_by, webinar_milestones) VALUES (${sqlLit(key)}, ${sqlLit(key)}, ${sqlLit(String(label).trim())}, ${fb ? sqlLit(fb.id) : 'NULL'}, ${sqlTextArray(camp.ids)}, ${!!rawSplit}, ${sqlLit(req.user.id)}, ${milestones})`);
             await runProvisionSQL(`INSERT INTO public.user_funnel_access (user_id, funnel) VALUES (${sqlLit(req.user.id)}, ${sqlLit(key)}) ON CONFLICT DO NOTHING`);
             await runProvisionSQL(`INSERT INTO ${key}.user_roles (user_id, role) VALUES (${sqlLit(req.user.id)}, 'admin') ON CONFLICT (user_id) DO UPDATE SET role = 'admin'`);
         } catch (provisionErr) {
@@ -2973,6 +3010,7 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
             fb_campaigns: camp.campaigns,
             events,
             webinar_milestones: milestones,
+            split_test: !!rawSplit,
             columns: sources,
             webhook_api_key: plaintextKey,
             postgrest_exposed: reachable,
@@ -3001,11 +3039,11 @@ app.get('/api/admin/funnel', dashboardLimiter, requireAuth, requireAdmin, async 
         const o = funnelConfig.funnels.get(k);
         return { key: k, label: o.label, fb_campaign_ids: o.fb_campaign_ids || [] };
     });
-    res.json({ key: f.key, label: f.label, fb_ad_account_id: f.fb_ad_account_id || null, fb_campaign_ids: f.fb_campaign_ids || [], shared_with: shared });
+    res.json({ key: f.key, label: f.label, fb_ad_account_id: f.fb_ad_account_id || null, fb_campaign_ids: f.fb_campaign_ids || [], split_test: !!f.split_test, shared_with: shared });
 });
 
 // PATCH /api/admin/funnel — edit the CURRENT funnel's label, ad account and
-// campaign scope. Body: { label?, fb_ad_account_id?: string|null, fb_campaign_ids?: [ids]|string }
+// campaign scope, and split-test switch. Body: { label?, fb_ad_account_id?: string|null, fb_campaign_ids?: [ids]|string, split_test?: bool }
 // Changes apply to syncs from now on; use /api/admin/funnel/resync for past days.
 app.patch('/api/admin/funnel', dashboardLimiter, requireAuth, requireAdmin, async (req, res) => {
     try {
@@ -3028,12 +3066,13 @@ app.patch('/api/admin/funnel', dashboardLimiter, requireAuth, requireAdmin, asyn
         const camp = await checkFunnelCampaigns(f.key, acct, body.fb_campaign_ids !== undefined ? body.fb_campaign_ids : (acct === f.fb_ad_account_id ? f.fb_campaign_ids : []));
         if (camp.error) return res.status(400).json({ error: camp.error });
 
-        await runProvisionSQL(`UPDATE public.funnels SET label = ${sqlLit(label)}, fb_ad_account_id = ${acct ? sqlLit(acct) : 'NULL'}, fb_campaign_ids = ${sqlTextArray(camp.ids)} WHERE key = ${sqlLit(f.key)}`);
+        const splitTest = body.split_test !== undefined ? !!body.split_test : !!f.split_test;
+        await runProvisionSQL(`UPDATE public.funnels SET label = ${sqlLit(label)}, fb_ad_account_id = ${acct ? sqlLit(acct) : 'NULL'}, fb_campaign_ids = ${sqlTextArray(camp.ids)}, split_test = ${splitTest} WHERE key = ${sqlLit(f.key)}`);
         const affected = new Set([f.key, ...funnelsOnAccount(f.fb_ad_account_id), ...funnelsOnAccount(acct)]);
         await refreshFunnelConfig(true);
         for (const k of affected) { invalidateMetricsCache(k); invalidateInsightsCache(k); }
         console.log(`✏️  Funnel "${f.key}" settings updated by ${req.user.email}: ${acct || 'no FB'}${camp.ids.length ? ` [${camp.ids.join(',')}]` : ''}`);
-        res.json({ ok: true, key: f.key, label, fb_ad_account_id: acct, fb_account_name: fbName, fb_campaigns: camp.campaigns, affected_funnels: [...affected] });
+        res.json({ ok: true, key: f.key, label, fb_ad_account_id: acct, fb_account_name: fbName, fb_campaigns: camp.campaigns, split_test: splitTest, affected_funnels: [...affected] });
     } catch (err) {
         console.error('❌ PATCH /api/admin/funnel error:', err.message);
         res.status(500).json({ error: err.message });
@@ -3277,30 +3316,46 @@ app.post('/api/admin/backfill-reg-page-visits', requireAuth, requireAdmin, async
     try {
         const funnel = req.funnel;
         const sb = clientFor(funnel);
-        const { data: rows, error } = await sb.from('daily_metrics')
-            .select('date, variant_splits')
-            .not('finalized_at', 'is', null)
-            .is('reg_page_visits', null)
-            .lt('date', dateToISO(getLADate()))
-            .order('date', { ascending: true });
-        if (error) throw error;
-        let started = false, stored = 0;
-        const failed = [];
-        for (const r of rows) {
-            const d = String(r.date).substring(0, 10);
-            const rv = await getRegPageVisits(funnel, [d]);
-            if (!rv) { failed.push(d); continue; }
-            if (!started && !rv[d]) continue; // before tracking began
-            started = true;
-            const c = rv[d] || { all: 0, A: 0, B: 0, undetected: 0 };
-            const vs = { ...(r.variant_splits || {}), reg_page_visits: { A: c.A, B: c.B, undetected: c.undetected } };
-            const { error: uErr } = await sb.from('daily_metrics').update({ reg_page_visits: c.all, variant_splits: vs }).eq('date', d);
-            if (uErr) { failed.push(d); continue; }
-            stored++;
+        if (!Object.keys(await getRegPageVariantMap(funnel)).length) return res.status(400).json({ error: 'No counted pages set for this funnel — add them first' });
+        // recount: the page list changed, so recompute days that already have a stored count.
+        if (req.body?.recount) {
+            const { error: rErr } = await sb.from('daily_metrics').update({ reg_page_visits: null }).not('finalized_at', 'is', null).not('reg_page_visits', 'is', null);
+            if (rErr) throw rErr;
         }
-        invalidateMetricsCache(funnel);
-        console.log(`👣 Backfill reg_page_visits[${funnel}]: ${stored} day(s), ${failed.length} failed, by ${req.user.email}`);
-        res.json({ ok: true, candidates: rows.length, stored, failed });
+        // One day per query (~1 s each), so a full recount can take minutes: with
+        // recount the loop runs in the background and the response returns at once.
+        const run = async () => {
+            const { data: rows, error } = await sb.from('daily_metrics')
+                .select('date, variant_splits')
+                .not('finalized_at', 'is', null)
+                .is('reg_page_visits', null)
+                .lt('date', dateToISO(getLADate()))
+                .order('date', { ascending: true });
+            if (error) throw error;
+            let started = false, stored = 0;
+            const failed = [];
+            for (const r of rows) {
+                const d = String(r.date).substring(0, 10);
+                const rv = await getRegPageVisits(funnel, [d]);
+                if (!rv) { failed.push(d); continue; }
+                if (!started && !rv[d]?.all) continue; // before tracking began
+                started = true;
+                const c = rv[d] || { all: 0, A: 0, B: 0, undetected: 0 };
+                const vs = { ...(r.variant_splits || {}), reg_page_visits: { A: c.A, B: c.B, undetected: c.undetected } };
+                const { error: uErr } = await sb.from('daily_metrics').update({ reg_page_visits: c.all, variant_splits: vs }).eq('date', d);
+                if (uErr) { failed.push(d); continue; }
+                stored++;
+            }
+            invalidateMetricsCache(funnel);
+            console.log(`👣 Backfill reg_page_visits[${funnel}]: ${stored} day(s), ${failed.length} failed, by ${req.user.email}`);
+            return { candidates: rows.length, stored, failed };
+        };
+        if (req.body?.recount) {
+            run().catch(e => console.error(`❌ Recount reg_page_visits[${funnel}] failed:`, e.message));
+            return res.json({ ok: true, started: true, note: 'Recounting in the background — past days fill in over the next few minutes.' });
+        }
+        const r = await run();
+        res.json({ ok: true, ...r });
     } catch (err) {
         console.error('❌ POST /api/admin/backfill-reg-page-visits error:', err.message);
         res.status(500).json({ error: 'Backfill failed', detail: err.message });

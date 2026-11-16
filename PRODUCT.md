@@ -155,10 +155,24 @@ LA date. `events.event_time` is UTC. Live webhook events are stamped at arrival
 (the app convention reads zoneless datetimes as LA; **eboov's CRM exports are
 UTC** — shift accordingly).
 
-**A/B variants** (standard funnels): `metadata.variant` on registrations
-(Stealth-stamped), inherited forward-only to downstream events via email/phone;
-`app_settings` A/B start cutoff; dashboard All/A/B/Undetected toggle;
-`get_variant_funnel` AI tool does the math correctly.
+**A/B variants** (any funnel with `funnels.split_test` on — toggled in Funnel
+settings or at New Funnel; analytics + native are on): `metadata.variant` on
+registrations (webhook `"variant": "A"|"B"`; Stealth-stamped on the main funnel),
+inherited forward-only to downstream events via email/phone; `app_settings` A/B
+start cutoff; dashboard All/A/B/Undetected toggle + A/B settings menu shown only
+when `split_test`; `get_variant_funnel` AI tool does the math correctly.
+
+**Page Views** (`reg_page_visits`): distinct tracked visitors (`contact_id`) per
+LA day who loaded any URL in the funnel's counted-page list (`app_settings`
+`reg_page_variants`, `{url: "A"|"B"|"undetected"}`), read from the shared
+`public.tracking_page_visits` for every funnel, one query per day. Only analytics
+has a built-in default list; other funnels show "—" until pages are added (Funnel
+settings → Edit counted pages). Saving can recount past days in the background
+(`POST /api/admin/backfill-reg-page-visits {recount:true}`). Iframes: list only
+the outer page — a cross-domain iframe gets its own visitor id.
+
+**Startup:** requests naming a funnel the registry hasn't loaded yet wait for it
+(`ensureFunnelKnown`) instead of falling back to analytics; unknown funnels → 400.
 
 ---
 
@@ -179,7 +193,7 @@ UTC** — shift accordingly).
   (`fbCampaignsFor` in `server.js`). So funnels may share one ad account.
   `get_fb_ads` applies the same scope at every level.
 - **Funnel settings** (account menu, admin): edit the current funnel's label,
-  ad account and campaign ids (`GET`/`PATCH /api/admin/funnel`). Campaign ids
+  split-test switch, Page Views counted pages, ad account and campaign ids (`GET`/`PATCH /api/admin/funnel`). Campaign ids
   are checked against Meta (must belong to the account) and can't be claimed
   by two funnels. The New Funnel form also takes campaign ids. The FB cron only
   writes *today*, so after a scope change use **Re-pull spend**

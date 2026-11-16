@@ -114,6 +114,13 @@ const api = {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Failed: ${res.status}`); }
     return res.json();
   },
+  async recountPageViews() {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE}/api/admin/backfill-reg-page-visits`, { method: "POST", headers, body: JSON.stringify({ recount: true }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || data.detail || `Failed: ${res.status}`);
+    return data;
+  },
   async getSalesPages() {
     const headers = await getAuthHeaders();
     const res = await fetch(`${API_BASE}/api/sales-pages`, { headers });
@@ -1047,6 +1054,8 @@ export default function App() {
 
   // In a single-variant view, spend and reg-page clicks (and any custom metric
   // built on them) have no A/B breakdown, so we drop them from the table/cards.
+  const splitOn = !!FUNNEL_META[activeFunnel]?.split_test;
+  useEffect(() => { if (!splitOn) setVariantFilter("all"); }, [activeFunnel, splitOn]);
   const inVariantView = variantFilter !== "all";
   const isHiddenInVariant = (col) => {
     if (!inVariantView) return false;
@@ -1939,7 +1948,7 @@ export default function App() {
                   <button type="button" aria-pressed={viewMode === "list"} style={viewMode === "list" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("list")}><I d="M4 6h16M4 12h16M4 18h16" size={14} /> List</button>
                   <button type="button" aria-pressed={viewMode === "board"} style={viewMode === "board" ? S.listToggleActive : S.listToggleInactive} onClick={() => setViewMode("board")}><I d="M4 4h4v16H4zM10 4h4v16h-4zM16 4h4v16h-4z" size={14} /> Board</button>
                 </div>
-                {(activeFunnel === "native" || activeFunnel === "analytics") && (
+                {splitOn && (
                   <div className="variant-toggle" style={S.listBoardToggle} title="Split test variant filter">
                     {["all", "A", "B", "undetected"].map(v => (
                       <button
@@ -1955,7 +1964,7 @@ export default function App() {
                   </div>
                 )}
                 <div className="overview-utility-actions">
-                  {isAdmin && (activeFunnel === "native" || activeFunnel === "analytics") && (
+                  {isAdmin && splitOn && (
                     <SplitTestSettings start={abTestStart} onStartNow={startAbTestNow} onClear={clearAbTest} onRegPages={() => setRegMapOpen(true)} />
                   )}
                   <button type="button" className="column-editor-trigger" style={S.btnLight} aria-label="Edit columns" title="Edit columns" onClick={() => setColEditorOpen(true)}>
@@ -2369,7 +2378,7 @@ export default function App() {
       {resetLinkOpen && <ResetLinkModal funnel={activeFunnel} onCancel={() => setResetLinkOpen(false)} />}
       {accessOpen && <FunnelAccessModal funnel={activeFunnel} onCancel={() => setAccessOpen(false)} />}
       {newFunnelOpen && <NewFunnelModal funnel={activeFunnel} onCancel={() => setNewFunnelOpen(false)} onCreated={() => { if (session?.access_token) fetchRole(session.access_token); }} />}
-      {settingsOpen && <FunnelSettingsModal funnel={activeFunnel} onCancel={() => setSettingsOpen(false)} onChanged={() => { if (session?.access_token) fetchRole(session.access_token); loadData(); }} />}
+      {settingsOpen && <FunnelSettingsModal funnel={activeFunnel} onCancel={() => setSettingsOpen(false)} onEditPages={() => { setSettingsOpen(false); setRegMapOpen(true); }} onChanged={() => { if (session?.access_token) fetchRole(session.access_token); loadData(); }} />}
       {manageColsOpen && <ManageColumnsModal funnel={activeFunnel} onCancel={() => setManageColsOpen(false)} onChanged={() => { if (session?.access_token) fetchRole(session.access_token); loadData(); }} />}
       {delConfirm && <Modal title="Delete entry" msg={`Remove the entry for ${fmtDateNice(delConfirm)}?`} onCancel={() => setDelConfirm(null)} onConfirm={() => deleteEntry(delConfirm)} />}
       {delCM && <Modal title="Delete custom metric" msg="This will remove the column from your table." onCancel={() => setDelCM(null)} onConfirm={() => deleteCM(delCM)} />}
@@ -2526,29 +2535,37 @@ function RegPageMapModal({ flash, onClose, onSaved }) {
   const dialogRef = useDialogFocus();
   const [rows, setRows] = useState(null); // [{ url, variant }]
   const [isDefault, setIsDefault] = useState(false);
+  const [hasDefault, setHasDefault] = useState(false);
+  const [split, setSplit] = useState(false); // funnel's split-test switch → show the A/B column
+  const [recount, setRecount] = useState(true);
   const [saving, setSaving] = useState(false);
   useEffect(() => {
     api.getRegPageVariants()
-      .then(r => { setRows(Object.entries(r.map || {}).map(([url, variant]) => ({ url, variant }))); setIsDefault(!!r.isDefault); })
+      .then(r => { setRows(Object.entries(r.map || {}).map(([url, variant]) => ({ url, variant }))); setIsDefault(!!r.isDefault); setHasDefault(Object.keys(r.default || {}).length > 0); setSplit(!!r.split_test); })
       .catch(e => { flash(e.message, "err"); setRows([]); });
   }, []);
   const update = (i, k, v) => setRows(rs => rs.map((row, j) => j === i ? { ...row, [k]: v } : row));
-  const add = () => setRows(rs => [...(rs || []), { url: "", variant: "A" }]);
+  const add = () => setRows(rs => [...(rs || []), { url: "", variant: split ? "A" : "undetected" }]);
   const remove = (i) => setRows(rs => rs.filter((_, j) => j !== i));
   const save = async () => {
     const map = {};
     for (const r of (rows || [])) { const u = (r.url || "").trim(); if (u) map[u] = r.variant; }
     setSaving(true);
-    try { await api.setRegPageVariants(map); flash(Object.keys(map).length ? "Reg-page map saved" : "Reverted to default"); onSaved && onSaved(); onClose(); }
+    try {
+      await api.setRegPageVariants(map);
+      let msg = Object.keys(map).length ? "Counted pages saved" : hasDefault ? "Reverted to default" : "Counted pages cleared — Page Views shows —";
+      if (recount && (Object.keys(map).length || hasDefault)) { await api.recountPageViews(); msg += " · past days are recounting in the background"; }
+      flash(msg); onSaved && onSaved(); onClose();
+    }
     catch (e) { flash(e.message, "err"); }
     finally { setSaving(false); }
   };
   return (
     <div className="modal-backdrop" style={S.overlay} onClick={onClose}>
-      <div ref={dialogRef} tabIndex={-1} className="modal-inner structured-dialog" role="dialog" aria-modal="true" aria-label="Registration page variant map" style={{ ...S.modal, maxWidth: 660, width: "92%", textAlign: "left", padding: 0, display: "flex", flexDirection: "column", maxHeight: "85vh" }} onClick={e => e.stopPropagation()}>
+      <div ref={dialogRef} tabIndex={-1} className="modal-inner structured-dialog" role="dialog" aria-modal="true" aria-label="Page Views counted pages" style={{ ...S.modal, maxWidth: 660, width: "92%", textAlign: "left", padding: 0, display: "flex", flexDirection: "column", maxHeight: "85vh" }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--ds-border)" }}>
-          <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0, color: "var(--ds-gray-900)" }}>Registration page variants</h2>
-          <div style={{ fontSize: 13, color: "var(--ds-gray-700)", marginTop: 4 }}>Maps each landing-page URL to its split-test variant for the <strong>Reg Page Visits</strong> metric. Use the full URL with no query string (e.g. <code>https://drshumardworkshop.com/webinar</code>).{isDefault && <span style={{ color: "var(--ds-gray-600)" }}> · currently using the built-in default</span>}</div>
+          <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0, color: "var(--ds-gray-900)" }}>Page Views — counted pages</h2>
+          <div style={{ fontSize: 13, color: "var(--ds-gray-700)", marginTop: 4, lineHeight: 1.5 }}>Page Views = unique visitors per day who loaded any of these pages (one person = one view, however many pages or reloads). Use the full URL with no query string. If a page embeds another in an iframe, list only the outer page.{split && <> The variant column assigns each page to split-test A or B.</>}{isDefault && <span style={{ color: "var(--ds-gray-600)" }}> · currently using the built-in default</span>}</div>
         </div>
         <div style={{ padding: 24, overflowY: "auto", flex: 1 }}>
           {rows === null ? <div style={{ color: "var(--ds-gray-600)" }}>Loading…</div> : (
@@ -2556,18 +2573,19 @@ function RegPageMapModal({ flash, onClose, onSaved }) {
               {rows.map((r, i) => (
                 <div className="repeater-row" key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
                   <input aria-label={`Registration page URL ${i + 1}`} style={{ ...S.inp, flex: 1, minWidth: 0, fontSize: 13 }} placeholder="https://drshumardworkshop.com/webinar" value={r.url} onChange={e => update(i, "url", e.target.value)} />
-                  <select aria-label={`Variant for registration page ${i + 1}`} style={{ ...S.inp, width: 130, fontSize: 13 }} value={r.variant} onChange={e => update(i, "variant", e.target.value)}>
-                    <option value="A">A</option><option value="B">B</option><option value="undetected">Undetected</option>
-                  </select>
+                  {split && <select aria-label={`Variant for registration page ${i + 1}`} style={{ ...S.inp, width: 130, fontSize: 13 }} value={r.variant} onChange={e => update(i, "variant", e.target.value)}>
+                    <option value="A">A</option><option value="B">B</option><option value="undetected">No variant</option>
+                  </select>}
                   <button aria-label={`Remove registration page ${i + 1}`} style={{ ...S.btnGhost, padding: "6px 9px" }} onClick={() => remove(i)} title="Remove">✕</button>
                 </div>
               ))}
               <button style={{ ...S.btnLight, alignSelf: "flex-start", fontSize: 13 }} onClick={add}>+ Add page</button>
-              {rows.length === 0 && <div style={{ fontSize: 12, color: "var(--ds-gray-600)" }}>No pages mapped — saving empty reverts to the default (/webinar→A, /webinar-page→B).</div>}
+              {rows.length === 0 && <div style={{ fontSize: 12, color: "var(--ds-gray-600)" }}>{hasDefault ? "No pages listed — saving empty reverts to the default (/webinar→A, /webinar-page→B)." : "No pages listed — Page Views shows — until you add one."}</div>}
             </div>
           )}
         </div>
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, padding: "16px 24px", borderTop: "1px solid var(--ds-border)" }}>
+        <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, padding: "16px 24px", borderTop: "1px solid var(--ds-border)" }}>
+          <label style={{ marginRight: "auto", display: "flex", alignItems: "center", gap: 7, fontSize: 13, color: "var(--ds-gray-700)", cursor: "pointer" }}><input type="checkbox" checked={recount} onChange={e => setRecount(e.target.checked)} />Recount past days too</label>
           <button style={S.btnGhost} onClick={onClose}>Cancel</button>
           <button style={{ ...S.btnDark, opacity: (saving || rows === null) ? 0.6 : 1 }} disabled={saving || rows === null} onClick={save}>{saving ? "Saving…" : "Save"}</button>
         </div>
@@ -2837,6 +2855,7 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
   const [fbCheck, setFbCheck] = useState(null); // {ok, name} | {ok:false, error}
   const [checkingFb, setCheckingFb] = useState(false);
   const [campaignIds, setCampaignIds] = useState("");
+  const [splitTest, setSplitTest] = useState(false);
   // Standard events are individually selectable; milestones are separate.
   const [stdPicked, setStdPicked] = useState(() => new Set(DEFAULT_EVENTS.map(e => e.column_name)));
   const [milestones, setMilestones] = useState(true);
@@ -2880,7 +2899,7 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
     if (fbId.trim() && !fbCheck?.ok) { setErr("Validate the Facebook ad account first (or clear the field)."); return; }
     setBusy(true);
     try {
-      const r = await api.adminCreateFunnel({ key: key.trim(), label: label.trim(), fb_ad_account_id: fbId.trim() || undefined, fb_campaign_ids: fbId.trim() ? campaignIds : undefined, sources, events, webinar_milestones: milestones }, funnel);
+      const r = await api.adminCreateFunnel({ key: key.trim(), label: label.trim(), fb_ad_account_id: fbId.trim() || undefined, fb_campaign_ids: fbId.trim() ? campaignIds : undefined, sources, events, webinar_milestones: milestones, split_test: splitTest }, funnel);
       setResult(r);
       onCreated?.();
     } catch (ex) { setErr(ex.message); }
@@ -2914,6 +2933,7 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
           <div><code style={hintCode}>POST {window.location.origin}/api/metrics/increment</code> with header <code style={hintCode}>X-API-Key</code> and a JSON body incl. <code style={hintCode}>email</code>, <code style={hintCode}>name</code>, <code style={hintCode}>phone</code>.</div>
           <div style={{ marginTop: 6 }}>{(result.events || []).map(e => <div key={e.column_name}>{e.display_label} → <code style={hintCode}>"field": "{e.column_name}"</code></div>)}</div>
           {result.webinar_milestones && <div>Stay-time → <code style={hintCode}>"field": "stayeduntil", "stayeduntil": 45 | 60 | 80</code></div>}
+          {result.split_test && <div>Split test → add <code style={hintCode}>"variant": "A"</code> or <code style={hintCode}>"B"</code> to registrations (later events inherit it)</div>}
           <div style={{ marginTop: 6 }}>{result.columns.map(c => <div key={c.column_name}>{c.display_label} purchase → <code style={hintCode}>"field": "purchases", "source": "{c.source_label}"</code></div>)}</div>
         </div>
         <button type="button" style={{ ...S.btnDark, width: "100%", justifyContent: "center" }} onClick={onCancel}>Done</button>
@@ -2981,6 +3001,10 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
             </div>
           ))}
           <button type="button" onClick={() => setCustomEvents(cs => [...cs, { event_type: "", display_label: "" }])} style={{ background: "none", border: "none", padding: 0, fontSize: 13, color: "var(--ds-blue-700)", cursor: "pointer", fontWeight: 600 }}>+ Add a custom event</button>
+          <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, color: "var(--ds-gray-800)", cursor: "pointer", marginTop: 10 }}>
+            <input type="checkbox" checked={splitTest} onChange={e => setSplitTest(e.target.checked)} />
+            Split test (A/B) <code style={hintCode}>"variant": "A" | "B"</code>
+          </label>
         </div>
         <div style={{ marginBottom: 6 }}>
           <div style={fieldLabel}>Purchase columns</div>
@@ -3015,25 +3039,28 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
   );
 }
 
-function FunnelSettingsModal({ funnel, onCancel, onChanged }) {
+function FunnelSettingsModal({ funnel, onCancel, onChanged, onEditPages }) {
   useEscapeKey(onCancel);
   const dialogRef = useDialogFocus();
   const [loaded, setLoaded] = useState(null); // settings as stored
   const [label, setLabel] = useState("");
   const [fbId, setFbId] = useState("");
   const [campaignIds, setCampaignIds] = useState("");
+  const [splitTest, setSplitTest] = useState(false);
+  const [pages, setPages] = useState(null); // counted Page Views URLs
   const [since, setSince] = useState("");
   const [err, setErr] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
-  const load = (d) => { setLoaded(d); setLabel(d.label || ""); setFbId(d.fb_ad_account_id || ""); setCampaignIds((d.fb_campaign_ids || []).join(", ")); };
+  const load = (d) => { setLoaded(d); setLabel(d.label || ""); setFbId(d.fb_ad_account_id || ""); setCampaignIds((d.fb_campaign_ids || []).join(", ")); setSplitTest(!!d.split_test); };
   useEffect(() => { api.adminGetFunnel(funnel).then(load).catch(ex => setErr(ex.message)); }, [funnel]);
+  useEffect(() => { api.getRegPageVariants().then(r => setPages(Object.keys(r.map || {}))).catch(() => setPages([])); }, [funnel]);
 
   const save = async (e) => {
     e.preventDefault();
     setErr(""); setNotice(""); setBusy(true);
     try {
-      const r = await api.adminUpdateFunnel({ label: label.trim(), fb_ad_account_id: fbId.trim() || null, fb_campaign_ids: fbId.trim() ? campaignIds : [] }, funnel);
+      const r = await api.adminUpdateFunnel({ label: label.trim(), fb_ad_account_id: fbId.trim() || null, fb_campaign_ids: fbId.trim() ? campaignIds : [], split_test: splitTest }, funnel);
       setNotice(`Saved.${r.fb_ad_account_id ? ` Spend syncs from ${r.fb_account_name || r.fb_ad_account_id}${r.fb_campaigns.length ? ` — campaigns: ${r.fb_campaigns.map(c => `${c.name} (${c.status})`).join(", ")}` : " — whole account"}.` : " No Facebook account linked."} Past days keep their old spend until you re-pull below.`);
       load(await api.adminGetFunnel(funnel));
       onChanged?.();
@@ -3049,13 +3076,13 @@ function FunnelSettingsModal({ funnel, onCancel, onChanged }) {
     } catch (ex) { setErr(ex.message); }
     finally { setBusy(false); }
   };
-  const dirty = loaded && (label.trim() !== (loaded.label || "") || fbId.trim() !== (loaded.fb_ad_account_id || "") || campaignIds.split(/[\s,]+/).filter(Boolean).join(",") !== (loaded.fb_campaign_ids || []).join(","));
+  const dirty = loaded && (splitTest !== !!loaded.split_test || label.trim() !== (loaded.label || "") || fbId.trim() !== (loaded.fb_ad_account_id || "") || campaignIds.split(/[\s,]+/).filter(Boolean).join(",") !== (loaded.fb_campaign_ids || []).join(","));
 
   return (
     <div className="modal-backdrop" style={S.overlay} onClick={onCancel}>
       <form ref={dialogRef} tabIndex={-1} className="modal-inner" role="dialog" aria-modal="true" aria-label="Funnel settings" style={{ ...S.modal, maxWidth: 520, textAlign: "left", maxHeight: "88vh", overflowY: "auto" }} onClick={e => e.stopPropagation()} onSubmit={save}>
         <div style={{ fontSize: 18, fontWeight: 600, color: "var(--ds-gray-900)", marginBottom: 6 }}>Funnel settings — {loaded?.label || FUNNEL_META[funnel]?.label || funnel}</div>
-        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>Name and Facebook spend source for this funnel. Key: <code>{funnel}</code></div>
+        <div style={{ color: "var(--ds-gray-700)", fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>Name, Facebook spend source, Page Views pages and split test for this funnel. Key: <code>{funnel}</code></div>
         {err && <div role="alert" style={{ background: "#FFF7F7", color: "#C00", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 12, border: "1px solid #F5B7B7" }}>{err}</div>}
         {notice && <div role="status" style={{ background: "#F0FDF4", color: "#166534", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 12, border: "1px solid #BBF7D0" }}>{notice}</div>}
         {!loaded ? <div style={{ fontSize: 13, color: "var(--ds-gray-600)", marginBottom: 14 }}>{err ? "" : "Loading…"}</div> : <>
@@ -3077,9 +3104,20 @@ function FunnelSettingsModal({ funnel, onCancel, onChanged }) {
               Shares {loaded.fb_ad_account_id} with: {loaded.shared_with.map(o => `${o.label} (${o.fb_campaign_ids.length ? `campaigns ${o.fb_campaign_ids.join(", ")}` : "everything else"})`).join(" · ")}
             </div>
           )}
+          <div style={{ marginTop: 16 }}>
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 13, color: "var(--ds-gray-800)", cursor: "pointer" }}>
+              <input type="checkbox" checked={splitTest} onChange={e => setSplitTest(e.target.checked)} style={{ marginTop: 2 }} />
+              <span><strong>Split test (A/B)</strong><br /><span style={{ fontSize: 11, color: "var(--ds-gray-600)" }}>Adds the All / A / B / Undetected toggle and the A/B settings menu (start date, which pages are A or B) to the dashboard. Webhooks tag registrations with <code>"variant": "A"</code> or <code>"B"</code>; later events inherit it by email/phone.</span></span>
+            </label>
+          </div>
           <div style={{ display: "flex", gap: 10, margin: "16px 0" }}>
             <button type="button" style={{ ...S.btnLight, flex: 1, justifyContent: "center" }} onClick={onCancel}>Close</button>
             <button type="submit" disabled={busy || !dirty} aria-busy={busy} style={{ ...S.btnDark, flex: 1, justifyContent: "center" }}>{busy ? "Saving…" : "Save"}</button>
+          </div>
+          <div style={{ borderTop: "1px solid var(--ds-border)", padding: "14px 0" }}>
+            <div style={fieldLabel}>Page Views — counted pages</div>
+            <div style={{ fontSize: 12, color: "var(--ds-gray-700)", marginBottom: 8, wordBreak: "break-all" }}>{pages === null ? "Loading…" : pages.length ? pages.join(" · ") : "None yet — Page Views shows — until pages are added."}</div>
+            <button type="button" disabled={dirty} title={dirty ? "Save changes first" : ""} onClick={onEditPages} style={{ ...S.btnLight, padding: "7px 14px", fontSize: 13 }}>Edit counted pages</button>
           </div>
           {loaded.fb_ad_account_id && (
             <div style={{ borderTop: "1px solid var(--ds-border)", paddingTop: 14 }}>
