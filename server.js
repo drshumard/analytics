@@ -2880,7 +2880,7 @@ app.post('/api/admin/funnels', dashboardLimiter, requireAuth, requireAdmin, asyn
         // Event columns: default = the standard webinar stages; custom funnels
         // define their own (e.g. eboov's stages). Column name = the webhook
         // `field` value = the events.event_type.
-        const RESERVED_COLS = new Set(['id', 'date', 'day_of_week', 'fb_spend', 'fb_link_clicks', 'purchases', 'attended', 'overrides', 'variant_splits', 'finalized_at', 'created_at', 'updated_at', 'total_purchases', 'stayeduntil', 'stayed_45', 'stayed_60', 'stayed_80', 'reg_page_visits', 'day', 'email', 'name', 'phone']);
+        const RESERVED_COLS = new Set(['id', 'date', 'day_of_week', 'fb_spend', 'fb_link_clicks', 'purchases', 'overrides', 'variant_splits', 'finalized_at', 'created_at', 'updated_at', 'total_purchases', 'stayeduntil', 'stayed_45', 'stayed_60', 'stayed_80', 'reg_page_visits', 'day', 'email', 'name', 'phone']);
         const eventsIn = (Array.isArray(rawEvents) && rawEvents.length) ? rawEvents : FALLBACK_EVENTS.map(e => ({ event_type: e.column_name, display_label: e.display_label }));
         const seenEv = new Set();
         const events = [];

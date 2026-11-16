@@ -2823,6 +2823,10 @@ function ForgotPasswordModal({ initialEmail, onCancel, onSent }) {
 const inputStyle = { width: "100%", padding: "9px 12px", borderRadius: 8, border: "1px solid var(--ds-border-hover)", fontSize: 13, outline: "none", boxSizing: "border-box" };
 const fieldLabel = { display: "block", fontSize: 12, fontWeight: 600, color: "#333", marginBottom: 5 };
 
+const hintCode = { whiteSpace: "nowrap", fontSize: 11, color: "var(--ds-gray-600)", fontFamily: "monospace", background: "var(--ds-gray-100)", borderRadius: 4, padding: "0 4px" };
+// Mirrors the server's event-name normalisation in POST /api/admin/funnels.
+const slugEvent = (v) => String(v || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
 function NewFunnelModal({ funnel, onCancel, onCreated }) {
   useEscapeKey(onCancel);
   const dialogRef = useDialogFocus();
@@ -2833,9 +2837,18 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
   const [fbCheck, setFbCheck] = useState(null); // {ok, name} | {ok:false, error}
   const [checkingFb, setCheckingFb] = useState(false);
   const [campaignIds, setCampaignIds] = useState("");
-  const [useStandardEvents, setUseStandardEvents] = useState(true);
-  const [customEvents, setCustomEvents] = useState([{ event_type: "", display_label: "" }]);
-  const [picked, setPicked] = useState(() => new Set(FUNNEL_SOURCES.map(s => s.source_label)));
+  // Standard events are individually selectable; milestones are separate.
+  const [stdPicked, setStdPicked] = useState(() => new Set(DEFAULT_EVENTS.map(e => e.column_name)));
+  const [milestones, setMilestones] = useState(true);
+  const [customEvents, setCustomEvents] = useState([]);
+  // Every purchase column known anywhere (defaults + every funnel's own), so the
+  // list doesn't depend on which funnel is open.
+  const catalog = useMemo(() => {
+    const seen = new Map();
+    for (const s of [...DEFAULT_SOURCES, ...Object.values(FUNNEL_META).flatMap(m => m.sources || [])]) if (!seen.has(s.source_label)) seen.set(s.source_label, s);
+    return [...seen.values()];
+  }, []);
+  const [picked, setPicked] = useState(() => new Set(["Paid Ads"]));
   const [customs, setCustoms] = useState([]); // [{source_label, display_label}]
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -2855,18 +2868,19 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
     e.preventDefault();
     setErr("");
     const sources = [
-      ...FUNNEL_SOURCES.filter(s => picked.has(s.source_label)).map(s => ({ source_label: s.source_label, display_label: s.display_label })),
+      ...catalog.filter(s => picked.has(s.source_label)).map(s => ({ source_label: s.source_label, display_label: s.display_label })),
       ...customs.filter(c => c.source_label.trim()).map(c => ({ source_label: c.source_label.trim(), display_label: (c.display_label || "").trim() || c.source_label.trim() })),
     ];
     if (!sources.length) { setErr("Pick or add at least one purchase source."); return; }
-    const events = useStandardEvents ? undefined : customEvents
-      .filter(e => e.event_type.trim())
-      .map(e => ({ event_type: e.event_type.trim(), display_label: (e.display_label || "").trim() || e.event_type.trim() }));
-    if (!useStandardEvents && (!events || !events.length)) { setErr("Define at least one event, or use the standard webinar stages."); return; }
+    const events = [
+      ...DEFAULT_EVENTS.filter(e => stdPicked.has(e.column_name)).map(e => ({ event_type: e.column_name, display_label: e.display_label })),
+      ...customEvents.filter(e => e.event_type.trim()).map(e => ({ event_type: e.event_type.trim(), display_label: (e.display_label || "").trim() || e.event_type.trim() })),
+    ];
+    if (!events.length) { setErr("Pick or add at least one event."); return; }
     if (fbId.trim() && !fbCheck?.ok) { setErr("Validate the Facebook ad account first (or clear the field)."); return; }
     setBusy(true);
     try {
-      const r = await api.adminCreateFunnel({ key: key.trim(), label: label.trim(), fb_ad_account_id: fbId.trim() || undefined, fb_campaign_ids: fbId.trim() ? campaignIds : undefined, sources, events, webinar_milestones: useStandardEvents }, funnel);
+      const r = await api.adminCreateFunnel({ key: key.trim(), label: label.trim(), fb_ad_account_id: fbId.trim() || undefined, fb_campaign_ids: fbId.trim() ? campaignIds : undefined, sources, events, webinar_milestones: milestones }, funnel);
       setResult(r);
       onCreated?.();
     } catch (ex) { setErr(ex.message); }
@@ -2895,7 +2909,13 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
           <div style={{ fontSize: 12, fontFamily: "monospace", wordBreak: "break-all", userSelect: "all", marginBottom: 8 }}>{result.webhook_api_key}</div>
           <button type="button" onClick={copyKey} style={{ ...S.btnDark, padding: "7px 14px", fontSize: 13 }}>{copied ? "Copied ✓" : "Copy key"}</button>
         </div>
-        <div style={{ fontSize: 12, color: "var(--ds-gray-600)", marginBottom: 16 }}>Point the funnel's n8n/webhooks at /api/metrics/increment with this key in X-API-Key — events route to the new funnel automatically.</div>
+        <div style={{ border: "1px solid var(--ds-border)", borderRadius: 8, padding: "10px 12px", marginBottom: 16, fontSize: 12, color: "var(--ds-gray-800)", lineHeight: 1.6 }}>
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>Webhook setup</div>
+          <div><code style={hintCode}>POST {window.location.origin}/api/metrics/increment</code> with header <code style={hintCode}>X-API-Key</code> and a JSON body incl. <code style={hintCode}>email</code>, <code style={hintCode}>name</code>, <code style={hintCode}>phone</code>.</div>
+          <div style={{ marginTop: 6 }}>{(result.events || []).map(e => <div key={e.column_name}>{e.display_label} → <code style={hintCode}>"field": "{e.column_name}"</code></div>)}</div>
+          {result.webinar_milestones && <div>Stay-time → <code style={hintCode}>"field": "stayeduntil", "stayeduntil": 45 | 60 | 80</code></div>}
+          <div style={{ marginTop: 6 }}>{result.columns.map(c => <div key={c.column_name}>{c.display_label} purchase → <code style={hintCode}>"field": "purchases", "source": "{c.source_label}"</code></div>)}</div>
+        </div>
         <button type="button" style={{ ...S.btnDark, width: "100%", justifyContent: "center" }} onClick={onCancel}>Done</button>
       </div>
     </div>
@@ -2937,39 +2957,50 @@ function NewFunnelModal({ funnel, onCancel, onCreated }) {
         </div>
         <div style={{ marginBottom: 14 }}>
           <div style={fieldLabel}>Funnel events</div>
-          <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, color: "var(--ds-gray-800)", cursor: "pointer", marginBottom: 6 }}>
-            <input type="checkbox" checked={useStandardEvents} onChange={e => setUseStandardEvents(e.target.checked)} />
-            Standard webinar stages ({DEFAULT_EVENTS.map(e => e.display_label).join(", ")}) + stay-time milestones
-          </label>
-          {!useStandardEvents && (
-            <div>
-              <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginBottom: 6 }}>Define this funnel's own events. The event name is what webhooks send as <code>field</code> and becomes the column name (lowercase/underscores).</div>
-              {customEvents.map((e, i) => (
-                <div key={i} style={{ display: "flex", gap: 8, marginBottom: 6 }}>
-                  <input value={e.event_type} onChange={ev => setCustomEvents(cs => cs.map((x, j) => j === i ? { ...x, event_type: ev.target.value } : x))} placeholder='Event name (e.g. "leads")' style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }} />
-                  <input value={e.display_label} onChange={ev => setCustomEvents(cs => cs.map((x, j) => j === i ? { ...x, display_label: ev.target.value } : x))} placeholder="Column label (optional)" style={{ ...inputStyle, flex: 1 }} />
-                  <button type="button" aria-label="Remove event" onClick={() => setCustomEvents(cs => cs.filter((_, j) => j !== i))} style={{ ...S.btnLight, padding: "0 10px" }}>✕</button>
-                </div>
-              ))}
-              <button type="button" onClick={() => setCustomEvents(cs => [...cs, { event_type: "", display_label: "" }])} style={{ background: "none", border: "none", padding: 0, fontSize: 13, color: "var(--ds-blue-700)", cursor: "pointer", fontWeight: 600 }}>+ Add an event</button>
+          <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginBottom: 6 }}>Each event becomes a dashboard column. Webhooks send the grey <code>field</code> value.</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px", marginBottom: 6 }}>
+            {DEFAULT_EVENTS.map(e => (
+              <label key={e.column_name} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, color: "var(--ds-gray-800)", cursor: "pointer" }}>
+                <input type="checkbox" checked={stdPicked.has(e.column_name)} onChange={ev => setStdPicked(p => { const n = new Set(p); ev.target.checked ? n.add(e.column_name) : n.delete(e.column_name); return n; })} />
+                {e.display_label} <code style={hintCode}>field: {e.column_name}</code>
+              </label>
+            ))}
+            <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, color: "var(--ds-gray-800)", cursor: "pointer" }}>
+              <input type="checkbox" checked={milestones} onChange={e => setMilestones(e.target.checked)} />
+              Stay-time 45/60/80 min <code style={hintCode}>field: stayeduntil</code>
+            </label>
+          </div>
+          {customEvents.map((e, i) => (
+            <div key={i} style={{ marginBottom: 6 }}>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input value={e.event_type} aria-label="Event name" onChange={ev => setCustomEvents(cs => cs.map((x, j) => j === i ? { ...x, event_type: ev.target.value } : x))} placeholder='Event name (e.g. "leads")' style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }} />
+                <input value={e.display_label} aria-label="Column label" onChange={ev => setCustomEvents(cs => cs.map((x, j) => j === i ? { ...x, display_label: ev.target.value } : x))} placeholder="Column label (optional)" style={{ ...inputStyle, flex: 1 }} />
+                <button type="button" aria-label="Remove event" onClick={() => setCustomEvents(cs => cs.filter((_, j) => j !== i))} style={{ ...S.btnLight, padding: "0 10px" }}>✕</button>
+              </div>
+              {slugEvent(e.event_type) && <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginTop: 3 }}>Webhooks send <code style={hintCode}>field: {slugEvent(e.event_type)}</code></div>}
             </div>
-          )}
+          ))}
+          <button type="button" onClick={() => setCustomEvents(cs => [...cs, { event_type: "", display_label: "" }])} style={{ background: "none", border: "none", padding: 0, fontSize: 13, color: "var(--ds-blue-700)", cursor: "pointer", fontWeight: 600 }}>+ Add a custom event</button>
         </div>
         <div style={{ marginBottom: 6 }}>
           <div style={fieldLabel}>Purchase columns</div>
+          <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginBottom: 6 }}>Purchases are sent with <code>field: purchases</code>; the grey <code>source</code> value picks the column (unknown sources count as FB Purchases).</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px", marginBottom: 8 }}>
-            {FUNNEL_SOURCES.map(s => (
+            {catalog.map(s => (
               <label key={s.source_label} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, color: "var(--ds-gray-800)", cursor: "pointer" }}>
                 <input type="checkbox" checked={picked.has(s.source_label)} onChange={e => setPicked(p => { const n = new Set(p); e.target.checked ? n.add(s.source_label) : n.delete(s.source_label); return n; })} />
-                {s.display_label} <span style={{ color: "var(--ds-gray-500)", fontSize: 11 }}>({s.source_label})</span>
+                {s.display_label} <code style={hintCode}>source: {s.source_label}</code>
               </label>
             ))}
           </div>
           {customs.map((c, i) => (
-            <div key={i} style={{ display: "flex", gap: 8, marginBottom: 6 }}>
-              <input value={c.source_label} onChange={e => setCustoms(cs => cs.map((x, j) => j === i ? { ...x, source_label: e.target.value } : x))} placeholder='Webhook source (e.g. "TikTok")' style={{ ...inputStyle, flex: 1 }} />
-              <input value={c.display_label} onChange={e => setCustoms(cs => cs.map((x, j) => j === i ? { ...x, display_label: e.target.value } : x))} placeholder="Column label (optional)" style={{ ...inputStyle, flex: 1 }} />
-              <button type="button" aria-label="Remove source" onClick={() => setCustoms(cs => cs.filter((_, j) => j !== i))} style={{ ...S.btnLight, padding: "0 10px" }}>✕</button>
+            <div key={i} style={{ marginBottom: 6 }}>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input value={c.source_label} aria-label="Webhook source" onChange={e => setCustoms(cs => cs.map((x, j) => j === i ? { ...x, source_label: e.target.value } : x))} placeholder='Webhook source (e.g. "TikTok")' style={{ ...inputStyle, flex: 1 }} />
+                <input value={c.display_label} aria-label="Column label" onChange={e => setCustoms(cs => cs.map((x, j) => j === i ? { ...x, display_label: e.target.value } : x))} placeholder="Column label (optional)" style={{ ...inputStyle, flex: 1 }} />
+                <button type="button" aria-label="Remove source" onClick={() => setCustoms(cs => cs.filter((_, j) => j !== i))} style={{ ...S.btnLight, padding: "0 10px" }}>✕</button>
+              </div>
+              {c.source_label.trim() && <div style={{ fontSize: 11, color: "var(--ds-gray-600)", marginTop: 3 }}>Webhooks send <code style={hintCode}>field: purchases</code> + <code style={hintCode}>source: {c.source_label.trim()}</code></div>}
             </div>
           ))}
           <button type="button" onClick={() => setCustoms(cs => [...cs, { source_label: "", display_label: "" }])} style={{ background: "none", border: "none", padding: 0, fontSize: 13, color: "var(--ds-blue-700)", cursor: "pointer", fontWeight: 600 }}>+ Add a new source</button>
