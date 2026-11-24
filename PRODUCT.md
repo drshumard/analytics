@@ -157,10 +157,39 @@ UTC** — shift accordingly).
 
 **A/B variants** (any funnel with `funnels.split_test` on — toggled in Funnel
 settings or at New Funnel; analytics + native are on): `metadata.variant` on
-registrations (webhook `"variant": "A"|"B"`; Stealth-stamped on the main funnel),
+registrations (webhook `"variant": "A"|"B"|"C"`; Stealth-stamped on the main funnel),
 inherited forward-only to downstream events via email/phone; `app_settings` A/B
-start cutoff; dashboard All/A/B/Undetected toggle + A/B settings menu shown only
+start cutoff; dashboard All/A/B/(C)/Undetected toggle + A/B settings menu shown only
 when `split_test`; `get_variant_funnel` AI tool does the math correctly.
+**A letter means one page, permanently** (`VARIANTS` in `server.js`) — a new page
+gets the next letter, never a reused one, so history keeps its meaning. Main
+funnel: A = `/webinar`, B = `/webinar-page` (GHL split test 2026-06-03 → 2026-11-23),
+C = `/registration` (own campaign since 2026-11-23 ~17:35 UTC; the first 19 events
+were re-stamped B→C from pageviews, marker `metadata.variant_fixed_from`). The C
+toggle appears once a funnel has C data.
+
+**Per-variant ad spend:** when each variant runs under its own campaigns,
+`app_settings` key `campaign_variants` = `{ "since": "YYYY-MM-DD", "map":
+{ "<campaign id>": "A"|"B"|"C" } }` (set via SQL — no UI yet). Every spend sync
+then also stores each mapped variant's spend + link clicks for dates ≥ `since`
+in `variant_splits.fb_spend` / `.fb_link_clicks` (`syncVariantSpend`). In a
+variant view the spend columns show on those days ("—" elsewhere, with a divider
+row where the split starts); spend-based summary cards are computed over the
+split days only and say so ("since Nov 25 · 3 of 30 days"); a variant with no
+split days (e.g. B) hides them. Backfill a day with
+Recalculate spend (`POST /api/refresh-date`). Main funnel: split runs from
+2026-11-24 (lookalike → A, `1 | 02/13` → C). 2026-11-23 carries a hand-set C
+value ($477.47 / 289 clicks = that campaign's hourly spend after its ~9:35 AM LA
+switch to `/registration`) and a hand-set A value ($3,647.05 / 3,965 clicks =
+the lookalike campaign's whole day, at Raymond's request — its morning traffic
+was still split across A and B); the sync never rewrites days before `since`.
+
+**Mistake window 2026-11-23 21:20 → 2026-11-24 11:45 UTC:** the GHL split was
+turned off to `/webinar-page` instead of `/webinar`. Because the test is now
+measured by campaign, that traffic counts as A: 43 events (19 registrations)
+re-stamped B→A (`variant_fixed_from`), and page views via `app_settings`
+`reg_page_variant_overrides` = `[{ url, variant, from, to }]` — time-boxed
+exceptions to the page → variant map, applied in `getRegPageVisits`.
 
 **Page Views** (`reg_page_visits`): distinct tracked visitors (`contact_id`) per
 LA day who loaded any URL in the funnel's counted-page list (`app_settings`

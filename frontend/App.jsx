@@ -3,7 +3,7 @@
 // Connects to Express API. No window.storage.
 // ============================================================================
 
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { Fragment, useState, useEffect, useCallback, useMemo, useRef } from "react";
 import DatePicker from "react-datepicker";
 import "react-datepicker/dist/react-datepicker.css";
 import { parse, startOfDay, endOfDay, subDays, startOfMonth, endOfMonth } from "date-fns";
@@ -1057,20 +1057,24 @@ export default function App() {
   const splitOn = !!FUNNEL_META[activeFunnel]?.split_test;
   useEffect(() => { if (!splitOn) setVariantFilter("all"); }, [activeFunnel, splitOn]);
   const inVariantView = variantFilter !== "all";
+  // Exception: days where campaigns are mapped to variants carry that variant's own
+  // spend (a variant row's fb_spend is null on every other day — e.g. while one
+  // campaign fed both pages). Table columns show when any day has it ("—" on days
+  // without, plus a divider row where it starts). Spend-based cards are computed
+  // over the split days only and say so, so a total never mixes split and unsplit days.
+  const noVariantSpend = (row) => inVariantView && row.fb_spend == null;
+  const cardUsesSpend = (card) => String(card.key).startsWith("cm:")
+    ? formulaUsesUnsplittable(customs.find(c => `cm:${c.id}` === card.key)?.formula)
+    : UNSPLITTABLE_FIELDS.includes(card.key);
+  // Rows a summary card is computed over.
+  const cardRows = (card) => inVariantView && cardUsesSpend(card) ? effectiveRows.filter(r => r.fb_spend != null) : effectiveRows;
   const isHiddenInVariant = (col) => {
-    if (!inVariantView) return false;
+    if (!inVariantView || tableRows.some(r => r.fb_spend != null)) return false;
     if (col.type === "base") return UNSPLITTABLE_FIELDS.includes(col.key);
     if (col.type === "custom") return formulaUsesUnsplittable(col.cm?.formula);
     return false;
   };
-  const cardHiddenInVariant = (card) => {
-    if (!inVariantView) return false;
-    if (String(card.key).startsWith("cm:")) {
-      const cm = customs.find(c => `cm:${c.id}` === card.key);
-      return formulaUsesUnsplittable(cm?.formula);
-    }
-    return UNSPLITTABLE_FIELDS.includes(card.key);
-  };
+  const cardHiddenInVariant = (card) => inVariantView && cardUsesSpend(card) && cardRows(card).length === 0;
 
   // ─── Column ordering ────────────────────────────────────────────
   const [colOrder, setColOrder] = useState(null);
@@ -1533,6 +1537,8 @@ export default function App() {
   // tableRows = rows matching the search box only. The table always shows
   // the full list so users can pick any day regardless of the card filter.
   const tableRows = filtered;
+  // Oldest day with per-variant spend in the current variant view (rows are newest-first).
+  const spendStart = inVariantView ? [...tableRows].reverse().find(r => r.fb_spend != null)?.date : null;
 
   // displayRows = search + date filter. Drives summary cards / totals when
   // no rows are explicitly selected.
@@ -1613,10 +1619,11 @@ export default function App() {
   };
 
   const getSummaryCardVal = (card) => {
-    if (effectiveRows.length === 0) return formatSummaryVal(0, card.format);
-    const values = effectiveRows.map(row => getSummaryRowValue(card, row, customs));
+    const rows = cardRows(card);
+    if (rows.length === 0) return formatSummaryVal(0, card.format);
+    const values = rows.map(row => getSummaryRowValue(card, row, customs));
     const sum = values.reduce((total, value) => total + value, 0);
-    const raw = card.agg === "avg" ? sum / effectiveRows.length : sum;
+    const raw = card.agg === "avg" ? sum / rows.length : sum;
     return formatSummaryVal(Math.round(raw * 100) / 100, card.format);
   };
 
@@ -1895,13 +1902,16 @@ export default function App() {
 
             <div className="summary-strip" style={{ ...S.strip, position: "relative" }}>
               {summaryCards.filter(c => !cardHiddenInVariant(c)).map((c, i) => {
-                const pct = selectedDates.size > 0 ? null : pctChange(c);
+                const rows = cardRows(c);
+                const partial = rows.length < effectiveRows.length; // spend card limited to the split days
+                const pct = selectedDates.size > 0 || partial ? null : pctChange(c);
                 const chartAccent = SUMMARY_CHART_COLORS[i % SUMMARY_CHART_COLORS.length];
                 return (
                   <div key={`${c.key}-${i}`} className="summary-card" style={S.stripCell}>
                     <div style={S.stripLabel}>
                       {c.label}
                       {c.agg === "avg" && <span style={{ fontSize: 10, color: "var(--ds-gray-600)", fontWeight: 400, marginLeft: 4 }}>(avg)</span>}
+                      {partial && <span title={`Variant ${variantFilter} only has its own ad spend on ${rows.length} of the ${effectiveRows.length} days in this period, so this card covers just those days.`} style={{ fontSize: 10, color: "var(--ds-amber-700, #A35200)", fontWeight: 500, display: "block", whiteSpace: "nowrap" }}>since {fmtDateNice(rows[rows.length - 1].date)}<br />{rows.length} of {effectiveRows.length} days</span>}
                     </div>
                     <div className="strip-val-row" style={S.stripValRow}>
                       <span style={S.stripVal}>{getSummaryCardVal(c)}</span>
@@ -1914,7 +1924,7 @@ export default function App() {
                     </div>
                     <SummarySparkline
                       card={c}
-                      rows={effectiveRows}
+                      rows={rows}
                       customs={customs}
                       accent={chartAccent}
                       gradientId={`summary-gradient-${i}`}
@@ -1950,7 +1960,7 @@ export default function App() {
                 </div>
                 {splitOn && (
                   <div className="variant-toggle" style={S.listBoardToggle} title="Split test variant filter">
-                    {["all", "A", "B", "undetected"].map(v => (
+                    {["all", "A", "B", ...(metrics.some(m => m.variants?.C && (m.variants.C.registrations > 0 || m.variants.C.reg_page_visits > 0)) ? ["C"] : []), "undetected"].map(v => (
                       <button
                         type="button"
                         key={v}
@@ -2049,8 +2059,8 @@ export default function App() {
                       const isSelected = selectedDates.has(row.date);
                       const ctx = evalAllCustoms(customs, row);
                       return (
+                        <Fragment key={row.date}>
                         <tr
-                          key={row.date}
                           className={`trow${isSelected ? " selected" : ""}`}
                           tabIndex={0}
                           aria-selected={isSelected}
@@ -2066,11 +2076,11 @@ export default function App() {
                           <td className="sticky-col sticky-col-2" style={{ ...S.td, whiteSpace: "nowrap", minWidth: 90 }}><span style={{ color: "var(--ds-gray-900)", fontWeight: 500, fontSize: 14 }}>{fmtDateNice(row.date)}</span></td>
                           {orderedCols.filter(c => (c.type === "base" ? isColVisible(c.key) : true) && !isHiddenInVariant(c)).map(c => {
                             if (c.type === "custom") {
-                              return <td key={c.key} style={{ ...S.tdNum, color: "var(--ds-green-600)", fontWeight: 600 }}>{fmtVal(ctx[c.cm.name], c.cm.format)}</td>;
+                              return <td key={c.key} style={{ ...S.tdNum, color: "var(--ds-green-600)", fontWeight: 600 }}>{fmtVal(noVariantSpend(row) && formulaUsesUnsplittable(c.cm.formula) ? null : ctx[c.cm.name], c.cm.format)}</td>;
                             }
                             if (c.key === "total_purchases") return <td key={c.key} style={S.tdNum}><span style={S.purchBadge}>{(Number(row.total_purchases) || 0).toLocaleString()}</span></td>;
-                            if (c.key === "fb_spend") return <td key={c.key} style={S.tdMoney}>{"$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>;
-                            return <td key={c.key} style={S.tdNum}>{c.key === "reg_page_visits" && row[c.key] == null ? "\u2014" : (Number(row[c.key]) || 0).toLocaleString()}</td>;
+                            if (c.key === "fb_spend") return <td key={c.key} style={S.tdMoney}>{noVariantSpend(row) ? "\u2014" : "$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</td>;
+                            return <td key={c.key} style={S.tdNum}>{(c.key === "reg_page_visits" || (c.key === "fb_link_clicks" && inVariantView)) && row[c.key] == null ? "\u2014" : (Number(row[c.key]) || 0).toLocaleString()}</td>;
                           })}
                           <td style={S.td} onClick={(e) => e.stopPropagation()}>
                             <div style={{ display: "flex", gap: 2, justifyContent: "center" }}>
@@ -2081,6 +2091,12 @@ export default function App() {
                             </div>
                           </td>
                         </tr>
+                        {row.date === spendStart && row !== tableRows[tableRows.length - 1] && (
+                          <tr aria-hidden="true"><td colSpan={99} style={{ padding: "6px 0", fontSize: 12, fontWeight: 500, color: "#A35200", background: "#FFF8EB", borderTop: "1px solid #F5D9A8", borderBottom: "1px solid #F5D9A8" }}>
+                            <div style={{ position: "sticky", left: 0, width: "100cqw", boxSizing: "border-box", padding: "0 14px", textAlign: "center" }}>▲ Variant {variantFilter} has its own ad spend from {fmtDateNice(row.date)}. Earlier days ran more than one page from the same campaigns, so spend can't be split by variant.</div>
+                          </td></tr>
+                        )}
+                        </Fragment>
                       );
                     })}
                   </tbody>
@@ -2118,11 +2134,11 @@ export default function App() {
                       <div style={S.boardCardBody}>
                         {orderedCols.filter(c => (c.type === "base" ? isColVisible(c.key) : true) && !isHiddenInVariant(c)).map(c => {
                           if (c.type === "custom") {
-                            return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={{ ...S.bcVal, color: "var(--ds-green-600)" }}>{fmtVal(boardCtx[c.cm.name], c.cm.format)}</span></div>;
+                            return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={{ ...S.bcVal, color: "var(--ds-green-600)" }}>{fmtVal(noVariantSpend(row) && formulaUsesUnsplittable(c.cm.formula) ? null : boardCtx[c.cm.name], c.cm.format)}</span></div>;
                           }
-                          if (c.key === "fb_spend") return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{"$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</span></div>;
+                          if (c.key === "fb_spend") return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{noVariantSpend(row) ? "\u2014" : "$" + (Number(row.fb_spend) || 0).toLocaleString("en-US", { minimumFractionDigits: 2 })}</span></div>;
                           if (c.key === "total_purchases") return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.purchBadge}>{(Number(row.total_purchases) || 0).toLocaleString()}</span></div>;
-                          return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{c.key === "reg_page_visits" && row[c.key] == null ? "\u2014" : (Number(row[c.key]) || 0).toLocaleString()}</span></div>;
+                          return <div key={c.key} style={S.bcItem}><span style={S.bcLabel}>{c.label}</span><span style={S.bcVal}>{(c.key === "reg_page_visits" || (c.key === "fb_link_clicks" && inVariantView)) && row[c.key] == null ? "\u2014" : (Number(row[c.key]) || 0).toLocaleString()}</span></div>;
                         })}
                       </div>
                       <div style={S.boardCardActions} onClick={(e) => e.stopPropagation()}>
@@ -2574,7 +2590,7 @@ function RegPageMapModal({ flash, onClose, onSaved }) {
                 <div className="repeater-row" key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
                   <input aria-label={`Registration page URL ${i + 1}`} style={{ ...S.inp, flex: 1, minWidth: 0, fontSize: 13 }} placeholder="https://drshumardworkshop.com/webinar" value={r.url} onChange={e => update(i, "url", e.target.value)} />
                   {split && <select aria-label={`Variant for registration page ${i + 1}`} style={{ ...S.inp, width: 130, fontSize: 13 }} value={r.variant} onChange={e => update(i, "variant", e.target.value)}>
-                    <option value="A">A</option><option value="B">B</option><option value="undetected">No variant</option>
+                    <option value="A">A</option><option value="B">B</option><option value="C">C</option><option value="undetected">No variant</option>
                   </select>}
                   <button aria-label={`Remove registration page ${i + 1}`} style={{ ...S.btnGhost, padding: "6px 9px" }} onClick={() => remove(i)} title="Remove">✕</button>
                 </div>
@@ -4425,6 +4441,7 @@ function QueryBuilder({ flash }) {
                 <option value="">All</option>
                 <option value="A">A</option>
                 <option value="B">B</option>
+                <option value="C">C</option>
                 <option value="undetected">Undetected</option>
               </select>
             </div>
@@ -5777,7 +5794,7 @@ const S = {
   listToggleInactive: { background: "transparent", padding: "6px 12px", borderRadius: 6, fontSize: 13, fontWeight: 500, color: "var(--ds-gray-700)", display: "flex", alignItems: "center", gap: 6, cursor: "pointer", whiteSpace: "nowrap" },
   searchWrap: { display: "flex", alignItems: "center", gap: 8, padding: "8px 11px", minHeight: 36, background: "var(--ds-background-100)", border: "1px solid var(--ds-border)", borderRadius: 8, width: 260, boxShadow: "var(--ds-shadow-small)" },
   searchInput: { border: "none", outline: "none", background: "transparent", fontFamily: fn, fontSize: 13, color: "var(--ds-gray-900)", width: "100%", fontWeight: 400 },
-  tableWrap: { background: "var(--ds-background-100)", border: "1px solid var(--ds-border)", overflowX: "auto", boxShadow: "var(--ds-shadow-small)", width: "100%", maxWidth: "100%", borderRadius: 12 },
+  tableWrap: { background: "var(--ds-background-100)", border: "1px solid var(--ds-border)", overflowX: "auto", containerType: "inline-size", boxShadow: "var(--ds-shadow-small)", width: "100%", maxWidth: "100%", borderRadius: 12 },
   table: { width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 900 },
   th: { padding: "11px 14px", textAlign: "center", verticalAlign: "middle", fontSize: 12, fontWeight: 550, color: "var(--ds-gray-700)", textTransform: "none", borderBottom: "1px solid var(--ds-border)", background: "var(--ds-background-200)", whiteSpace: "normal", lineHeight: 1.35 },
   td: { padding: "11px 14px", borderBottom: "1px solid var(--ds-border)", verticalAlign: "middle", textAlign: "center" },

@@ -289,6 +289,47 @@ async function getAbTestStart(funnel) {
     return b.abTestStart;
 }
 
+// Per-variant ad spend. When each split-test variant runs under its own campaigns, the
+// funnel's app_settings key 'campaign_variants' maps them:
+//   { "since": "YYYY-MM-DD", "map": { "<campaign id>": "A"|"B"|"C" } }
+// For dates >= since, each mapped variant's spend + link clicks are stored in that day's
+// variant_splits (keys fb_spend / fb_link_clicks) so the variant views can show spend.
+// Unmapped funnels and earlier dates are untouched (spend stays unsplit, shown "—").
+// Best-effort: never throws, so it can't break the main spend sync it runs after.
+async function syncVariantSpend(funnel, isoDate) {
+    try {
+        const sb = clientFor(funnel);
+        const { data: cfg } = await sb.from('app_settings').select('value').eq('key', 'campaign_variants').maybeSingle();
+        const map = cfg?.value?.map || {};
+        const ids = Object.keys(map).filter(id => isVariant(map[id]));
+        if (!ids.length || !cfg.value.since || isoDate < cfg.value.since) return;
+        const url = new URL(`https://graph.facebook.com/${process.env.FB_API_VERSION || 'v23.0'}/${fbAccountFor(funnel)}/insights`);
+        url.searchParams.set('access_token', process.env.FB_ACCESS_TOKEN);
+        url.searchParams.set('level', 'campaign');
+        url.searchParams.set('fields', 'campaign_id,spend,inline_link_clicks');
+        url.searchParams.set('time_range', JSON.stringify({ since: isoDate, until: isoDate }));
+        url.searchParams.set('filtering', JSON.stringify([{ field: 'campaign.id', operator: 'IN', value: ids }]));
+        url.searchParams.set('limit', '500');
+        const r = await fetch(url.toString());
+        const json = await r.json();
+        if (!r.ok) throw new Error(json?.error?.message || `HTTP ${r.status}`);
+        const spend = {}, clicks = {};
+        for (const id of ids) { spend[map[id]] = 0; clicks[map[id]] = 0; } // mapped variants show 0, not "—"
+        for (const row of json.data || []) {
+            const v = map[row.campaign_id];
+            spend[v] += parseFloat(row.spend) || 0;
+            clicks[v] += parseInt(row.inline_link_clicks) || 0;
+        }
+        for (const v of Object.keys(spend)) spend[v] = Math.round(spend[v] * 100) / 100;
+        const { data: row } = await sb.from('daily_metrics').select('variant_splits').eq('date', isoDate).maybeSingle();
+        const { error } = await sb.from('daily_metrics')
+            .update({ variant_splits: { ...(row?.variant_splits || {}), fb_spend: spend, fb_link_clicks: clicks } }).eq('date', isoDate);
+        if (error) throw error;
+    } catch (err) {
+        console.warn(`⚠️ variant spend sync failed [${funnel} ${isoDate}]:`, err.message);
+    }
+}
+
 // Manual identity links for a funnel: { aliasEmailLower -> canonicalEmailLower }. Lets
 // an admin attribute a sale that arrived under a different email to the right
 // registrant (so it counts in the correct variant). Cached on the bucket; cleared when
@@ -551,7 +592,18 @@ async function getRegPageVisits(funnel, dates) {
     // other counted page (e.g. /register='undetected') → NULL. NULL = counts in 'all',
     // bucketed undetected.
     const cutoffGate = cutoffIso ? `WHEN timestamp < '${cutoffIso}'::timestamptz THEN NULL ` : '';
-    const variantCase = urls.filter(u => map[u] === 'A' || map[u] === 'B')
+    // Time-boxed exceptions to the page → variant map (app_settings key
+    // 'reg_page_variant_overrides': [{ url, variant, from, to }], ISO times): visits to
+    // `url` inside [from, to) count as `variant` instead — e.g. a window where a campaign
+    // was pointed at the wrong page. Checked before the normal map.
+    let overrides = [];
+    try {
+        const { data } = await clientFor(funnel).from('app_settings').select('value').eq('key', 'reg_page_variant_overrides').maybeSingle();
+        if (Array.isArray(data?.value)) overrides = data.value.filter(o => urls.includes(o.url) && isVariant(o.variant) && !isNaN(Date.parse(o.from)) && !isNaN(Date.parse(o.to)));
+    } catch { /* no overrides */ }
+    const overrideCase = overrides
+        .map(o => `WHEN split_part(current_url,'?',1) = '${esc(o.url)}' AND timestamp >= '${new Date(o.from).toISOString()}'::timestamptz AND timestamp < '${new Date(o.to).toISOString()}'::timestamptz THEN '${o.variant}' `).join('');
+    const variantCase = overrideCase + urls.filter(u => isVariant(map[u]))
         .map(u => `WHEN split_part(current_url,'?',1) = '${esc(u)}' THEN '${map[u]}'`).join(' ');
     const sql = `WITH v0 AS (
         SELECT (timestamp AT TIME ZONE 'America/Los_Angeles')::date AS day,
@@ -574,11 +626,11 @@ async function getRegPageVisits(funnel, dates) {
         // funnels in their own schema can read it too.
         const { data, error } = await supabasePublic.rpc('ai_run_sql', { query: sql });
         if (error || !Array.isArray(data)) { console.warn(`⚠️  reg_page_visits query failed [${funnel}]:`, error?.message || data?.error); return null; }
-        for (const d of uniq) out[d] = { all: 0, A: 0, B: 0, undetected: 0 }; // counted, even if zero
+        for (const d of uniq) out[d] = emptyBuckets(); // counted, even if zero
         for (const r of (data || [])) {
             const d = String(r.day).slice(0, 10);
-            if (!out[d]) out[d] = { all: 0, A: 0, B: 0, undetected: 0 };
-            const v = (r.variant === 'A' || r.variant === 'B') ? r.variant : 'undetected';
+            if (!out[d]) out[d] = emptyBuckets();
+            const v = isVariant(r.variant) ? r.variant : 'undetected';
             out[d][v] += Number(r.visitors) || 0;
             out[d].all += Number(r.visitors) || 0;
         }
@@ -1344,6 +1396,7 @@ app.post('/api/refresh', dashboardLimiter, async (req, res) => {
         const acct = fbAccountFor(funnel);
         if (!acct) return res.status(400).json({ error: `The ${funnel} funnel has no Facebook ad account linked` });
         const result = await syncFacebookSpend(acct, funnelConfig.funnels.get(funnel).schema_name, funnel, fbCampaignsFor(funnel));
+        await syncVariantSpend(funnel, dateToISO(getLADate()));
         refreshTimestamps.push(now);
         invalidateMetricsCache(funnel);
         invalidateInsightsCache(funnel);
@@ -1376,6 +1429,7 @@ app.post('/api/refresh-date', dashboardLimiter, async (req, res) => {
         const { fetchFacebookInsights, writeInsightsToSupabase } = await import('./fb-sync.js');
         const insights = await fetchFacebookInsights(date, acct, fbCampaignsFor(funnel));
         await writeInsightsToSupabase(date, insights, funnelConfig.funnels.get(funnel).schema_name);
+        await syncVariantSpend(funnel, date);
         invalidateMetricsCache(funnel);
         invalidateInsightsCache(funnel);
 
@@ -1644,8 +1698,18 @@ const STAYED_DEDUP_MAP = { 45: 'stayed_45', 60: 'stayed_60', 80: 'stayed_80' };
 
 // Purchase metadata.source → column mapping now comes from purchaseSourceMap(funnel).
 
+// Split-test variants. A letter means ONE page, permanently — a new page gets the next
+// letter instead of reusing one, so history never changes meaning.
+const VARIANTS = ['A', 'B', 'C'];
+const isVariant = (v) => VARIANTS.includes(v);
 // Allowed variant buckets. 'all' is computed as the sum of the others.
-const VARIANT_BUCKETS = ['A', 'B', 'undetected'];
+const VARIANT_BUCKETS = [...VARIANTS, 'undetected'];
+const emptyBuckets = () => ({ all: 0, ...Object.fromEntries(VARIANT_BUCKETS.map(v => [v, 0])) });
+// { A, B, C, undetected } from a per-variant count object (missing → 0).
+const bucketSplit = (c) => Object.fromEntries(VARIANT_BUCKETS.map(v => [v, Number(c?.[v]) || 0]));
+const VARIANT_SQL_LIST = VARIANTS.map(v => `'${v}'`).join(',');
+// variant_splits keys holding per-variant ad spend (written by syncVariantSpend).
+const FB_SPLIT_KEYS = ['fb_spend', 'fb_link_clicks'];
 
 // Normalize a phone to a comparable key: digits only, last 10 (so "+1 (555)
 // 123-4567" and "5551234567" match). Returns '' for anything under 10 digits so
@@ -1680,7 +1744,7 @@ function buildVariantResolver(events, cutoffMs = null, aliasMap = null, emailPho
         const raw = ev.metadata?.variant;
         if (raw === undefined || raw === null || raw === '') continue;
         const v = String(raw).trim().toUpperCase();
-        if (v !== 'A' && v !== 'B') continue;
+        if (!isVariant(v)) continue;
         const since = new Date(ev.event_time).getTime();
         const ek = (ev.email || '').toLowerCase();
         if (ek && !(ek in emailToVariant)) emailToVariant[ek] = { v, since };
@@ -1692,7 +1756,7 @@ function buildVariantResolver(events, cutoffMs = null, aliasMap = null, emailPho
         const raw = ev.metadata?.variant;
         if (raw === undefined || raw === null || raw === '') return null;
         const v = String(raw).trim().toUpperCase();
-        return (v === 'A' || v === 'B') ? v : null;
+        return isVariant(v) ? v : null;
     };
     return (ev) => {
         const t = new Date(ev.event_time).getTime();
@@ -1772,13 +1836,13 @@ function computeDedupFromEvents(events, cutoffMs = null, aliasMap = null, emailP
         if (userSet.size === 0) continue;
         const [d, type, variant] = k.split('|');
         if (!result[d]) result[d] = {};
-        if (!result[d][type]) result[d][type] = { all: 0, A: 0, B: 0, undetected: 0 };
+        if (!result[d][type]) result[d][type] = emptyBuckets();
         result[d][type][variant] = (result[d][type][variant] || 0) + userSet.size;
     }
     for (const d of Object.keys(result)) {
         for (const type of Object.keys(result[d])) {
             const b = result[d][type];
-            b.all = (b.A || 0) + (b.B || 0) + (b.undetected || 0);
+            b.all = VARIANT_BUCKETS.reduce((n, v) => n + (b[v] || 0), 0);
         }
     }
     return result;
@@ -2001,7 +2065,7 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
         if (v > 0 || parentAuthoritative) {
             updates[f] = v;
             written[f] = v;
-            splits[f] = { A: Number(c?.A) || 0, B: Number(c?.B) || 0, undetected: Number(c?.undetected) || 0 };
+            splits[f] = bucketSplit(c);
         }
     }
 
@@ -2009,15 +2073,17 @@ async function finalizeDailyMetricsForDate(funnel, isoDate) {
     // scan. A failed lookup (null) leaves any previously stored count untouched.
     const rv = await getRegPageVisits(funnel, [isoDate]);
     if (rv) {
-        const c = rv[isoDate] || { all: 0, A: 0, B: 0, undetected: 0 };
+        const c = rv[isoDate] || emptyBuckets();
         updates.reg_page_visits = c.all;
         written.reg_page_visits = c.all;
-        splits.reg_page_visits = { A: c.A, B: c.B, undetected: c.undetected };
+        splits.reg_page_visits = bucketSplit(c);
     }
 
     // Ensure the row exists. Create with day_of_week if not.
     const { data: existing } = await supabase
-        .from('daily_metrics').select('date').eq('date', isoDate).maybeSingle();
+        .from('daily_metrics').select('date, variant_splits').eq('date', isoDate).maybeSingle();
+    // Per-variant ad spend is written by the FB sync, not derived from events — keep it.
+    for (const k of FB_SPLIT_KEYS) if (existing?.variant_splits?.[k]) splits[k] = existing.variant_splits[k];
     if (!existing) {
         const dayOfWeek = new Date(isoDate + 'T12:00:00Z').toLocaleDateString('en-US', {
             weekday: 'long', timeZone: 'America/Los_Angeles',
@@ -2129,7 +2195,7 @@ app.put('/api/reg-page-variants', dashboardLimiter, requireAuth, async (req, res
                 const u = String(url || '').trim();
                 const v = String(variant || '').trim().toUpperCase();
                 if (!u) continue;
-                if (v !== 'A' && v !== 'B' && v !== 'UNDETECTED') return res.status(400).json({ error: `Variant for "${u}" must be A, B, or Undetected` });
+                if (!isVariant(v) && v !== 'UNDETECTED') return res.status(400).json({ error: `Variant for "${u}" must be ${VARIANTS.join(', ')}, or Undetected` });
                 if (!/^https?:\/\/.+/i.test(u)) return res.status(400).json({ error: `"${u}" must be a full URL (https://…)` });
                 clean[u] = (v === 'UNDETECTED') ? 'undetected' : v;
             }
@@ -2220,7 +2286,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
         const supabase = clientFor(funnel);
         const bucket = getCacheBucket(funnel);
         const { limit = DASHBOARD_DAYS, offset = 0, variant: variantRaw = 'all', expand } = req.query;
-        const ALLOWED_VARIANTS = ['all', 'A', 'B', 'undetected'];
+        const ALLOWED_VARIANTS = ['all', ...VARIANT_BUCKETS];
         const variant = ALLOWED_VARIANTS.includes(String(variantRaw)) ? String(variantRaw) : 'all';
         // expand=variants embeds per-variant (A/B/undetected) breakdowns on every
         // row so the dashboard can switch the split-test toggle CLIENT-SIDE with no
@@ -2329,6 +2395,9 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 } else {
                     o.reg_page_visits = rv ? (rv[vnt] || 0) : null;
                 }
+                // Ad spend per variant exists only where campaigns are mapped to variants
+                // (campaign_variants setting); null = not split that day, shown "—".
+                if (vnt !== 'all') for (const k of FB_SPLIT_KEYS) o[k] = splits?.[k]?.[vnt] ?? null;
                 return o;
             };
             // Non-expanded: top level reflects the requested `variant` (default 'all').
@@ -2345,7 +2414,7 @@ app.get('/api/metrics', dashboardLimiter, async (req, res) => {
                 updated_at: row.updated_at,
             };
             if (expandVariants) {
-                out.variants = { A: buildVals('A'), B: buildVals('B'), undetected: buildVals('undetected') };
+                out.variants = Object.fromEntries(VARIANT_BUCKETS.map(v => [v, buildVals(v)]));
             }
             return out;
         });
@@ -3103,6 +3172,7 @@ app.post('/api/admin/funnel/resync', dashboardLimiter, requireAuth, requireAdmin
             for (const date of dates) {
                 const ins = await fetchFacebookInsights(date, acct, scope);
                 await writeInsightsToSupabase(date, ins, schema);
+                await syncVariantSpend(k, date);
                 spend += ins.spend;
             }
             totals[k] = { label: funnelConfig.funnels.get(k).label, spend: Math.round(spend * 100) / 100 };
@@ -3291,9 +3361,10 @@ app.post('/api/admin/backfill-variant-splits', requireAuth, requireAdmin, async 
             const d = String(t.date).substring(0, 10);
             const counts = dedupMap[d] || {};
             const splits = {};
+            for (const k of FB_SPLIT_KEYS) if (t.variant_splits?.[k]) splits[k] = t.variant_splits[k];
             for (const f of FIELDS) {
                 const c = counts[f];
-                if (c) splits[f] = { A: Number(c.A) || 0, B: Number(c.B) || 0, undetected: Number(c.undetected) || 0 };
+                if (c) splits[f] = bucketSplit(c);
             }
             const { error: upErr } = await sb.from('daily_metrics').update({ variant_splits: splits }).eq('date', d);
             if (!upErr) updated++;
@@ -3340,8 +3411,8 @@ app.post('/api/admin/backfill-reg-page-visits', requireAuth, requireAdmin, async
                 if (!rv) { failed.push(d); continue; }
                 if (!started && !rv[d]?.all) continue; // before tracking began
                 started = true;
-                const c = rv[d] || { all: 0, A: 0, B: 0, undetected: 0 };
-                const vs = { ...(r.variant_splits || {}), reg_page_visits: { A: c.A, B: c.B, undetected: c.undetected } };
+                const c = rv[d] || emptyBuckets();
+                const vs = { ...(r.variant_splits || {}), reg_page_visits: bucketSplit(c) };
                 const { error: uErr } = await sb.from('daily_metrics').update({ reg_page_visits: c.all, variant_splits: vs }).eq('date', d);
                 if (uErr) { failed.push(d); continue; }
                 stored++;
@@ -3411,6 +3482,7 @@ if (process.env.FB_ACCESS_TOKEN) {
         for (const funnel of targets) {
             try {
                 await syncFacebookSpend(fbAccountFor(funnel), funnelConfig.funnels.get(funnel).schema_name, funnel, fbCampaignsFor(funnel));
+                await syncVariantSpend(funnel, dateToISO(getLADate()));
                 invalidateMetricsCache(funnel);
                 invalidateInsightsCache(funnel);
             } catch (err) {
@@ -3438,6 +3510,7 @@ if (process.env.FB_ACCESS_TOKEN) {
                 console.log(`🌙 Daily 4 AM cron: fetching final ad insights for ${yesterdayISO} (${funnel})`);
                 const insights = await fetchFacebookInsights(yesterdayISO, acct, fbCampaignsFor(funnel));
                 await writeInsightsToSupabase(yesterdayISO, insights, funnelConfig.funnels.get(funnel).schema_name);
+                await syncVariantSpend(funnel, yesterdayISO);
                 invalidateMetricsCache(funnel);
                 invalidateInsightsCache(funnel);
                 console.log(`✅ Daily 4 AM cron [${funnel}]: $${insights.spend.toFixed(2)}, ${insights.linkClicks} link clicks written for ${yesterdayISO}`);
@@ -3483,6 +3556,7 @@ app.post('/api/fb-sync', webhookLimiter, authenticateWebhook, async (req, res) =
     try {
         const acct = fbAccountFor(req.funnel);
         const result = acct ? await syncFacebookSpend(acct, funnelConfig.funnels.get(req.funnel).schema_name, req.funnel, fbCampaignsFor(req.funnel)) : null;
+        if (result) await syncVariantSpend(req.funnel, dateToISO(getLADate()));
         if (!result) {
             return res.status(400).json({ error: `FB sync not available — check FB_ACCESS_TOKEN and the ${req.funnel} funnel's linked ad account` });
         }
@@ -3533,7 +3607,7 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
 
         const { table = 'events', dateFrom, dateTo, eventType, search, sortBy, sortDir = 'desc', limit = 500, variant: variantRaw } = req.body;
         // Optional split-test variant filter: 'A' | 'B' | 'undetected' (else all)
-        const variantFilter = ['A', 'B', 'undetected'].includes(String(variantRaw)) ? String(variantRaw) : null;
+        const variantFilter = VARIANT_BUCKETS.includes(String(variantRaw)) ? String(variantRaw) : null;
 
         // Only allow querying safe tables
         const ALLOWED_TABLES = ['events', 'daily_metrics', 'dashboard'];
@@ -3638,7 +3712,7 @@ app.post('/api/admin/query', dashboardLimiter, requireAuth, async (req, res) => 
             // Raw events carry the variant they arrived with (own tag). 'undetected'
             // here = no variant in the payload. (For dashboard-attributed variant —
             // incl. forward-only inheritance — use the Dashboard table.)
-            if (variantFilter === 'A' || variantFilter === 'B') query = query.eq('metadata->>variant', variantFilter);
+            if (isVariant(variantFilter)) query = query.eq('metadata->>variant', variantFilter);
             else if (variantFilter === 'undetected') query = query.is('metadata->>variant', null);
             if (search) query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
             query = query.order(sortBy || 'event_time', { ascending: sortDir === 'asc' });
@@ -4363,7 +4437,7 @@ async function getVariantFunnel(funnel, from, to) {
         FROM events r
         LEFT JOIN tc_phone rtc ON rtc.email_key = lower(r.email)
         WHERE r.event_type='registrations'
-          AND upper(trim(coalesce(r.metadata->>'variant',''))) IN ('A','B')${regCutoff}
+          AND upper(trim(coalesce(r.metadata->>'variant',''))) IN (${VARIANT_SQL_LIST})${regCutoff}
     ), email_map AS (
         SELECT DISTINCT ON (email_key) email_key, variant, event_time AS since FROM reg_v
         WHERE email_key IS NOT NULL AND email_key <> '' ORDER BY email_key, event_time ASC
@@ -4374,7 +4448,7 @@ async function getVariantFunnel(funnel, from, to) {
         SELECT e.event_type, ${personKey} AS person_key,
                CASE
                    ${evCutoffCase}-- 1) the event's OWN tag wins (any type — Stealth stamps downstream too)
-                   WHEN upper(trim(coalesce(e.metadata->>'variant',''))) IN ('A','B')
+                   WHEN upper(trim(coalesce(e.metadata->>'variant',''))) IN (${VARIANT_SQL_LIST})
                         THEN upper(trim(e.metadata->>'variant'))
                    -- 2) an untagged registration never inherits
                    WHEN e.event_type = 'registrations' THEN 'undetected'
@@ -4419,7 +4493,7 @@ async function getVariantFunnel(funnel, from, to) {
         };
     };
     const variants = {};
-    for (const v of ['A', 'B', 'undetected']) {
+    for (const v of VARIANT_BUCKETS) {
         variants[v] = build(rows.find(r => r.variant === v) || {});
     }
     // Headline A-vs-B comparison on the registered→purchase rate (the bottom-line
@@ -4440,7 +4514,7 @@ async function getVariantFunnel(funnel, from, to) {
         date_from: from || null, date_to: to || null,
         variants,
         comparison,
-        note: "Attribution rules: (1) any event with its OWN metadata.variant ('A'/'B') uses it — registrations AND downstream events (Stealth stamps the variant on attended/CTA/purchase too). (2) An untagged registration is 'undetected' and is NEVER back-filled. (3) An untagged downstream event inherits the registrant's variant via email then phone (last-10-digits), but FORWARD-ONLY — only if it occurred at/after the variant was assigned; events predating the person's experiment entry, and purchases whose checkout email/phone never matched a tagged registration, are 'undetected'. FB spend and reg-page link clicks have NO variant dimension — do NOT compute cost-per-variant (cost/reg, CPA, ROAS) from a single variant's counts.",
+        note: "Attribution rules: (1) any event with its OWN metadata.variant ('A'/'B') uses it — registrations AND downstream events (Stealth stamps the variant on attended/CTA/purchase too); a third page is 'C'. (2) An untagged registration is 'undetected' and is NEVER back-filled. (3) An untagged downstream event inherits the registrant's variant via email then phone (last-10-digits), but FORWARD-ONLY — only if it occurred at/after the variant was assigned; events predating the person's experiment entry, and purchases whose checkout email/phone never matched a tagged registration, are 'undetected'. FB spend and reg-page link clicks have NO variant dimension — do NOT compute cost-per-variant (cost/reg, CPA, ROAS) from a single variant's counts.",
     };
 }
 
@@ -4482,7 +4556,7 @@ async function getJourneyDataDictionary(funnel) {
         sales_pages: salesPages,
         totals: totals[0] || {},
         notes: [
-            "events.metadata.variant ('A' or 'B') is the split-test bucket. Attribution: (1) any event with its OWN variant tag uses it — registrations AND downstream events, since Stealth now stamps it on attended/CTA/purchase; (2) an untagged registration is 'undetected' and is NEVER back-filled; (3) an untagged downstream event inherits the registrant's variant via email then phone (last-10-digits), FORWARD-ONLY — only if it occurred at/after the variant was assigned. Pre-experiment events and unmatched purchases are 'undetected'.",
+            "events.metadata.variant ('A', 'B' or 'C' — one letter per registration page) is the split-test bucket. Attribution: (1) any event with its OWN variant tag uses it — registrations AND downstream events, since Stealth now stamps it on attended/CTA/purchase; (2) an untagged registration is 'undetected' and is NEVER back-filled; (3) an untagged downstream event inherits the registrant's variant via email then phone (last-10-digits), FORWARD-ONLY — only if it occurred at/after the variant was assigned. Pre-experiment events and unmatched purchases are 'undetected'.",
             "For A/B counts/conversions use get_variant_funnel; for the LIST of people in a variant use get_journey_segment (variant:'A'). A naive `WHERE metadata->>'variant'='A'` is fine for registration ROWS but undercounts downstream events that were untagged and inherited.",
             "FB spend (daily_metrics.fb_spend) and reg-page link clicks (fb_link_clicks) have NO variant dimension — FB reports them at account/day level — so cost-per-variant (cost/reg, CPA, ROAS) is NOT computable per A/B variant.",
             "sales_pages maps each named sales/checkout page to the URL where its visits land in tracking_page_visits.current_url. To count how many people hit a sales page, use get_sales_page_visits (it collapses stitched identities to distinct people) rather than a raw COUNT — a naive count of tracking_page_visits would double-count stitched contacts and miss the page→label naming.",
@@ -4514,7 +4588,7 @@ async function getJourneySegment(funnel, params) {
     for (const s of (Array.isArray(p.not_reached_stages) ? p.not_reached_stages : [])) { const c = mapStage(s); if (c) conds.push(`NOT ${c}`); }
     if (p.webinar_slot) conds.push(`email_key IN (SELECT lower(email) FROM events WHERE event_type='registrations' AND metadata->>'webinar_datetime_utc' ILIKE '%${esc(p.webinar_slot)}%' AND email IS NOT NULL)`);
     if (p.purchase_source) conds.push(`email_key IN (SELECT lower(email) FROM events WHERE event_type='purchases' AND metadata->>'source' ILIKE '${esc(p.purchase_source)}' AND email IS NOT NULL)`);
-    if (p.variant && ['A', 'B'].includes(String(p.variant).toUpperCase())) {
+    if (p.variant && isVariant(String(p.variant).toUpperCase())) {
         const vv = String(p.variant).toUpperCase();
         conds.push(`email_key IN (SELECT lower(email) FROM events WHERE event_type='registrations' AND upper(trim(coalesce(metadata->>'variant',''))) = '${vv}' AND email IS NOT NULL)`);
     }
@@ -5391,7 +5465,7 @@ const INSIGHTS_TOOLS = [
     },
     {
         name: 'get_variant_funnel',
-        description: 'A/B SPLIT-TEST results: the funnel as distinct people per stage (registered → attended → watched_replay → saw_cta → clicked_cta → purchased) broken down by variant A, B, and undetected, plus per-variant stage-to-stage conversion % and a headline A-vs-B comparison on the registered→purchase rate (absolute point diff + relative lift + leader). Use for ANY split-test / A/B / "variant A vs B" question. It does the variant attribution correctly: a person\'s variant is their FIRST registration\'s metadata.variant, inherited by all their later events via email (or phone when the email doesn\'t match — e.g. a purchase under a different checkout email) — a naive WHERE metadata->>\'variant\'=\'A\' on purchases/attendance would undercount. NOTE: FB spend and reg-page link clicks cannot be split by variant, so this tool reports conversion rates only, not cost-per-variant.',
+        description: 'A/B SPLIT-TEST results: the funnel as distinct people per stage (registered → attended → watched_replay → saw_cta → clicked_cta → purchased) broken down by variant A, B, C, and undetected, plus per-variant stage-to-stage conversion % and a headline A-vs-B comparison on the registered→purchase rate (absolute point diff + relative lift + leader). Use for ANY split-test / A/B / "variant A vs B" question. It does the variant attribution correctly: a person\'s variant is their FIRST registration\'s metadata.variant, inherited by all their later events via email (or phone when the email doesn\'t match — e.g. a purchase under a different checkout email) — a naive WHERE metadata->>\'variant\'=\'A\' on purchases/attendance would undercount. NOTE: FB spend and reg-page link clicks cannot be split by variant, so this tool reports conversion rates only, not cost-per-variant.',
         input_schema: {
             type: 'object',
             properties: {
@@ -5426,7 +5500,7 @@ const INSIGHTS_TOOLS = [
                 not_reached_stages: { type: 'array', items: { type: 'string' }, description: 'Stages the person must NOT have reached (e.g. ["attended"] for registrants who were no-shows).' },
                 webinar_slot:       { type: 'string', description: 'Substring of the registration webinar datetime, e.g. "May 10" or "April 11th 2026, 10:00:00 pm".' },
                 purchase_source:    { type: 'string', description: 'Restrict to people who purchased from this source, e.g. "Paid Ads", "AI Bot".' },
-                variant:            { type: 'string', description: 'Restrict to people who REGISTERED in split-test variant "A" or "B" (by the registration\'s own variant tag). Combine with reached_stages:["registration"] for the registrant roster of a variant.' },
+                variant:            { type: 'string', description: 'Restrict to people who REGISTERED in split-test variant "A", "B" or "C" (by the registration\'s own variant tag). Combine with reached_stages:["registration"] for the registrant roster of a variant.' },
                 registered_from:    { type: 'string', description: 'Registration date range start (YYYY-MM-DD), optional.' },
                 registered_to:      { type: 'string', description: 'Registration date range end (YYYY-MM-DD), optional.' },
                 limit:              { type: 'number', description: 'Max people to return (default 100, max 500).' },
@@ -5739,7 +5813,7 @@ INSTRUCTIONS:
 - Pipeline-stage / appointment / opportunity questions (Day 1, testing, report of findings, started, refunds…) live ONLY in GoHighLevel — see the GOHIGHLEVEL section. Segment × pipeline joins ("everyone who purchased in July") → one get_ghl_pipeline_status call. Ad-hoc single-contact lookups → ghl MCP tools. Never answer stage questions from funnel data alone.` : ''}
 - CUSTOMER JOURNEY — you can see the funnel end to end, per person:
   • \`get_journey_funnel\` — distinct-people funnel + stage-to-stage conversion/drop-off (optionally date-ranged). Use for funnel/conversion/drop-off questions.
-  • \`get_variant_funnel\` — A/B split-test breakdown: the funnel per variant (A / B / undetected) + per-variant conversion % + a headline A-vs-B comparison on the registered→purchase rate. Use for any split-test / "variant A vs B" question. Attribution (handled for you): an event's own variant tag wins (registrations + Stealth-stamped downstream); untagged registrations are undetected; untagged downstream events inherit the registrant's variant forward-only (email→phone). For the actual LIST of people in a variant (e.g. everyone who registered in A), use \`get_journey_segment\` with variant:"A". Note: spend can't be split by variant — compare CONVERSION RATES, not cost; if asked for cost-per-variant, explain spend has no A/B dimension.
+  • \`get_variant_funnel\` — A/B split-test breakdown: the funnel per variant (A / B / C / undetected) + per-variant conversion % + a headline A-vs-B comparison on the registered→purchase rate. Use for any split-test / "variant A vs B" question. Attribution (handled for you): an event's own variant tag wins (registrations + Stealth-stamped downstream); untagged registrations are undetected; untagged downstream events inherit the registrant's variant forward-only (email→phone). For the actual LIST of people in a variant (e.g. everyone who registered in A), use \`get_journey_segment\` with variant:"A". Note: spend can't be split by variant — compare CONVERSION RATES, not cost; if asked for cost-per-variant, explain spend has no A/B dimension.
   • \`get_contact_journey\` — one person's full chronological timeline by email or contact_id. Use for "what did <email> do" or sample buyer/non-buyer paths.
   • \`get_journey_segment\` — the LIST of people matching a segment (registered-but-not-attended, buyers from a given webinar slot, attended-but-didn't-buy, etc.). Use when the user wants WHO, not just how many.
   • \`get_email_report\` — email-marketing performance by source (clicks → people → buyers → conversion %, traffic_source=email). Use for "which emails convert best".
@@ -7612,7 +7686,7 @@ const variantOfRegistrantEmail = async (supabase, emailLower) => {
         .eq('event_type', 'registrations').ilike('email', emailLower).order('event_time', { ascending: true });
     for (const r of data || []) {
         const v = String(r.metadata?.variant || '').trim().toUpperCase();
-        if (v === 'A' || v === 'B') return v;
+        if (isVariant(v)) return v;
     }
     return null;
 };
