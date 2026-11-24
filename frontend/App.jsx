@@ -1098,6 +1098,28 @@ export default function App() {
   const [selectedDates, setSelectedDates] = useState(() => new Set());
   // Anchor for shift-click range selection (last clicked row's date).
   const selectionAnchorRef = useRef(null);
+  // Keep the table's column names pinned under the nav while the PAGE scrolls. The
+  // table scrolls sideways inside its own box, so CSS sticky can't pin the header to
+  // the window; instead shift the header row down by however far the table's top
+  // has scrolled past the nav (CSS var consumed by `.overview-table-wrap thead th`).
+  useEffect(() => {
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      const wrap = document.querySelector(".overview-table-wrap");
+      const head = wrap?.querySelector("thead");
+      if (!head) return;
+      const navBottom = Math.max(0, document.querySelector(".app-navbar")?.getBoundingClientRect().bottom || 0);
+      const box = wrap.getBoundingClientRect();
+      const shift = Math.min(Math.max(0, navBottom - box.top), Math.max(0, box.height - head.offsetHeight * 2));
+      wrap.style.setProperty("--head-shift", `${Math.round(shift)}px`);
+    };
+    const onScroll = () => { if (!raf) raf = requestAnimationFrame(update); };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll);
+    update();
+    return () => { window.removeEventListener("scroll", onScroll); window.removeEventListener("resize", onScroll); cancelAnimationFrame(raf); };
+  });
 
   // Build the ordered list of column descriptors
   const buildColList = useCallback(() => {
@@ -5567,7 +5589,7 @@ table{font-variant-numeric:tabular-nums}
 thead th{position:sticky;top:0;z-index:1}
 tbody tr{transition:background-color 120ms ease}
 tbody tr:hover{background:var(--ds-background-200)}
-.overview-table-wrap thead th{z-index:2}
+.overview-table-wrap thead th{z-index:2;transform:translateY(var(--head-shift,0px))}
 .overview-table-wrap th:not(.sticky-col){min-width:86px}
 .overview-table-wrap .sticky-col{position:sticky;z-index:1}
 .overview-table-wrap thead .sticky-col{z-index:3}

@@ -171,7 +171,9 @@ toggle appears once a funnel has C data.
 **Overview look (2026-11-24 restyle):** Geist type, raised summary cards (8 per row
 ≥1536px, 4 below, compact 2-up without sparklines on phones), full-width layout with
 10px gutters (8px ≤768px), and a flush edge-to-edge metrics table with no height cap
-(the page scrolls; column names no longer stay pinned), centered headers and values.
+(the page scrolls; column names stay pinned under the nav via a scroll-linked
+`--head-shift` on the header row, since the table's sideways scroll box rules out CSS
+sticky to the window), centered headers and values.
 
 **Per-variant ad spend:** when each variant runs under its own campaigns,
 `app_settings` key `campaign_variants` = `{ "since": "YYYY-MM-DD", "map":
